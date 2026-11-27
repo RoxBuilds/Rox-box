@@ -685,6 +685,7 @@ dependencies = [
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
+ "victory-standin",
  "windows",
  "windows-sys",
  "zlib-rs",
@@ -750,6 +751,14 @@ dependencies = [
  "windows",
  "windows-sys",
  "zlib-rs",
+]
+
+[[package]]
+name = "victory-standin"
+version = "0.2.0"
+dependencies = [
+ "victory-formats",
+ "victory-shader",
 ]
 
 [[package]]

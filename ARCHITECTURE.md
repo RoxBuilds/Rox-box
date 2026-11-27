@@ -48,8 +48,10 @@ project this one descends from.
 | `crates/victory-formats` | Pure format code: console texture layouts (tiling and detiling), BCPack, XMA2 audio | `src/lib.rs` |
 | `crates/victory-pipeline` | The content-addressed on-disk cache (`Cache`, `CacheKey`) | `src/cache.rs` |
 | `crates/victory-game` | Readers for container formats that titles ship data in (packed shader archives). Nothing about any one title | `src/lib.rs` |
+| `crates/victory-standin` | The title side of a stand-in title (PC-layout structures, table offsets, the self-test's scene), shared by the self-test and the demo title | `src/lib.rs`, `src/scene.rs` |
 | `xtask` | Repository tasks: `policy`, `install-hooks`, `dist`, `verify-dist` | `src/main.rs` |
 | `tests/fixtures/hle-probe` | A stand-in "title" of our own code, built on demand by the loader tests | |
+| `tests/fixtures/demo-title` | The open demo title: an executable of our own that `victory run --execute` runs end to end ([docs/demo-title.md](docs/demo-title.md)) | `src/main.rs` |
 
 Everything is platform-level: no crate holds knowledge of a particular title.
 What a single title needs (a byte patch, the names of shaders that want special
@@ -331,7 +333,8 @@ with the `diagnostics` feature ([docs/debugging.md](docs/debugging.md)).
 - **To change what a player sees first**: `apps/victory/src/preflight.rs` and
   `scripts/play.ps1`.
 - **To try a change with no title files**: `victory selftest --warp`
-  ([docs/selftest.md](docs/selftest.md)).
+  ([docs/selftest.md](docs/selftest.md)); for the whole run path, the demo
+  title ([docs/demo-title.md](docs/demo-title.md)).
 - **To see what to work on**: [ROADMAP.md](ROADMAP.md).
 
 Most files open with a module comment that explains the console behaviour

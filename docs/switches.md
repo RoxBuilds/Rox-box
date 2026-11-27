@@ -4,7 +4,7 @@ Every `VICTORY_*` environment variable the source reads. This file is generated 
 
 To add a switch, write it in the code (`switch::on`, `toggled!` or a value read), describe it in a comment directly above the read, and run `cargo xtask switches`. `cargo xtask switches --check` (and `cargo test`) fail when this file is stale. `scripts\play.ps1` clears every other `VICTORY_*` variable; see [ARCHITECTURE.md](../ARCHITECTURE.md#configuration-and-switches).
 
-449 switches: 8 paths, 19 in `victory`, 6 in `victory-core`, 343 in `victory-gpu`, 26 in `victory-hle`, 7 in `victory-loader`, 40 in `victory-shader`.
+450 switches: 8 paths, 19 in `victory`, 6 in `victory-core`, 343 in `victory-gpu`, 26 in `victory-hle`, 8 in `victory-loader`, 40 in `victory-shader`.
 
 How to read the tables:
 
@@ -44,7 +44,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_HOST_WAVE` | value |  | `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes | `apps/victory/src/main.rs` |
 | `VICTORY_PAIRS` | value |  |  | `apps/victory/src/translate.rs` |
 | `VICTORY_POKE` | value |  | Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at each title+rva twice a second. Titles that exit if their main loop stalls for an extended watchdog period run on through slower frames when their tick flag is poked. The address must be writable title data. | `apps/victory/src/run.rs`<br>`crates/victory-core/src/report.rs` |
-| `VICTORY_RELAUNCHED_FROM` | value |  | A title that relaunched itself was checked when it first started, and the software adapter of a diagnostics build is not the default one. | `apps/victory/src/preflight.rs`<br>`crates/victory-core/src/report.rs`<br>`crates/victory-hle/src/modules/lifecycle.rs` |
+| `VICTORY_RELAUNCHED_FROM` | value |  | A title that relaunched itself was checked when it first started. With `VICTORY_D3D12_WARP=1` the graphics items are the software adapter's, the one the run will use (they were left out with every host item when the switch worked only in diagnostics builds). | `apps/victory/src/preflight.rs`<br>`crates/victory-core/src/report.rs`<br>`crates/victory-hle/src/modules/lifecycle.rs` |
 | `VICTORY_SHADER_CENSUS` | value<br>shader cache key |  | `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended: its label, the console program's instructions by encoding class (a static count of the whole program, not of one thread's path), and the host module's instructions by kind (`emit::census::KINDS`). | `apps/victory/src/translate.rs`<br>`crates/victory-shader/src/emit/bitcode/census.rs` |
 | `VICTORY_SKIP_CPU_CHECK` | value |  |  | `apps/victory/src/preflight.rs` |
 | `VICTORY_SKIP_PREFLIGHT` | value |  | `VICTORY_SKIP_PREFLIGHT=1`: `run --execute` starts whatever the host lacks. | `apps/victory/src/preflight.rs` |
@@ -134,7 +134,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_D3D12_DEBUG` | off unless set<br>shader cache key |  | The debug layer only in builds with diagnostics. | `crates/victory-gpu/src/host.rs`<br>`crates/victory-shader/src/emit/host.rs` |
 | `VICTORY_D3D12_DRED` | off unless set | `light` | Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics builds). | `crates/victory-gpu/src/host.rs` |
 | `VICTORY_D3D12_GBV` | off unless set |  | GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range descriptor heap indices and the like become messages naming the command instead of page faults. Without state tracking (directly indexed textures are not transitioned). | `crates/victory-gpu/src/host.rs` |
-| `VICTORY_D3D12_WARP` | off unless set |  | Diagnostics: the software adapter, on which a shader's wild access is an access violation in this process (a crash report with the address and instruction) instead of a GPU fault and driver reset. (This crate's own tests too: how they run on a PC without a card; and `victory selftest --warp`, which tells a driver's fault from the layer's, in any build.) | `apps/victory/src/preflight.rs`<br>`apps/victory/src/selftest.rs`<br>`crates/victory-gpu/src/host.rs` |
+| `VICTORY_D3D12_WARP` | off unless set |  | `VICTORY_D3D12_WARP=1`: the software adapter, on which a shader's wild access is an access violation in this process (a crash report with the address and instruction) instead of a GPU fault and driver reset; on which this crate's tests and `victory selftest --warp` run on a PC without a card; and on which CI runs the demo title (docs/demo-title.md), since a hosted runner has no graphics card... | `apps/victory/src/selftest.rs`<br>`crates/victory-gpu/src/host.rs`<br>`crates/victory-gpu/src/preflight.rs` |
 | `VICTORY_DECLARE_ONCE` | value |  | See \[`HostList::defer_gpu_write`\]. | `crates/victory-gpu/src/host.rs` |
 | `VICTORY_DEPTH_TWINS` | value |  |  | `crates/victory-gpu/src/resource.rs` |
 | `VICTORY_DIRECT_WRITES` | value |  | Whether title memory is written with the kernel's own call (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks what the pages are (as `VirtualQuery` does: about 2 ms a call in the title's big pools, see \[`copy_mapped`\]): putting back what shaders wrote cost more than a second a frame for hundreds of pieces, 2 ms each whatever their size. On by default... | `crates/victory-gpu/src/host.rs` |
@@ -448,6 +448,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | Name | Kind | Set by launcher | Description | Where |
 |---|---|---|---|---|
 | `VICTORY_CLZERO_ASK` | value |  | Whether what Windows said about memory is remembered per thread (the regions it found writable, the code bytes it found readable) and not asked again at every emulated instruction. VirtualQuery walks page tables for each region and becomes expensive in tight `clzero` zeroing loops across large heaps. On by default; `VICTORY_CLZERO_ASK=1` asks every time, as before. | `crates/victory-loader/src/console_insn.rs` |
+| `VICTORY_EXIT_DETACH_HOST` | value |  | Read now: a thread ended below may hold the environment's lock. | `crates/victory-loader/src/threads.rs` |
 | `VICTORY_MWAITX_WAIT` | value | `1` with -Fast |  | `crates/victory-loader/src/console_wait.rs` |
 | `VICTORY_MWAITX_WAIT_US` | value |  | When a wait's timer is due, in microseconds: `VICTORY_MWAITX_WAIT_US` (250; 50 to 20,000). It ends on its next tick past that. | `crates/victory-loader/src/console_wait.rs` |
 | `VICTORY_PATCH_CLZERO` | value |  | Whether a `clzero` loop (\[`ConsoleOnly::ClzeroLoop`\]) is replaced the first time it faults by a jump to the same loop with plain stores (\[`clzero_stub`\]). On by default; `VICTORY_PATCH_CLZERO=0` emulates each time, as before. | `crates/victory-loader/src/console_insn.rs` |

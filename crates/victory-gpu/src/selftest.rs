@@ -2,16 +2,19 @@
 //! "title" made of our own code, so that it can be run on any PC, in the
 //! tests and in CI, without a single file from a title.
 //!
-//! The stand-in calls what a title's calls arrive at and nothing else: the
-//! device comes from the device-creation export a title imports (the
-//! caller resolves it through the runtime's registry and passes it in),
-//! and every object after that is reached through the function tables the
-//! device hands out, at the offsets a title's code calls (the tables of
-//! `device.rs`, `queue.rs`, `list.rs`, `resource.rs`, `descriptor.rs`,
-//! `fence.rs`). The structures it passes are laid out as on PC, which is
-//! what a title passes. Only the checks read behind the tables: a picture
-//! is read back from the host texture the layer made, and what the swap
-//! chain did is asked of the host (`host/selfcheck.rs`).
+//! The stand-in is `victory_standin`, which the open demo title
+//! (`tests/fixtures/demo-title`) links too: it calls what a title's calls
+//! arrive at and nothing else. The device comes from the device-creation
+//! export a title imports (the caller resolves it through the runtime's
+//! registry and passes it in), and every object after that is reached
+//! through the function tables the device hands out, at the offsets a
+//! title's code calls (the tables of `device.rs`, `queue.rs`, `list.rs`,
+//! `resource.rs`, `descriptor.rs`, `fence.rs`). The structures it passes
+//! are laid out as on PC, which is what a title passes. Only the checks
+//! here read behind the tables: a picture is read back from the host
+//! texture the layer made, what the swap chain did is asked of the host
+//! (`host/selfcheck.rs`), and a pipeline's first use is waited for until
+//! its host pipeline is there.
 //!
 //! The stages, each reported as it finishes:
 //!
@@ -37,52 +40,22 @@
 //! With `bench`, a few of the layer's own hot paths are timed on synthetic
 //! data ([`Rate`]); see `docs/selftest.md` for what they mean.
 //!
-//! Nothing here runs unless `victory selftest` asks: [`running`] is the
-//! only state a title run could see, and it stays false there.
+//! Nothing here runs unless `victory selftest` asks.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use victory_standin::pc::{COMMON, COPY_SOURCE, Obj, RENDER_TARGET, Rect};
+use victory_standin::scene::{BufferCopy, Compute, DrawCall, Drawing, LEFT_HALF, PIECE, PIECE_AT, TiledTexture, WHOLE, step};
+use victory_standin::{SIDE, Title, hr_text};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::core::Interface;
 
-use crate::object::{HRESULT, Iid, S_OK, This, guid, slot};
+use crate::object::This;
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Whether `victory selftest` is running in this process: the software
-/// adapter may then be asked for in a build without diagnostics.
-pub(crate) fn running() -> bool {
-    RUNNING.load(Ordering::Relaxed)
-}
-
-/// `D3D12XboxCreateDevice(adapter, parameters, iid, out)`.
-pub type CreateDevice = extern "system" fn(*const c_void, *const u32, *const Iid, *mut This) -> HRESULT;
-/// `D3D12SerializeRootSignature(desc, version, blob, error)`.
-pub type SerializeRoot =
-    extern "system" fn(*const crate::root::Desc, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
-
-/// The exports the stand-in title imports, as the runtime binds them.
-#[derive(Clone, Copy)]
-pub struct Imports {
-    pub create_device: CreateDevice,
-    pub serialize_root: SerializeRoot,
-}
-
-impl Imports {
-    /// This crate's own entry points, unwrapped (the runtime's device
-    /// creation also installs its memory allocator first).
-    pub fn ours() -> Imports {
-        Imports {
-            create_device: crate::device::create,
-            serialize_root: crate::root::serialize,
-        }
-    }
-}
+pub use victory_standin::{CreateDevice, Imports, SerializeRoot};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -156,7 +129,6 @@ pub const STAGES: [&str; 5] = ["Device", "Clear + present", "Unified memory", "T
 /// called from another thread if a step takes longer than the patience
 /// (with the stage it was in); it must end the process.
 pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), hung: fn(&'static str) -> !) -> Report {
-    RUNNING.store(true, Ordering::Relaxed);
     if options.warp {
         // SAFETY: before the host device exists, on the thread that makes
         // it; nothing of ours reads the environment concurrently yet.
@@ -172,7 +144,7 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
     };
 
     Watchdog::arm(STAGES[0]);
-    let title = match Title::new(imports, options) {
+    let title = match device(imports, options) {
         Ok((title, detail)) => {
             tell(&mut report, STAGES[0], Outcome::Ok(detail));
             title
@@ -189,25 +161,25 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
     };
 
     Watchdog::arm(STAGES[1]);
-    let outcome = title.clear_and_present(options.frames, &mut bench).into_outcome();
+    let outcome = clear_and_present(&title, options.frames, &mut bench).into_outcome();
     let presented = matches!(outcome, Outcome::Ok(_));
     tell(&mut report, STAGES[1], outcome);
 
     Watchdog::arm(STAGES[2]);
     let outcome = if presented {
-        title.unified_memory().into_outcome()
+        unified_memory(&title).into_outcome()
     } else {
         Outcome::Skip("needs clear + present".into())
     };
     tell(&mut report, STAGES[2], outcome);
 
     Watchdog::arm(STAGES[3]);
-    let outcome = title.translated_shader(imports, &mut bench);
+    let outcome = translated_shader(&title, &mut bench);
     tell(&mut report, STAGES[3], outcome);
 
     Watchdog::arm(STAGES[4]);
     let outcome = if presented {
-        title.translated_draw(imports, &mut bench)
+        translated_draw(&title, &mut bench)
     } else {
         Outcome::Skip("needs clear + present".into())
     };
@@ -215,7 +187,7 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
 
     if options.bench {
         Watchdog::arm("Benchmark");
-        report.rates = title.bench(bench);
+        report.rates = rates(&title, bench);
     }
     Watchdog::disarm();
     report
@@ -236,6 +208,12 @@ impl From<String> for Failed {
 impl From<&str> for Failed {
     fn from(reason: &str) -> Self {
         reason.to_owned().into()
+    }
+}
+
+impl From<victory_standin::Failed> for Failed {
+    fn from(failed: victory_standin::Failed) -> Self {
+        failed.0.into()
     }
 }
 
@@ -295,1099 +273,398 @@ impl Watchdog {
     }
 }
 
-// The structures a title passes, laid out as on PC (D3D12's headers).
-
-#[repr(C)]
-struct QueueDesc {
-    kind: u32,
-    priority: i32,
-    flags: u32,
-    nodes: u32,
-}
-
-/// `D3D12_DESCRIPTOR_HEAP_DESC`, then the room newer titles' callers have
-/// after it (a placement of their own), left empty.
-#[repr(C)]
-struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
-    after: [u64; 2],
-}
-
-#[repr(C)]
-struct HeapProperties {
-    kind: u32,
-    cpu_pages: u32,
-    pool: u32,
-    creation_nodes: u32,
-    visible_nodes: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
-}
-
-/// A transition barrier (`D3D12_RESOURCE_BARRIER`).
-#[repr(C)]
-struct Barrier {
-    kind: u32,
-    flags: u32,
-    resource: This,
-    subresource: u32,
-    before: u32,
-    after: u32,
-    _pad: u32,
-}
-
-#[repr(C)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-/// `D3D12_UNORDERED_ACCESS_VIEW_DESC` of a raw buffer.
-#[repr(C)]
-struct RawUav {
-    format: u32,
-    dimension: u32,
-    first: u64,
-    count: u32,
-    stride: u32,
-    counter_offset: u64,
-    flags: u32,
-    _pad: u32,
-}
-
-/// `D3D12_COMPUTE_PIPELINE_STATE_DESC`.
-#[repr(C)]
-struct ComputeDesc {
-    root: This,
-    code: *const u8,
-    size: usize,
-    nodes: u32,
-    cached: *const u8,
-    cached_size: usize,
-    flags: u32,
-}
-
-/// One plane of a present (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`): the frame
-/// token, the resources, source rectangles and destination (none: whole),
-/// colour space; two planes' room, the second left empty.
-#[repr(C)]
-struct Planes {
-    token: u64,
-    count: u32,
-    _pad: u32,
-    resources: *const This,
-    sources: u64,
-    destination: u64,
-    rest: [u8; 0x90 - 0x28],
-}
-
-/// `D3D12_VERTEX_BUFFER_VIEW`.
-#[repr(C)]
-struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
-}
-
-/// `D3D12_PIPELINE_STATE_STREAM_DESC`: the stream's size and where it is.
-#[repr(C)]
-struct StreamDesc {
-    size: usize,
-    stream: *const u8,
-}
-
-/// `D3D12_SHADER_BYTECODE`.
-#[repr(C)]
-struct Code {
-    code: *const u8,
-    size: usize,
-}
-
-/// One subobject of a pipeline-state stream: its type, then its
-/// description at its own alignment, the whole padded to a pointer, as the
-/// D3D12 headers' stream helpers lay it out (and a title's code passes it).
-#[repr(C, align(8))]
-struct Sub<T>(u32, T);
-
-/// The pipeline-state stream of a vertex and pixel pipeline, with the
-/// state a title of the current generation gives one (D3D12's subobject
-/// types: root signature 0, VS 1, PS 2, blend 8, sample mask 9, rasterizer
-/// 10, input layout 12, topology 14, target formats 15, depth format 16,
-/// samples 17, depth-stencil with bounds 21).
-#[repr(C)]
-struct GraphicsStream {
-    root: Sub<This>,
-    vs: Sub<Code>,
-    ps: Sub<Code>,
-    blend: Sub<D3D12_BLEND_DESC>,
-    sample_mask: Sub<u32>,
-    rasterizer: Sub<D3D12_RASTERIZER_DESC>,
-    depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
-    layout: Sub<D3D12_INPUT_LAYOUT_DESC>,
-    topology: Sub<u32>,
-    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-    depth_format: Sub<u32>,
-    samples: Sub<DXGI_SAMPLE_DESC>,
-}
-
-/// The draw's one vertex attribute: x and y floats at the start of each
-/// vertex of vertex buffer 0.
-fn position_input() -> D3D12_INPUT_ELEMENT_DESC {
-    D3D12_INPUT_ELEMENT_DESC {
-        SemanticName: windows::core::s!("POSITION"),
-        SemanticIndex: 0,
-        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT,
-        InputSlot: 0,
-        AlignedByteOffset: 0,
-        InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-        InstanceDataStepRate: 0,
+/// Stage 1: the device through the title's import, the host device behind
+/// it (on the software adapter if asked for), the title's objects, and one
+/// empty frame presented, so that the swap chain and the window exist.
+fn device(imports: &Imports, options: &Options) -> Result<(Title, String), Failed> {
+    let device = Title::create_device(imports)?;
+    let Some(host) = crate::host::host() else {
+        return Err(Failed {
+            reason: "no host Direct3D 12 device at feature level 12_0 (the warning above says why)".into(),
+            no_device: true,
+        });
+    };
+    let facts = host.adapter_facts();
+    let software = facts.as_ref().is_some_and(|a| a.software);
+    if options.warp && !software {
+        return Err("asked for the software adapter (WARP) and got another".into());
     }
-}
-
-impl GraphicsStream {
-    /// Opaque triangles into one RGBA8 target: no blending, no culling (the
-    /// triangle's winding is left to the programs), no depth.
-    fn new(root: This, vs: &[u8], ps: &[u8], inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> GraphicsStream {
-        let code = |c: &[u8]| Code { code: c.as_ptr(), size: c.len() };
-        let target = D3D12_RENDER_TARGET_BLEND_DESC {
-            SrcBlend: D3D12_BLEND_ONE,
-            DestBlend: D3D12_BLEND_ZERO,
-            BlendOp: D3D12_BLEND_OP_ADD,
-            SrcBlendAlpha: D3D12_BLEND_ONE,
-            DestBlendAlpha: D3D12_BLEND_ZERO,
-            BlendOpAlpha: D3D12_BLEND_OP_ADD,
-            LogicOp: D3D12_LOGIC_OP_NOOP,
-            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
-            ..Default::default()
-        };
-        let keep = D3D12_DEPTH_STENCILOP_DESC {
-            StencilFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilPassOp: D3D12_STENCIL_OP_KEEP,
-            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-        };
-        let mut formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
-        formats.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(RGBA8 as i32);
-        GraphicsStream {
-            root: Sub(0, root),
-            vs: Sub(1, code(vs)),
-            ps: Sub(2, code(ps)),
-            blend: Sub(8, D3D12_BLEND_DESC { RenderTarget: [target; 8], ..Default::default() }),
-            sample_mask: Sub(9, u32::MAX),
-            rasterizer: Sub(
-                10,
-                D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
-                    CullMode: D3D12_CULL_MODE_NONE,
-                    DepthClipEnable: true.into(),
-                    ..Default::default()
-                },
-            ),
-            depth: Sub(
-                21,
-                D3D12_DEPTH_STENCIL_DESC1 {
-                    DepthEnable: false.into(),
-                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
-                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-                    StencilEnable: false.into(),
-                    StencilReadMask: 0xff,
-                    StencilWriteMask: 0xff,
-                    FrontFace: keep,
-                    BackFace: keep,
-                    DepthBoundsTestEnable: false.into(),
-                },
-            ),
-            layout: Sub(12, D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: inputs.as_ptr(), NumElements: inputs.len() as u32 }),
-            // D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
-            topology: Sub(14, 3),
-            targets: Sub(15, formats),
-            depth_format: Sub(16, 0),
-            samples: Sub(17, DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
-        }
+    let adapter = match &facts {
+        Some(a) if a.software => format!("{} (software)", a.name),
+        Some(a) if a.driver.is_empty() => format!("{}, {} MB", a.name, a.vram_mb),
+        Some(a) => format!("{}, driver {}, {} MB", a.name, a.driver, a.vram_mb),
+        None => "an adapter DXGI does not describe".into(),
+    };
+    let title = Title::on(device, *imports, Watchdog::pet)?;
+    title.frame(|t| t.clear([0.0, 0.0, 0.0, 1.0]))?;
+    title.present()?;
+    title.sync()?;
+    let presents = host.presents().ok_or("the first present made no swap chain")?;
+    if !presents.window {
+        return Err("the swap chain has no window".into());
     }
+    Ok((title, format!("{adapter}; queue, list, fence and a {}x{} window", presents.size.0, presents.size.1)))
 }
 
-// The interface ids a title asks with (the PC ones).
-const DEVICE11: Iid = guid(0x5405c344, 0xd457, 0x444e, [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39]);
-const QUEUE: Iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
-const ALLOCATOR: Iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
-const LIST: Iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
-const FENCE: Iid = guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]);
-const RESOURCE: Iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
-const DESCRIPTOR_HEAP: Iid = guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
-const ROOT_SIGNATURE: Iid = guid(0xc54a6b66, 0x72df, 0x4ee8, [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14]);
-const PIPELINE: Iid = guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]);
-
-// The methods, by their byte offset in the tables (as `device.rs`,
-// `queue.rs`, `list.rs` and the others list them; the newer layouts, which
-// a device created as `ID3D12Device11` hands out, move a queue's methods
-// from 0x70 on by two slots).
-type MakeQueue = extern "system" fn(This, *const QueueDesc, *const Iid, *mut This) -> HRESULT;
-type MakeAllocator = extern "system" fn(This, u32, *const Iid, *mut This) -> HRESULT;
-type MakeList = extern "system" fn(This, u32, u32, This, This, *const Iid, *mut This) -> HRESULT;
-type MakeFence = extern "system" fn(This, u64, u32, *const Iid, *mut This) -> HRESULT;
-type MakeHeap = extern "system" fn(This, *const HeapDesc, *const Iid, *mut This) -> HRESULT;
-type MakeCommitted =
-    extern "system" fn(This, *const HeapProperties, u32, *const ResourceDesc, u32, *const c_void, *const Iid, *mut This) -> HRESULT;
-type MakeRtv = extern "system" fn(This, This, *const c_void, u64);
-type MakeUav = extern "system" fn(This, This, This, *const RawUav, u64);
-type MakeRoot = extern "system" fn(This, u32, *const u8, usize, *const Iid, *mut This) -> HRESULT;
-type MakeCompute = extern "system" fn(This, *const ComputeDesc, *const Iid, *mut This) -> HRESULT;
-type MakeStream = extern "system" fn(This, *const StreamDesc, *const Iid, *mut This) -> HRESULT;
-type HeapStart = extern "system" fn(This) -> u64;
-type GpuAddress = extern "system" fn(This) -> u64;
-type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
-type ResetAllocator = extern "system" fn(This) -> HRESULT;
-type Close = extern "system" fn(This) -> HRESULT;
-type ResetList = extern "system" fn(This, This, This) -> HRESULT;
-type Barriers = extern "system" fn(This, u32, *const Barrier);
-type ClearRtv = extern "system" fn(This, u64, *const [f32; 4], u32, *const Rect);
-type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
-type CopyResource = extern "system" fn(This, This, This);
-type SetPipeline = extern "system" fn(This, This);
-type SetRoot = extern "system" fn(This, This);
-type SetHeaps = extern "system" fn(This, u32, *const This);
-type SetTable = extern "system" fn(This, u32, u64);
-type SetConstants = extern "system" fn(This, u32, u32, *const u32, u32);
-type Dispatch = extern "system" fn(This, u32, u32, u32);
-type SetTopology = extern "system" fn(This, u32);
-type SetViewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
-type SetScissors = extern "system" fn(This, u32, *const Rect);
-type SetVertexBuffers = extern "system" fn(This, u32, u32, *const VertexView);
-type SetTargets = extern "system" fn(This, u32, *const u64, i32, *const u64);
-type Draw = extern "system" fn(This, u32, u32, u32, u32);
-type Execute = extern "system" fn(This, u32, *const This);
-type Signal = extern "system" fn(This, This, u64) -> HRESULT;
-type Present = extern "system" fn(This, u32, *const Planes, *const u8) -> HRESULT;
-type Completed = extern "system" fn(This) -> u64;
-type WaitFor = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
-
-const DIRECT: u32 = 0;
-const BUFFER: u32 = 1;
-const TEXTURE_2D: u32 = 3;
-const RGBA8: u32 = 28;
-const DEFAULT_HEAP: u32 = 1;
-const UPLOAD_HEAP: u32 = 2;
-const RENDER_TARGET_FLAG: u32 = 1;
-const UNORDERED_FLAG: u32 = 4;
-const COMMON: u32 = 0;
-const RENDER_TARGET: u32 = 4;
-const COPY_SOURCE: u32 = 0x800;
-const RTV_HEAP: u32 = 2;
-const VIEW_HEAP: u32 = 0;
-const SHADER_VISIBLE: u32 = 1;
-const TRIANGLE_LIST: u32 = 4;
-
-/// The side of the picture of stages 2 and 3: small, so that the window
-/// is small and a frame costs the card nothing.
-const SIDE: u32 = 64;
-
-fn hr_text(hr: HRESULT) -> String {
-    format!("{:#010x}", hr as u32)
-}
-
-fn check(what: &str, hr: HRESULT) -> Result<(), Failed> {
-    if hr == S_OK { Ok(()) } else { Err(format!("{what} returned {}", hr_text(hr)).into()) }
-}
-
-/// The stand-in title: its device and the objects it made.
-struct Title {
-    device: This,
-    queue: This,
-    allocator: This,
-    list: This,
-    fence: This,
-    value: std::cell::Cell<u64>,
-    /// The render target and its view, made by stage 1.
-    target: This,
-    rtv: u64,
-}
-
-impl Title {
-    fn new(imports: &Imports, options: &Options) -> Result<(Title, String), Failed> {
-        let null: This = std::ptr::null();
-        let mut parameters = [0u32; 32];
-        parameters[0] = crate::device::CHECKED_VERSION;
-        let mut device = null;
-        check("device creation", (imports.create_device)(std::ptr::null(), parameters.as_ptr(), &DEVICE11, &mut device))?;
-        let Some(host) = crate::host::host() else {
-            return Err(Failed {
-                reason: "no host Direct3D 12 device at feature level 12_0 (the warning above says why)".into(),
-                no_device: true,
-            });
-        };
-        let facts = host.adapter_facts();
-        let software = facts.as_ref().is_some_and(|a| a.software);
-        if options.warp && !software {
-            return Err("asked for the software adapter (WARP) and got another".into());
-        }
-        let adapter = match &facts {
-            Some(a) if a.software => format!("{} (software)", a.name),
-            Some(a) if a.driver.is_empty() => format!("{}, {} MB", a.name, a.vram_mb),
-            Some(a) => format!("{}, driver {}, {} MB", a.name, a.driver, a.vram_mb),
-            None => "an adapter DXGI does not describe".into(),
-        };
-        let (mut queue, mut allocator, mut list, mut fence) = (null, null, null, null);
-        let desc = QueueDesc { kind: DIRECT, priority: 0, flags: 0, nodes: 0 };
-        check("CreateCommandQueue", slot::<MakeQueue>(device, 0x40)(device, &desc, &QUEUE, &mut queue))?;
-        check("CreateCommandAllocator", slot::<MakeAllocator>(device, 0x48)(device, DIRECT, &ALLOCATOR, &mut allocator))?;
-        check("CreateCommandList", slot::<MakeList>(device, 0x60)(device, 0, DIRECT, allocator, null, &LIST, &mut list))?;
-        check("CreateFence", slot::<MakeFence>(device, 0x120)(device, 0, 0, &FENCE, &mut fence))?;
-        // A list is made open, as on PC.
-        check("Close", slot::<Close>(list, 0x48)(list))?;
-        let mut title = Title {
-            device,
-            queue,
-            allocator,
-            list,
-            fence,
-            value: std::cell::Cell::new(0),
-            target: null,
-            rtv: 0,
-        };
-        (title.target, title.rtv) = title.render_target()?;
-        // The window comes with the first present.
-        title.frame(|t| t.clear([0.0, 0.0, 0.0, 1.0]))?;
+fn clear_and_present(title: &Title, frames: u32, bench: &mut Bench) -> Result<String, Failed> {
+    let host = crate::host::host().ok_or("no host")?;
+    let before = host.presents().map_or(0, |p| p.count);
+    let frames = frames.max(1);
+    let looked = [0, frames / 2, frames - 1];
+    let mut intervals = Vec::with_capacity(frames as usize);
+    let mut last = Instant::now();
+    for f in 0..frames {
+        let bytes = colour_of(f);
+        let colour = bytes.map(|b| f32::from(b) / 255.0);
+        title.frame(|t| t.clear(colour))?;
         title.present()?;
         title.sync()?;
-        let presents = host.presents().ok_or("the first present made no swap chain")?;
-        if !presents.window {
-            return Err("the swap chain has no window".into());
-        }
-        Ok((title, format!("{adapter}; queue, list, fence and a {}x{} window", presents.size.0, presents.size.1)))
-    }
-
-    fn null() -> This {
-        std::ptr::null()
-    }
-
-    fn committed(&self, heap: u32, desc: &ResourceDesc, state: u32) -> Result<This, Failed> {
-        let properties = HeapProperties { kind: heap, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 };
-        let mut out = Self::null();
-        let make = slot::<MakeCommitted>(self.device, 0xd8);
-        check("CreateCommittedResource", make(self.device, &properties, 0, desc, state, std::ptr::null(), &RESOURCE, &mut out))?;
-        Ok(out)
-    }
-
-    fn buffer(&self, heap: u32, bytes: u64, flags: u32) -> Result<This, Failed> {
-        let desc = ResourceDesc {
-            dimension: BUFFER,
-            alignment: 0,
-            width: bytes,
-            height: 1,
-            depth_or_array_size: 1,
-            mip_levels: 1,
-            format: 0,
-            sample_count: 1,
-            sample_quality: 0,
-            layout: 1,
-            flags,
-        };
-        self.committed(heap, &desc, COMMON)
-    }
-
-    fn texture_desc(flags: u32) -> ResourceDesc {
-        ResourceDesc {
-            dimension: TEXTURE_2D,
-            alignment: 0,
-            width: u64::from(SIDE),
-            height: SIDE,
-            depth_or_array_size: 1,
-            mip_levels: 1,
-            format: RGBA8,
-            sample_count: 1,
-            sample_quality: 0,
-            // The console's own choice of tiling.
-            layout: 0,
-            flags,
-        }
-    }
-
-    /// The title memory of a resource, as `Map` gives it.
-    fn mapped(resource: This, len: usize) -> Result<&'static mut [u8], Failed> {
-        let mut at = std::ptr::null_mut();
-        check("Map", slot::<Map>(resource, 0x40)(resource, 0, std::ptr::null(), &mut at))?;
-        if at.is_null() {
-            return Err("Map gave no address".into());
-        }
-        // SAFETY: the resource's memory holds at least `len` bytes (the
-        // caller made it so) and lives as long as the resource, which the
-        // stand-in never releases; nothing else writes it while the title
-        // looks (the GPU's work was waited for).
-        Ok(unsafe { std::slice::from_raw_parts_mut(at, len) })
-    }
-
-    fn render_target(&self) -> Result<(This, u64), Failed> {
-        let target = self.committed(DEFAULT_HEAP, &Self::texture_desc(RENDER_TARGET_FLAG), COMMON)?;
-        let mut heap = Self::null();
-        let desc = HeapDesc { kind: RTV_HEAP, count: 1, flags: 0, nodes: 0, after: [0; 2] };
-        check("CreateDescriptorHeap", slot::<MakeHeap>(self.device, 0x70)(self.device, &desc, &DESCRIPTOR_HEAP, &mut heap))?;
-        let rtv = slot::<HeapStart>(heap, 0x48)(heap);
-        slot::<MakeRtv>(self.device, 0xa0)(self.device, target, std::ptr::null(), rtv);
-        Ok((target, rtv))
-    }
-
-    /// Records one list (reset, `record`, close) and submits it.
-    fn frame(&self, record: impl FnOnce(&Self) -> Result<(), Failed>) -> Result<(), Failed> {
-        check("allocator Reset", slot::<ResetAllocator>(self.allocator, 0x40)(self.allocator))?;
-        check("list Reset", slot::<ResetList>(self.list, 0x50)(self.list, self.allocator, Self::null()))?;
-        record(self)?;
-        check("Close", slot::<Close>(self.list, 0x48)(self.list))?;
-        slot::<Execute>(self.queue, 0x50)(self.queue, 1, &self.list);
-        Watchdog::pet();
-        Ok(())
-    }
-
-    fn transition(&self, resource: This, before: u32, after: u32) {
-        let b = Barrier { kind: 0, flags: 0, resource, subresource: u32::MAX, before, after, _pad: 0 };
-        slot::<Barriers>(self.list, 0xd0)(self.list, 1, &b);
-    }
-
-    fn clear(&self, colour: [f32; 4]) -> Result<(), Failed> {
-        self.transition(self.target, COMMON, RENDER_TARGET);
-        slot::<ClearRtv>(self.list, 0x1a0)(self.list, self.rtv, &colour, 0, std::ptr::null());
-        self.transition(self.target, RENDER_TARGET, COMMON);
-        Ok(())
-    }
-
-    fn present(&self) -> Result<(), Failed> {
-        let token = self.value.get() + 1;
-        let planes = Planes {
-            token,
-            count: 1,
-            _pad: 0,
-            resources: &self.target,
-            sources: 0,
-            destination: 0,
-            rest: [0; 0x90 - 0x28],
-        };
-        check("PresentX", slot::<Present>(self.queue, 0x100)(self.queue, 1, &planes, std::ptr::null()))
-    }
-
-    /// Signals the fence after what was submitted and waits for it, as a
-    /// title with one frame in flight does.
-    fn sync(&self) -> Result<(), Failed> {
-        let value = self.value.get() + 1;
-        self.value.set(value);
-        check("Signal", slot::<Signal>(self.queue, 0x80)(self.queue, self.fence, value))?;
-        if slot::<Completed>(self.fence, 0x40)(self.fence) < value {
-            check("SetEventOnCompletion", slot::<WaitFor>(self.fence, 0x48)(self.fence, value, std::ptr::null_mut()))?;
-        }
-        let reached = slot::<Completed>(self.fence, 0x40)(self.fence);
-        Watchdog::pet();
-        if reached < value {
-            return Err(format!("the fence stopped at {reached}, short of {value}").into());
-        }
-        Ok(())
-    }
-
-    fn clear_and_present(&self, frames: u32, bench: &mut Bench) -> Result<String, Failed> {
-        let host = crate::host::host().ok_or("no host")?;
-        let before = host.presents().map_or(0, |p| p.count);
-        let frames = frames.max(1);
-        let looked = [0, frames / 2, frames - 1];
-        let mut intervals = Vec::with_capacity(frames as usize);
-        let mut last = Instant::now();
-        for f in 0..frames {
-            let bytes = colour_of(f);
-            let colour = bytes.map(|b| f32::from(b) / 255.0);
-            self.frame(|t| t.clear(colour))?;
-            self.present()?;
-            self.sync()?;
-            let now = Instant::now();
-            intervals.push(now - last);
-            last = now;
-            if looked.contains(&f) {
-                let (_, _, pixels) = read_back(self.target)?;
-                if let Some(at) = pixels.chunks_exact(4).position(|p| !near(p, &bytes)) {
-                    let p = &pixels[at * 4..at * 4 + 4];
-                    return Err(format!(
-                        "frame {f}: pixel ({}, {}) is {p:?}, the clear was {bytes:?}",
-                        at as u32 % SIDE,
-                        at as u32 / SIDE
-                    )
-                    .into());
-                }
-                last = Instant::now();
-            }
-        }
-        let presents = host.presents().ok_or("no swap chain")?;
-        let shown = presents.count.wrapping_sub(before);
-        if shown < frames {
-            return Err(format!(
-                "the swap chain took {shown} of {frames} presents (last {})",
-                hr_text(presents.last.0)
-            )
-            .into());
-        }
-        // The first interval holds the stage's start, the ones after a
-        // read-back are left out above.
-        intervals.remove(0);
-        bench.present = median(&mut intervals);
-        Ok(format!("{frames} frames cleared and presented; 3 of them read back and matched"))
-    }
-
-    fn unified_memory(&self) -> Result<String, Failed> {
-        let buffer = self.buffer_round_trip()?;
-        let texture = self.texture_round_trip()?;
-        Ok(format!("{buffer}; {texture}"))
-    }
-
-    /// A buffer the title writes is copied into another by a list; the title
-    /// reads the copy, changes the first and the change must be there after
-    /// the next submission. (Neither buffer has a host copy yet, so the
-    /// layer copies at submission, `HostList::defer_copy`; the copy on the
-    /// card and its landing are stage 4's.)
-    fn buffer_round_trip(&self) -> Result<String, Failed> {
-        const LEN: usize = 1 << 20;
-        let src = self.buffer(UPLOAD_HEAP, LEN as u64, 0)?;
-        let dst = self.buffer(DEFAULT_HEAP, LEN as u64, 0)?;
-        let from = Self::mapped(src, LEN)?;
-        for (i, b) in from.iter_mut().enumerate() {
-            *b = (i as u32).wrapping_mul(2_654_435_761).rotate_right(13) as u8;
-        }
-        let copy = |t: &Self| {
-            slot::<CopyBuffer>(t.list, 0x78)(t.list, dst, 0, src, 0, LEN as u64);
-            Ok(())
-        };
-        self.frame(copy)?;
-        self.sync()?;
-        let to = Self::mapped(dst, LEN)?;
-        if let Some(at) = first_difference(from, to) {
-            return Err(format!("the buffer copy differs at byte {at}").into());
-        }
-        // The title changes three stretches: one page, a few bytes in the
-        // middle of another, the last bytes.
-        from[4096..8192].fill(0xa5);
-        from[500_000..500_100].fill(0x5a);
-        from[LEN - 17..].fill(0x3c);
-        self.frame(copy)?;
-        self.sync()?;
-        if let Some(at) = first_difference(from, to) {
-            return Err(format!("after the title changed the source, the copy differs at byte {at}").into());
-        }
-        Ok("a 1 MiB buffer copied, changed and copied again".into())
-    }
-
-    /// A texture the title fills in the console's tiled layout is copied into
-    /// the render target, presented and read back; then part of it is
-    /// rewritten in title memory and the next copy must show that part.
-    fn texture_round_trip(&self) -> Result<String, Failed> {
-        use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
-        let layout = Texture::new(&TextureDesc {
-            dimension: Dimension::Tex2d,
-            width: SIDE,
-            height: SIDE,
-            depth_or_array: 1,
-            mips: 1,
-            format: RGBA8,
-            samples: 1,
-            // What the layer takes a texture of layout 0 without target or
-            // depth flags to be in (`resource::texture_layout`).
-            swizzle: Swizzle::SW_4KB_S,
-        })
-        .map_err(|e| format!("no console layout for the texture: {e:?}"))?;
-        let plane = &layout.planes[0].layout;
-        let texture = self.committed(DEFAULT_HEAP, &Self::texture_desc(0), COPY_SOURCE)?;
-        let memory = Self::mapped(texture, layout.size as usize)?;
-        let pitch = SIDE as usize * 4;
-        let mut linear: Vec<u8> = (0..SIDE * SIDE)
-            .flat_map(|i| {
-                let (x, y) = (i % SIDE, i / SIDE);
-                [(x * 4) as u8, (y * 4) as u8, ((x ^ y) * 4) as u8, 255]
-            })
-            .collect();
-        plane.tile(memory, 0, 0, &linear, pitch, 0).map_err(|e| format!("tiling failed: {e:?}"))?;
-        let copied = |t: &Self| {
-            slot::<CopyResource>(t.list, 0x88)(t.list, t.target, texture);
-            Ok(())
-        };
-        self.frame(copied)?;
-        self.present()?;
-        self.sync()?;
-        let (_, _, pixels) = read_back(self.target)?;
-        if let Some(at) = first_far(&pixels, &linear) {
-            return Err(format!("the tiled texture came through wrong at pixel ({}, {})", at % SIDE, at / SIDE).into());
-        }
-        // A 16x16 block rewritten: only the bytes that change are stored,
-        // as a title updating part of a texture writes only its pages.
-        for y in 8..24 {
-            for x in 16..32 {
-                let at = (y * SIDE as usize + x) * 4;
-                linear[at..at + 4].copy_from_slice(&[250, 10, 200, 255]);
-            }
-        }
-        let mut tiled = memory.to_vec();
-        plane.tile(&mut tiled, 0, 0, &linear, pitch, 0).map_err(|e| format!("tiling failed: {e:?}"))?;
-        let mut changed = 0;
-        for (m, t) in memory.iter_mut().zip(&tiled) {
-            if m != t {
-                *m = *t;
-                changed += 1;
-            }
-        }
-        self.frame(copied)?;
-        self.present()?;
-        self.sync()?;
-        let (_, _, pixels) = read_back(self.target)?;
-        if let Some(at) = first_far(&pixels, &linear) {
-            return Err(format!(
-                "after the title rewrote {changed} bytes of the texture, pixel ({}, {}) is still old",
-                at % SIDE,
-                at / SIDE
-            )
-            .into());
-        }
-        Ok(format!("a {SIDE}x{SIDE} tiled texture uploaded, presented, partly rewritten and seen again"))
-    }
-
-    /// The root signature the compute program's layout asks for: four root
-    /// constants (`b0`) and a table of one UAV (`u0`).
-    fn compute_root(&self, imports: &Imports) -> Result<This, Failed> {
-        let range = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-            NumDescriptors: 1,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
-        };
-        let parameters = [
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-        ];
-        self.root_signature(imports, &parameters, D3D12_ROOT_SIGNATURE_FLAG_NONE)
-    }
-
-    /// The root signature of `parameters`, serialized through the title's
-    /// import and created on the device.
-    fn root_signature(
-        &self,
-        imports: &Imports,
-        parameters: &[D3D12_ROOT_PARAMETER],
-        flags: D3D12_ROOT_SIGNATURE_FLAGS,
-    ) -> Result<This, Failed> {
-        let desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: parameters.len() as u32,
-            pParameters: parameters.as_ptr(),
-            NumStaticSamplers: 0,
-            pStaticSamplers: std::ptr::null(),
-            Flags: flags,
-        };
-        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let hr = (imports.serialize_root)((&raw const desc).cast(), 1, &mut blob, &mut error);
-        if !error.is_null() {
-            // SAFETY: the serializer hands out a blob reference of its own.
-            drop(unsafe { windows::Win32::Graphics::Direct3D::ID3DBlob::from_raw(error) });
-        }
-        check("D3D12SerializeRootSignature", hr)?;
-        if blob.is_null() {
-            return Err("D3D12SerializeRootSignature gave no blob".into());
-        }
-        // SAFETY: as above; the blob is ours to release.
-        let blob = unsafe { windows::Win32::Graphics::Direct3D::ID3DBlob::from_raw(blob) };
-        // SAFETY: the blob's own bytes.
-        let (at, len) = unsafe { (blob.GetBufferPointer().cast::<u8>().cast_const(), blob.GetBufferSize()) };
-        let mut root = Self::null();
-        check("CreateRootSignature", slot::<MakeRoot>(self.device, 0x80)(self.device, 0, at, len, &ROOT_SIGNATURE, &mut root))?;
-        Ok(root)
-    }
-
-    /// Why translated shaders cannot run on this adapter, if they cannot.
-    fn no_translated_shaders() -> Option<String> {
-        let Some(host) = crate::host::host() else {
-            return Some("no device".into());
-        };
-        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
-        // SAFETY: a plain query into our structure.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
-        };
-        (asked.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0).then(|| {
-            format!(
-                "the adapter has shader model {}.{}; translated shaders need 6.6",
-                model.HighestShaderModel.0 >> 4,
-                model.HighestShaderModel.0 & 15
-            )
-        })
-    }
-
-    fn translated_shader(&self, imports: &Imports, bench: &mut Bench) -> Outcome {
-        if let Some(why) = Self::no_translated_shaders() {
-            return Outcome::Skip(why);
-        }
-        match self.compute(imports, bench) {
-            Ok(detail) => Outcome::Ok(detail),
-            Err(f) => Outcome::Fail(f.reason),
-        }
-    }
-
-    fn translated_draw(&self, imports: &Imports, bench: &mut Bench) -> Outcome {
-        if let Some(why) = Self::no_translated_shaders() {
-            return Outcome::Skip(why);
-        }
-        self.draw(imports, bench).into_outcome()
-    }
-
-    /// The root signature the draw programs' layouts ask for: four root
-    /// constants for the vertex stage (`b0`, root slot 0) and one for the
-    /// pixel stage (`b1`, slot 1), as a title would declare them.
-    fn draw_root(&self, imports: &Imports) -> Result<This, Failed> {
-        let constants = |register, count, visibility| D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: register, RegisterSpace: 0, Num32BitValues: count },
-            },
-            ShaderVisibility: visibility,
-        };
-        let parameters = [constants(0, 4, D3D12_SHADER_VISIBILITY_VERTEX), constants(1, 1, D3D12_SHADER_VISIBILITY_PIXEL)];
-        self.root_signature(imports, &parameters, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)
-    }
-
-    /// The synthetic vertex and pixel programs, from their containers to
-    /// the pixels they draw: a pipeline-state stream given to the device's
-    /// `CreatePipelineState`, then targets, viewport, scissor, topology, a
-    /// vertex buffer in title memory, root constants and draws through the
-    /// list's table, presented and read back. Twice: one draw over the
-    /// whole target, then two (other constants; the second cut to the left
-    /// half by its scissor) in one list.
-    fn draw(&self, imports: &Imports, bench: &mut Bench) -> Result<String, Failed> {
-        use victory_shader::native::synth;
-        let (vs, ps) = (synth::draw_vertex(), synth::draw_pixel());
-        let root = self.draw_root(imports)?;
-        let inputs = [position_input()];
-        let stream = GraphicsStream::new(root, &vs, &ps, &inputs);
-        let desc = StreamDesc { size: size_of::<GraphicsStream>(), stream: (&raw const stream).cast() };
-        let mut pipeline = Self::null();
-        check("CreatePipelineState", slot::<MakeStream>(self.device, 0x2b0)(self.device, &desc, &PIPELINE, &mut pipeline))?;
-        // One triangle over the whole target: (-1, -1), (-1, 3), (3, -1),
-        // as x, y floats in a title buffer.
-        const STRIDE: u32 = 8;
-        let corners: [f32; 6] = [-1.0, -1.0, -1.0, 3.0, 3.0, -1.0];
-        let vertices = self.buffer(UPLOAD_HEAP, 256, 0)?;
-        let memory = Self::mapped(vertices, 256)?;
-        for (at, c) in memory.chunks_exact_mut(4).zip(corners) {
-            at.copy_from_slice(&c.to_le_bytes());
-        }
-        let view = VertexView {
-            address: slot::<GpuAddress>(vertices, 0x58)(vertices),
-            size: STRIDE * 3,
-            stride: STRIDE,
-        };
-        // As for the compute pipeline: the host pipeline is made on first
-        // use, by the workers; a draw before it is ready would be dropped.
-        let began = Instant::now();
-        self.frame(|t| {
-            slot::<SetPipeline>(t.list, 0xc8)(t.list, pipeline);
-            Ok(())
-        })?;
-        self.sync()?;
-        while crate::pipeline::host_pipeline(pipeline).is_none() {
-            if began.elapsed() > Duration::from_secs(30) {
-                return Err("no host graphics pipeline 30 s after the pipeline's first use (the host refused it or a \
-                            program did not translate, see the log)"
-                    .into());
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        bench.graphics = Some(began.elapsed());
-        let half = Rect { left: 0, top: 0, right: SIDE as i32 / 2, bottom: SIDE as i32 };
-        let whole = Rect { right: SIDE as i32, ..half };
-        // Colours whose channels are whole steps of an 8-bit target.
-        let step = |n: u32| (n as f32 / 255.0).to_bits();
-        let rounds: [&[([u32; 4], u32, &Rect)]; 2] = [
-            &[([step(40), step(200), step(90), step(17)], step(230), &whole)],
-            &[
-                ([step(250), step(5), step(128), step(0)], step(64), &whole),
-                ([step(16), step(96), step(240), step(255)], step(255), &half),
-            ],
-        ];
-        let viewport = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: SIDE as f32, Height: SIDE as f32, MinDepth: 0.0, MaxDepth: 1.0 };
-        let mut draws = 0;
-        for (round, draws_of) in rounds.iter().enumerate() {
-            let ran_before = crate::draw::drawn();
-            self.frame(|t| {
-                let l = t.list;
-                t.transition(t.target, COMMON, RENDER_TARGET);
-                slot::<ClearRtv>(l, 0x1a0)(l, t.rtv, &[0.0, 0.0, 0.0, 0.0], 0, std::ptr::null());
-                slot::<SetTargets>(l, 0x190)(l, 1, &t.rtv, 0, std::ptr::null());
-                slot::<SetViewports>(l, 0xa8)(l, 1, &viewport);
-                slot::<SetTopology>(l, 0xa0)(l, TRIANGLE_LIST);
-                slot::<SetRoot>(l, 0x110)(l, root);
-                slot::<SetPipeline>(l, 0xc8)(l, pipeline);
-                slot::<SetVertexBuffers>(l, 0x180)(l, 0, 1, &view);
-                for (vs_constants, ps_constant, scissor) in draws_of.iter() {
-                    slot::<SetScissors>(l, 0xb0)(l, 1, *scissor);
-                    slot::<SetConstants>(l, 0x140)(l, 0, 4, vs_constants.as_ptr(), 0);
-                    slot::<SetConstants>(l, 0x140)(l, 1, 1, ps_constant, 0);
-                    slot::<Draw>(l, 0x60)(l, 3, 1, 0, 0);
-                }
-                t.transition(t.target, RENDER_TARGET, COMMON);
-                Ok(())
-            })?;
-            self.present()?;
-            self.sync()?;
-            let ran = crate::draw::drawn() - ran_before;
-            if ran < draws_of.len() as u64 {
+        let now = Instant::now();
+        intervals.push(now - last);
+        last = now;
+        if looked.contains(&f) {
+            let (_, _, pixels) = read_back(title.target)?;
+            if let Some(at) = pixels.chunks_exact(4).position(|p| !near(p, &bytes)) {
+                let p = &pixels[at * 4..at * 4 + 4];
                 return Err(format!(
-                    "list {}: {ran} of {} draws ran on the host; the others were dropped",
-                    round + 1,
-                    draws_of.len()
+                    "frame {f}: pixel ({}, {}) is {p:?}, the clear was {bytes:?}",
+                    at as u32 % SIDE,
+                    at as u32 / SIDE
                 )
                 .into());
             }
-            draws += draws_of.len();
-            let (_, _, pixels) = read_back(self.target)?;
-            for (at, pixel) in pixels.chunks_exact(4).enumerate() {
-                let (x, y) = (at as u32 % SIDE, at as u32 / SIDE);
-                // The last draw whose scissor holds the pixel.
-                let last = draws_of.iter().rev().find(|d| (x as i32) < d.2.right && (y as i32) < d.2.bottom);
-                let Some((vs_constants, ps_constant, _)) = last else { continue };
-                let want = synth::draw_colour(*vs_constants, *ps_constant).map(|c| (c * 255.0).round() as u8);
-                if !near(pixel, &want) {
-                    return Err(format!(
-                        "list {}: pixel ({x}, {y}) is {pixel:?}, the programs draw {want:?} there",
-                        round + 1
-                    )
-                    .into());
-                }
-            }
+            last = Instant::now();
         }
-        Ok(format!(
-            "a {}-byte vertex and a {}-byte pixel container translated, made a host graphics pipeline from a \
-             pipeline stream; {draws} draws in 2 lists presented and read back, every pixel matched",
-            vs.len(),
-            ps.len()
-        ))
     }
-
-    /// The synthetic compute program, from its container to the values it
-    /// stores in title memory.
-    fn compute(&self, imports: &Imports, bench: &mut Bench) -> Result<String, Failed> {
-        use victory_shader::native::synth;
-        let container = synth::container(&[synth::pattern_store()], &[]);
-        // The translation a pipeline's first use makes, timed apart (the
-        // pipeline below translates again: there is no cache on disk here).
-        let began = Instant::now();
-        crate::shader_cache::host_shader(&container).map_err(|e| format!("the translator refused our program: {e}"))?;
-        bench.translate = Some(began.elapsed());
-        let root = self.compute_root(imports)?;
-        let desc = ComputeDesc {
-            root,
-            code: container.as_ptr(),
-            size: container.len(),
-            nodes: 0,
-            cached: std::ptr::null(),
-            cached_size: 0,
-            flags: 0,
-        };
-        let mut pipeline = Self::null();
-        check("CreateComputePipelineState", slot::<MakeCompute>(self.device, 0x58)(self.device, &desc, &PIPELINE, &mut pipeline))?;
-        let mut heap = Self::null();
-        let heap_desc = HeapDesc { kind: VIEW_HEAP, count: 4, flags: SHADER_VISIBLE, nodes: 0, after: [0; 2] };
-        check("CreateDescriptorHeap", slot::<MakeHeap>(self.device, 0x70)(self.device, &heap_desc, &DESCRIPTOR_HEAP, &mut heap))?;
-        let (cpu, gpu) = (slot::<HeapStart>(heap, 0x48)(heap), slot::<HeapStart>(heap, 0x50)(heap));
-        const LEN: usize = 64 << 10;
-        let out = self.buffer(DEFAULT_HEAP, LEN as u64, UNORDERED_FLAG)?;
-        let memory = Self::mapped(out, LEN)?;
-        for word in memory.chunks_exact_mut(4) {
-            word.copy_from_slice(&0xdead_beefu32.to_le_bytes());
-        }
-        // R32_TYPELESS, buffer, raw.
-        let view = RawUav { format: 39, dimension: 1, first: 0, count: (LEN / 4) as u32, stride: 0, counter_offset: 0, flags: 1, _pad: 0 };
-        slot::<MakeUav>(self.device, 0x98)(self.device, out, Self::null(), &view, cpu);
-        let record = |t: &Self, constants: [u32; 4]| {
-            slot::<SetHeaps>(t.list, 0x100)(t.list, 1, &heap);
-            slot::<SetRoot>(t.list, 0x108)(t.list, root);
-            slot::<SetPipeline>(t.list, 0xc8)(t.list, pipeline);
-            slot::<SetConstants>(t.list, 0x138)(t.list, 0, 4, constants.as_ptr(), 0);
-            slot::<SetTable>(t.list, 0x118)(t.list, 1, gpu);
-            slot::<Dispatch>(t.list, 0x70)(t.list, 1, 1, 1);
-        };
-        // A host pipeline is made on the pipeline's first use, by the
-        // pipeline workers; a dispatch before it is ready is dropped, as a
-        // title's is. Bind it once, then wait for it.
-        let began = Instant::now();
-        self.frame(|t| {
-            slot::<SetPipeline>(t.list, 0xc8)(t.list, pipeline);
-            Ok(())
-        })?;
-        self.sync()?;
-        while crate::pipeline::host_pipeline(pipeline).is_none() {
-            if began.elapsed() > Duration::from_secs(30) {
-                return Err("no host pipeline 30 s after the pipeline's first use (the host refused it, see the log)".into());
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        bench.pipeline = Some(began.elapsed());
-        let threads = synth::PATTERN_THREADS as usize;
-        for (round, constants) in [[0x1234_5678u32, 7, 0, 0], [0x0bad_f00d, 1000, 0, 0]].into_iter().enumerate() {
-            self.frame(|t| {
-                record(t, constants);
-                Ok(())
-            })?;
-            self.sync()?;
-            for i in 0..LEN / 4 {
-                let got = u32::from_le_bytes(memory[4 * i..4 * i + 4].try_into().unwrap_or_default());
-                let want = if i < threads { synth::pattern_value(i as u32, [constants[0], constants[1]]) } else { 0xdead_beef };
-                if got != want {
-                    return Err(format!(
-                        "dispatch {}: title memory at dword {i} holds {got:#010x}, the program stores {want:#010x}",
-                        round + 1
-                    )
-                    .into());
-                }
-            }
-        }
-        // The shader's buffer has a host copy now, so a list's copy into it
-        // is made on the card at its place in the list (`host/place.rs`) and
-        // must come back into title memory as the shader's stores did.
-        const AT: usize = 8192;
-        const PIECE: usize = 4096;
-        let on_card = crate::shadow::peek(memory.as_ptr() as u64 + AT as u64, PIECE as u64).is_some();
-        let src = self.buffer(UPLOAD_HEAP, PIECE as u64, 0)?;
-        let from = Self::mapped(src, PIECE)?;
-        for (i, b) in from.iter_mut().enumerate() {
-            *b = (i * 7 + 3) as u8;
-        }
-        self.frame(|t| {
-            slot::<CopyBuffer>(t.list, 0x78)(t.list, out, AT as u64, src, 0, PIECE as u64);
-            Ok(())
-        })?;
-        self.sync()?;
-        if let Some(at) = first_difference(from, &memory[AT..AT + PIECE]) {
-            return Err(format!("a copy into the shader's buffer did not land: byte {} differs", AT + at).into());
-        }
-        let after = u32::from_le_bytes(memory[AT + PIECE..AT + PIECE + 4].try_into().unwrap_or_default());
-        if after != 0xdead_beef {
-            return Err(format!("a copy into the shader's buffer wrote past its end ({after:#010x})").into());
-        }
-        Ok(format!(
-            "a {}-byte compute container translated, made a host pipeline, dispatched twice; its stores and a list's copy \
-             {} landed in title memory",
-            container.len(),
-            if on_card { "on the card" } else { "at submission" }
-        ))
+    let presents = host.presents().ok_or("no swap chain")?;
+    let shown = presents.count.wrapping_sub(before);
+    if shown < frames {
+        return Err(format!(
+            "the swap chain took {shown} of {frames} presents (last {})",
+            hr_text(presents.last.0)
+        )
+        .into());
     }
+    // The first interval holds the stage's start, the ones after a
+    // read-back are left out above.
+    intervals.remove(0);
+    bench.present = median(&mut intervals);
+    Ok(format!("{frames} frames cleared and presented; 3 of them read back and matched"))
+}
 
-    fn bench(&self, measured: Bench) -> Vec<Rate> {
-        let mut rates = Vec::new();
-        if let Some(d) = measured.present {
-            rates.push(Rate { name: "present_interval", value: ms(d), unit: "ms", what: "one cleared 64x64 frame, presented and waited for (median)" });
-        }
-        if let Ok(r) = self.bench_copy() {
-            rates.push(r);
-        }
-        if let Some(r) = bench_watch() {
-            rates.push(r);
-        }
-        if let Some(r) = bench_compare() {
-            rates.push(r);
-        }
-        if let Ok(r) = self.bench_recording() {
-            rates.push(r);
-        }
-        if let Some(d) = measured.translate {
-            rates.push(Rate { name: "shader_translation", value: ms(d), unit: "ms", what: "the synthetic compute container to DXIL" });
-        }
-        if let Some(d) = measured.pipeline {
-            rates.push(Rate { name: "pipeline_creation", value: ms(d), unit: "ms", what: "first use to a host compute pipeline, translation included" });
-        }
-        if let Some(d) = measured.graphics {
-            rates.push(Rate {
-                name: "graphics_pipeline_creation",
-                value: ms(d),
-                unit: "ms",
-                what: "first use to a host vertex and pixel pipeline, both translations included",
-            });
-        }
-        rates
+fn unified_memory(title: &Title) -> Result<String, Failed> {
+    let buffer = buffer_round_trip(title)?;
+    let texture = texture_round_trip(title)?;
+    Ok(format!("{buffer}; {texture}"))
+}
+
+/// A buffer the title writes is copied into another by a list; the title
+/// reads the copy, changes the first and the change must be there after
+/// the next submission. (Neither buffer has a host copy yet, so the
+/// layer copies at submission, `HostList::defer_copy`; the copy on the
+/// card and its landing are stage 4's.)
+fn buffer_round_trip(title: &Title) -> Result<String, Failed> {
+    let mut buffers = BufferCopy::new(title, 1 << 20)?;
+    title.frame(|t| {
+        buffers.record(t);
+        Ok(())
+    })?;
+    title.sync()?;
+    if let Some(at) = buffers.differs() {
+        return Err(format!("the buffer copy differs at byte {at}").into());
     }
-
-    /// A 64 MiB title buffer, all of it changed by the title before each
-    /// copy, copied by a list into another and waited for.
-    fn bench_copy(&self) -> Result<Rate, Failed> {
-        const LEN: usize = 64 << 20;
-        let src = self.buffer(UPLOAD_HEAP, LEN as u64, 0)?;
-        let dst = self.buffer(DEFAULT_HEAP, LEN as u64, 0)?;
-        let from = Self::mapped(src, LEN)?;
-        let mut times = Vec::new();
-        for round in 0..6u8 {
-            from.fill(round);
-            let began = Instant::now();
-            self.frame(|t| {
-                slot::<CopyBuffer>(t.list, 0x78)(t.list, dst, 0, src, 0, LEN as u64);
-                Ok(())
-            })?;
-            self.sync()?;
-            times.push(began.elapsed());
-        }
-        times.remove(0);
-        let t = median(&mut times).ok_or("no rounds")?;
-        Ok(Rate {
-            name: "buffer_copy",
-            value: LEN as f64 / (1 << 20) as f64 / t.as_secs_f64(),
-            unit: "MB/s",
-            what: "64 MiB the title rewrote, copied by a list into another title buffer (median of 5)",
-        })
+    buffers.change(0);
+    title.frame(|t| {
+        buffers.record(t);
+        Ok(())
+    })?;
+    title.sync()?;
+    if let Some(at) = buffers.differs() {
+        return Err(format!("after the title changed the source, the copy differs at byte {at}").into());
     }
+    Ok("a 1 MiB buffer copied, changed and copied again".into())
+}
 
-    /// Commands a list records per second: render-target clears of one
-    /// pixel, which go through the list's table and onto the host list.
-    fn bench_recording(&self) -> Result<Rate, Failed> {
-        const CALLS: u32 = 20_000;
-        let mut took = Duration::ZERO;
-        self.frame(|t| {
+/// A texture the title fills in the console's tiled layout is copied into
+/// the render target, presented and read back; then part of it is
+/// rewritten in title memory and the next copy must show that part.
+fn texture_round_trip(title: &Title) -> Result<String, Failed> {
+    let mut texture = TiledTexture::new(title)?;
+    let copied = |t: &Title, texture: &TiledTexture| {
+        texture.record_copy(t);
+        Ok(())
+    };
+    title.frame(|t| copied(t, &texture))?;
+    title.present()?;
+    title.sync()?;
+    let (_, _, pixels) = read_back(title.target)?;
+    if let Some(at) = first_far(&pixels, texture.picture()) {
+        return Err(format!("the tiled texture came through wrong at pixel ({}, {})", at % SIDE, at / SIDE).into());
+    }
+    let changed = texture.rewrite_block([250, 10, 200, 255])?;
+    title.frame(|t| copied(t, &texture))?;
+    title.present()?;
+    title.sync()?;
+    let (_, _, pixels) = read_back(title.target)?;
+    if let Some(at) = first_far(&pixels, texture.picture()) {
+        return Err(format!(
+            "after the title rewrote {changed} bytes of the texture, pixel ({}, {}) is still old",
+            at % SIDE,
+            at / SIDE
+        )
+        .into());
+    }
+    Ok(format!("a {SIDE}x{SIDE} tiled texture uploaded, presented, partly rewritten and seen again"))
+}
+
+/// Why translated shaders cannot run on this adapter, if they cannot.
+fn no_translated_shaders() -> Option<String> {
+    let Some(host) = crate::host::host() else {
+        return Some("no device".into());
+    };
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+    // SAFETY: a plain query into our structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+    };
+    (asked.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0).then(|| {
+        format!(
+            "the adapter has shader model {}.{}; translated shaders need 6.6",
+            model.HighestShaderModel.0 >> 4,
+            model.HighestShaderModel.0 & 15
+        )
+    })
+}
+
+fn translated_shader(title: &Title, bench: &mut Bench) -> Outcome {
+    if let Some(why) = no_translated_shaders() {
+        return Outcome::Skip(why);
+    }
+    compute(title, bench).into_outcome()
+}
+
+fn translated_draw(title: &Title, bench: &mut Bench) -> Outcome {
+    if let Some(why) = no_translated_shaders() {
+        return Outcome::Skip(why);
+    }
+    draw(title, bench).into_outcome()
+}
+
+/// A pipeline's first use, then a wait for its host pipeline: it is made
+/// on first use, by the pipeline workers (`pipeline/make.rs`), and a draw
+/// or dispatch before it is ready would be dropped, as a title's is. How
+/// long it took.
+fn first_use(title: &Title, pipeline: Obj, refused: &str) -> Result<Duration, Failed> {
+    let began = Instant::now();
+    title.frame(|t| {
+        t.set_pipeline(pipeline);
+        Ok(())
+    })?;
+    title.sync()?;
+    while crate::pipeline::host_pipeline(pipeline.cast()).is_none() {
+        if began.elapsed() > Duration::from_secs(30) {
+            return Err(refused.into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Ok(began.elapsed())
+}
+
+/// The synthetic vertex and pixel programs, from their containers to
+/// the pixels they draw: a pipeline-state stream given to the device's
+/// `CreatePipelineState`, then targets, viewport, scissor, topology, a
+/// vertex buffer in title memory, root constants and draws through the
+/// list's table, presented and read back. Twice: one draw over the
+/// whole target, then two (other constants; the second cut to the left
+/// half by its scissor) in one list.
+fn draw(title: &Title, bench: &mut Bench) -> Result<String, Failed> {
+    let drawing = Drawing::new(title)?;
+    bench.graphics = Some(first_use(
+        title,
+        drawing.pipeline,
+        "no host graphics pipeline 30 s after the pipeline's first use (the host refused it or a program did not \
+         translate, see the log)",
+    )?);
+    let rounds: [&[DrawCall]; 2] = [
+        &[DrawCall { vs: [step(40), step(200), step(90), step(17)], ps: step(230), scissor: WHOLE }],
+        &[
+            DrawCall { vs: [step(250), step(5), step(128), step(0)], ps: step(64), scissor: WHOLE },
+            DrawCall { vs: [step(16), step(96), step(240), step(255)], ps: step(255), scissor: LEFT_HALF },
+        ],
+    ];
+    let mut draws = 0;
+    for (round, draws_of) in rounds.iter().enumerate() {
+        let ran_before = crate::draw::drawn();
+        title.frame(|t| {
             t.transition(t.target, COMMON, RENDER_TARGET);
-            let clear = slot::<ClearRtv>(t.list, 0x1a0);
-            let one = Rect { left: 0, top: 0, right: 1, bottom: 1 };
-            let began = Instant::now();
-            for i in 0..CALLS {
-                let c = (i % 255) as f32 / 255.0;
-                clear(t.list, t.rtv, &[c, c, c, 1.0], 1, &one);
-            }
-            took = began.elapsed();
+            t.clear_target([0.0, 0.0, 0.0, 0.0]);
+            drawing.record(t, draws_of);
             t.transition(t.target, RENDER_TARGET, COMMON);
             Ok(())
         })?;
-        self.sync()?;
-        Ok(Rate {
-            name: "list_recording",
-            value: f64::from(CALLS) / took.as_secs_f64(),
-            unit: "calls/s",
-            what: "ClearRenderTargetView calls through the list's table onto the host list",
-        })
+        title.present()?;
+        title.sync()?;
+        let ran = crate::draw::drawn() - ran_before;
+        if ran < draws_of.len() as u64 {
+            return Err(format!(
+                "list {}: {ran} of {} draws ran on the host; the others were dropped",
+                round + 1,
+                draws_of.len()
+            )
+            .into());
+        }
+        draws += draws_of.len();
+        let (_, _, pixels) = read_back(title.target)?;
+        for (at, pixel) in pixels.chunks_exact(4).enumerate() {
+            let (x, y) = (at as u32 % SIDE, at as u32 / SIDE);
+            // The last draw whose scissor holds the pixel.
+            let inside = |r: &Rect| (x as i32) < r.right && (y as i32) < r.bottom;
+            let Some(last) = draws_of.iter().rev().find(|d| inside(&d.scissor)) else { continue };
+            let want = last.colour();
+            if !near(pixel, &want) {
+                return Err(format!(
+                    "list {}: pixel ({x}, {y}) is {pixel:?}, the programs draw {want:?} there",
+                    round + 1
+                )
+                .into());
+            }
+        }
     }
+    Ok(format!(
+        "a {}-byte vertex and a {}-byte pixel container translated, made a host graphics pipeline from a \
+         pipeline stream; {draws} draws in 2 lists presented and read back, every pixel matched",
+        drawing.vs.len(),
+        drawing.ps.len()
+    ))
+}
+
+/// The synthetic compute program, from its container to the values it
+/// stores in title memory.
+fn compute(title: &Title, bench: &mut Bench) -> Result<String, Failed> {
+    use victory_shader::native::synth;
+    let container = synth::container(&[synth::pattern_store()], &[]);
+    // The translation a pipeline's first use makes, timed apart (the
+    // pipeline below translates again: there is no cache on disk here).
+    let began = Instant::now();
+    crate::shader_cache::host_shader(&container).map_err(|e| format!("the translator refused our program: {e}"))?;
+    bench.translate = Some(began.elapsed());
+    let mut compute = Compute::new(title)?;
+    bench.pipeline = Some(first_use(
+        title,
+        compute.pipeline,
+        "no host pipeline 30 s after the pipeline's first use (the host refused it, see the log)",
+    )?);
+    for (round, constants) in [[0x1234_5678u32, 7, 0, 0], [0x0bad_f00d, 1000, 0, 0]].into_iter().enumerate() {
+        title.frame(|t| {
+            compute.record_dispatch(t, constants);
+            Ok(())
+        })?;
+        title.sync()?;
+        compute.check_stores(constants, &format!("dispatch {}", round + 1))?;
+    }
+    // The shader's buffer has a host copy now, so a list's copy into it
+    // is made on the card at its place in the list (`host/place.rs`) and
+    // must come back into title memory as the shader's stores did.
+    let on_card = crate::shadow::peek(compute.memory().address() + PIECE_AT as u64, PIECE as u64).is_some();
+    compute.write_piece(0);
+    title.frame(|t| {
+        compute.record_copy_in(t);
+        Ok(())
+    })?;
+    title.sync()?;
+    compute.check_copy_in()?;
+    Ok(format!(
+        "a {}-byte compute container translated, made a host pipeline, dispatched twice; its stores and a list's copy \
+         {} landed in title memory",
+        container.len(),
+        if on_card { "on the card" } else { "at submission" }
+    ))
+}
+
+fn rates(title: &Title, measured: Bench) -> Vec<Rate> {
+    let mut rates = Vec::new();
+    if let Some(d) = measured.present {
+        rates.push(Rate { name: "present_interval", value: ms(d), unit: "ms", what: "one cleared 64x64 frame, presented and waited for (median)" });
+    }
+    if let Ok(r) = bench_copy(title) {
+        rates.push(r);
+    }
+    if let Some(r) = bench_watch() {
+        rates.push(r);
+    }
+    if let Some(r) = bench_compare() {
+        rates.push(r);
+    }
+    if let Ok(r) = bench_recording(title) {
+        rates.push(r);
+    }
+    if let Some(d) = measured.translate {
+        rates.push(Rate { name: "shader_translation", value: ms(d), unit: "ms", what: "the synthetic compute container to DXIL" });
+    }
+    if let Some(d) = measured.pipeline {
+        rates.push(Rate { name: "pipeline_creation", value: ms(d), unit: "ms", what: "first use to a host compute pipeline, translation included" });
+    }
+    if let Some(d) = measured.graphics {
+        rates.push(Rate {
+            name: "graphics_pipeline_creation",
+            value: ms(d),
+            unit: "ms",
+            what: "first use to a host vertex and pixel pipeline, both translations included",
+        });
+    }
+    rates
+}
+
+/// A 64 MiB title buffer, all of it changed by the title before each
+/// copy, copied by a list into another and waited for.
+fn bench_copy(title: &Title) -> Result<Rate, Failed> {
+    const LEN: usize = 64 << 20;
+    let mut buffers = BufferCopy::new(title, LEN)?;
+    let mut times = Vec::new();
+    for round in 0..6u8 {
+        buffers.fill(round);
+        let began = Instant::now();
+        title.frame(|t| {
+            buffers.record(t);
+            Ok(())
+        })?;
+        title.sync()?;
+        times.push(began.elapsed());
+    }
+    times.remove(0);
+    let t = median(&mut times).ok_or("no rounds")?;
+    Ok(Rate {
+        name: "buffer_copy",
+        value: LEN as f64 / (1 << 20) as f64 / t.as_secs_f64(),
+        unit: "MB/s",
+        what: "64 MiB the title rewrote, copied by a list into another title buffer (median of 5)",
+    })
+}
+
+/// Commands a list records per second: render-target clears of one
+/// pixel, which go through the list's table and onto the host list.
+fn bench_recording(title: &Title) -> Result<Rate, Failed> {
+    const CALLS: u32 = 20_000;
+    let mut took = Duration::ZERO;
+    title.frame(|t| {
+        t.transition(t.target, COMMON, RENDER_TARGET);
+        let one = [Rect { left: 0, top: 0, right: 1, bottom: 1 }];
+        let began = Instant::now();
+        for i in 0..CALLS {
+            let c = (i % 255) as f32 / 255.0;
+            t.clear_rects([c, c, c, 1.0], &one);
+        }
+        took = began.elapsed();
+        t.transition(t.target, RENDER_TARGET, COMMON);
+        Ok(())
+    })?;
+    title.sync()?;
+    Ok(Rate {
+        name: "list_recording",
+        value: f64::from(CALLS) / took.as_secs_f64(),
+        unit: "calls/s",
+        what: "ClearRenderTargetView calls through the list's table onto the host list",
+    })
 }
 
 /// What stage 2 and the shader stages measured for the benchmark.
@@ -1418,10 +695,6 @@ fn near(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 1)
 }
 
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    a.iter().zip(b).position(|(x, y)| x != y)
-}
-
 /// The first pixel of `a` not [`near`] the same one of `b`.
 fn first_far(a: &[u8], b: &[u8]) -> Option<u32> {
     a.chunks_exact(4).zip(b.chunks_exact(4)).position(|(x, y)| !near(x, y)).map(|i| i as u32)
@@ -1429,7 +702,8 @@ fn first_far(a: &[u8], b: &[u8]) -> Option<u32> {
 
 /// The host copy of a title texture of RGBA8, read back: width, height and
 /// tight rows. The title's work must have been waited for.
-fn read_back(texture: This) -> Result<(u32, u32, Vec<u8>), Failed> {
+fn read_back(texture: Obj) -> Result<(u32, u32, Vec<u8>), Failed> {
+    let texture: This = texture.cast();
     let host = crate::host::host().ok_or("no host")?;
     let image = crate::resource::host_resource(texture).ok_or("the texture has no host copy")?;
     // SAFETY: a live resource.
@@ -1578,33 +852,92 @@ fn bench_compare() -> Option<Rate> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::offset_of;
+
+    use victory_standin::pc;
+
     use super::*;
 
-    /// The structures are laid out as the layer reads them.
+    /// The stand-in's structures are laid out as the host's bindings of the
+    /// D3D12 headers say, field for field where a title's code reads them.
     #[test]
     fn structures_have_the_pc_layouts() {
-        assert_eq!(size_of::<ResourceDesc>(), 56);
-        assert_eq!(size_of::<Barrier>(), size_of::<D3D12_RESOURCE_BARRIER>());
-        assert_eq!(size_of::<RawUav>(), 40);
-        assert_eq!(size_of::<ComputeDesc>(), size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>());
-        assert_eq!(std::mem::offset_of!(Planes, resources), 0x10);
-        assert_eq!(size_of::<Planes>(), 0x90);
-        assert_eq!(size_of::<QueueDesc>(), 16);
-        assert_eq!(size_of::<VertexView>(), size_of::<D3D12_VERTEX_BUFFER_VIEW>());
-        assert_eq!(size_of::<Code>(), size_of::<D3D12_SHADER_BYTECODE>());
+        use pc::Sub;
+        assert_eq!(size_of::<pc::ResourceDesc>(), size_of::<D3D12_RESOURCE_DESC>());
+        assert_eq!(offset_of!(pc::ResourceDesc, layout), offset_of!(D3D12_RESOURCE_DESC, Layout));
+        assert_eq!(size_of::<pc::Barrier>(), size_of::<D3D12_RESOURCE_BARRIER>());
+        assert_eq!(size_of::<pc::RawUav>(), 40);
+        assert_eq!(size_of::<pc::ComputeDesc>(), size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>());
+        assert_eq!(offset_of!(pc::ComputeDesc, flags), offset_of!(D3D12_COMPUTE_PIPELINE_STATE_DESC, Flags));
+        assert_eq!(offset_of!(pc::Planes, resources), 0x10);
+        assert_eq!(size_of::<pc::Planes>(), 0x90);
+        assert_eq!(size_of::<pc::QueueDesc>(), size_of::<D3D12_COMMAND_QUEUE_DESC>());
+        assert_eq!(size_of::<pc::HeapProperties>(), size_of::<D3D12_HEAP_PROPERTIES>());
+        assert_eq!(size_of::<pc::VertexView>(), size_of::<D3D12_VERTEX_BUFFER_VIEW>());
+        assert_eq!(size_of::<pc::Code>(), size_of::<D3D12_SHADER_BYTECODE>());
+        assert_eq!(size_of::<pc::Viewport>(), size_of::<D3D12_VIEWPORT>());
+        // `D3D12_RECT` is `RECT`: four 32-bit edges.
+        assert_eq!(size_of::<pc::Rect>(), 16);
+        // The two sides of one header: what the stand-in passes and what
+        // the layer checked its layouts against.
+        assert_eq!(victory_standin::INTERFACE_VERSION, crate::device::CHECKED_VERSION);
+        assert_eq!(size_of::<pc::VirtualMemory>(), size_of::<crate::device::VirtualMemory>());
+        assert_eq!(size_of::<pc::BlendTarget>(), size_of::<D3D12_RENDER_TARGET_BLEND_DESC>());
+        assert_eq!(offset_of!(pc::BlendTarget, write_mask), offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask));
+        assert_eq!(size_of::<pc::BlendDesc>(), size_of::<D3D12_BLEND_DESC>());
+        assert_eq!(size_of::<pc::RasterizerDesc>(), size_of::<D3D12_RASTERIZER_DESC>());
+        assert_eq!(offset_of!(pc::RasterizerDesc, depth_clip), offset_of!(D3D12_RASTERIZER_DESC, DepthClipEnable));
+        assert_eq!(size_of::<pc::DepthStencilDesc1>(), size_of::<D3D12_DEPTH_STENCIL_DESC1>());
+        assert_eq!(offset_of!(pc::DepthStencilDesc1, front), offset_of!(D3D12_DEPTH_STENCIL_DESC1, FrontFace));
+        assert_eq!(offset_of!(pc::DepthStencilDesc1, depth_bounds_test), offset_of!(D3D12_DEPTH_STENCIL_DESC1, DepthBoundsTestEnable));
+        assert_eq!(size_of::<pc::InputElement>(), size_of::<D3D12_INPUT_ELEMENT_DESC>());
+        assert_eq!(offset_of!(pc::InputElement, class), offset_of!(D3D12_INPUT_ELEMENT_DESC, InputSlotClass));
+        assert_eq!(size_of::<pc::InputLayout>(), size_of::<D3D12_INPUT_LAYOUT_DESC>());
+        assert_eq!(size_of::<pc::TargetFormats>(), size_of::<D3D12_RT_FORMAT_ARRAY>());
+        assert_eq!(size_of::<pc::SampleDesc>(), size_of::<DXGI_SAMPLE_DESC>());
+        assert_eq!(size_of::<pc::DescriptorRange>(), size_of::<D3D12_DESCRIPTOR_RANGE>());
+        assert_eq!(size_of::<pc::RootParameter>(), size_of::<D3D12_ROOT_PARAMETER>());
+        assert_eq!(offset_of!(pc::RootParameter, visibility), offset_of!(D3D12_ROOT_PARAMETER, ShaderVisibility));
+        assert_eq!(size_of::<pc::RootDesc>(), size_of::<D3D12_ROOT_SIGNATURE_DESC>());
+        assert_eq!(offset_of!(pc::RootDesc, flags), offset_of!(D3D12_ROOT_SIGNATURE_DESC, Flags));
         // Each subobject is as long as the layer's walk of a stream takes
         // it to be (`pipeline::subobject`, D3D12's padding to a pointer).
-        assert_eq!(size_of::<Sub<This>>(), 16);
-        assert_eq!(size_of::<Sub<Code>>(), 24);
-        assert_eq!(size_of::<Sub<D3D12_BLEND_DESC>>(), 336);
+        assert_eq!(size_of::<Sub<pc::Obj>>(), 16);
+        assert_eq!(size_of::<Sub<pc::Code>>(), 24);
+        assert_eq!(size_of::<Sub<pc::BlendDesc>>(), 336);
         assert_eq!(size_of::<Sub<u32>>(), 8);
-        assert_eq!(size_of::<Sub<D3D12_RASTERIZER_DESC>>(), 48);
-        assert_eq!(size_of::<Sub<D3D12_DEPTH_STENCIL_DESC1>>(), 64);
-        assert_eq!(size_of::<Sub<D3D12_INPUT_LAYOUT_DESC>>(), 24);
-        assert_eq!(size_of::<Sub<D3D12_RT_FORMAT_ARRAY>>(), 40);
-        assert_eq!(size_of::<Sub<DXGI_SAMPLE_DESC>>(), 16);
-        assert_eq!(std::mem::offset_of!(GraphicsStream, samples), 0x258);
-        assert_eq!(size_of::<GraphicsStream>(), 0x268);
+        assert_eq!(size_of::<Sub<pc::RasterizerDesc>>(), 48);
+        assert_eq!(size_of::<Sub<pc::DepthStencilDesc1>>(), 64);
+        assert_eq!(size_of::<Sub<pc::InputLayout>>(), 24);
+        assert_eq!(size_of::<Sub<pc::TargetFormats>>(), 40);
+        assert_eq!(size_of::<Sub<pc::SampleDesc>>(), 16);
+        assert_eq!(offset_of!(pc::GraphicsStream, samples), 0x258);
+        assert_eq!(size_of::<pc::GraphicsStream>(), 0x268);
+    }
+
+    /// The values the stand-in writes into those structures are the
+    /// headers' (it names them by number, having no bindings).
+    #[test]
+    fn values_are_the_pc_ones() {
+        assert_eq!(D3D12_BLEND_ONE.0, 2);
+        assert_eq!(D3D12_BLEND_ZERO.0, 1);
+        assert_eq!(D3D12_BLEND_OP_ADD.0, 1);
+        assert_eq!(D3D12_LOGIC_OP_NOOP.0, 4);
+        assert_eq!(D3D12_FILL_MODE_SOLID.0, 3);
+        assert_eq!(D3D12_CULL_MODE_NONE.0, 1);
+        assert_eq!(D3D12_STENCIL_OP_KEEP.0, 1);
+        assert_eq!(D3D12_COMPARISON_FUNC_ALWAYS.0, 8);
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE.0 as u32, pc::ROOT_TABLE);
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS.0 as u32, pc::ROOT_CONSTANTS);
+        assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_UAV.0 as u32, pc::RANGE_UAV);
+        assert_eq!(D3D12_SHADER_VISIBILITY_VERTEX.0 as u32, pc::VISIBLE_VERTEX);
+        assert_eq!(D3D12_SHADER_VISIBILITY_PIXEL.0 as u32, pc::VISIBLE_PIXEL);
+        assert_eq!(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT.0 as u32, pc::ROOT_INPUT_LAYOUT);
+        assert_eq!(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, pc::COPY_DEST);
+        assert_eq!(D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, pc::COPY_SOURCE);
+        assert_eq!(D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32, pc::RENDER_TARGET);
+        assert_eq!(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT.0 as u32, pc::RG32_FLOAT);
+        assert_eq!(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, pc::RGBA8);
     }
 
     #[test]

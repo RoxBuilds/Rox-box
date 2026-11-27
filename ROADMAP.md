@@ -68,7 +68,10 @@ A change should be provable on a contributor's PC and in CI:
 - an **open demo title**: a real PE32+ image built from our own source that
   goes through the loader, the runtime and the graphics layer with synthetic
   console shaders. It turns the self-test's in-process scene into a full run
-  and is the benchmark every performance claim is made against;
+  and is the benchmark every performance claim is made against. It exists
+  (`tests/fixtures/demo-title`, [docs/demo-title.md](docs/demo-title.md)), and
+  `cargo test --workspace` runs it with `victory run` on the software
+  adapter;
 - **benchmark gates** in CI: the self-test's rates and the demo title's frame
   times, compared with the previous commit;
 - **frame captures of the demo title** for the replay tool

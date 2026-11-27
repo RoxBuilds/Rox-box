@@ -302,9 +302,10 @@ fn memory_item(commit: Option<(u64, u64)>) -> Item {
 }
 
 /// What the graphics adapter gives, as items: the device, the shader model,
-/// mesh shaders.
+/// mesh shaders. `asked_software`: the software adapter was asked for
+/// (`VICTORY_D3D12_WARP=1`), so it is no surprise that the card is one.
 #[cfg(windows)]
-fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::NoDevice>) -> Vec<Item> {
+fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::NoDevice>, asked_software: bool) -> Vec<Item> {
     const UPDATE: &str = "update the graphics driver (from the card maker's site) and Windows; \
                           if it stays, this graphics card is too old";
     let gpu = match gpu {
@@ -332,7 +333,13 @@ fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::No
         gpu.dedicated_mb,
         gpu.driver.as_deref().unwrap_or("unknown")
     );
-    let card = if gpu.software {
+    let card = if gpu.software && asked_software {
+        Item::warn(
+            "Graphics card",
+            format!("{described}: the software adapter, as VICTORY_D3D12_WARP=1 asks"),
+            "unset VICTORY_D3D12_WARP to run on the graphics card: titles run at seconds per frame on this adapter",
+        )
+    } else if gpu.software {
         Item::warn(
             "Graphics card",
             format!("{described}: a software adapter, not a graphics card"),
@@ -365,6 +372,14 @@ fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::No
 
 /// The host's side: processor, Windows, memory, graphics.
 fn host_items() -> Vec<Item> {
+    host_items_and_device().0
+}
+
+/// [`host_items`], and whether there is a Direct3D 12 device at all on the
+/// adapter a run would use: the default one, or the software adapter when
+/// `VICTORY_D3D12_WARP=1` asks for it (the host makes its device there in
+/// every build, `victory-gpu/src/host.rs`).
+fn host_items_and_device() -> (Vec<Item>, bool) {
     #[cfg(target_arch = "x86_64")]
     let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
@@ -373,14 +388,37 @@ fn host_items() -> Vec<Item> {
     let mut items = vec![cpu_item(has_avx2, skip.as_deref())];
     #[cfg(windows)]
     {
-        items.push(windows_item(victory_gpu::preflight::windows_version()));
-        items.push(memory_item(victory_gpu::preflight::commit_memory_mb()));
-        items.extend(gpu_items(victory_gpu::preflight::gpu()));
+        use victory_gpu::preflight as host;
+        items.push(windows_item(host::windows_version()));
+        items.push(memory_item(host::commit_memory_mb()));
+        let software = host::software_asked();
+        let gpu = if software { host::software_gpu() } else { host::gpu() };
+        let device = gpu.is_ok();
+        items.extend(gpu_items(gpu, software));
+        (items, device)
     }
     #[cfg(not(windows))]
-    items.push(Item::missing("Windows", "this is not Windows", "titles run on Windows 11 (x64)"));
-    items
+    {
+        items.push(Item::missing("Windows", "this is not Windows", "titles run on Windows 11 (x64)"));
+        (items, false)
+    }
 }
+
+/// `run --execute` refused because there is no Direct3D 12 device at all
+/// on the adapter it would use (no graphics driver, a remote session, a
+/// runner without the D3D12 runtime). It ends the process with
+/// [`crate::selftest::NO_DEVICE`], as the self-test does, so that a test
+/// may skip on it.
+#[derive(Debug)]
+pub struct NoDevice(pub String);
+
+impl std::fmt::Display for NoDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoDevice {}
 
 /// What to say of a folder of game files (`game_dir`, a `test_titles`
 /// entry) that lies inside a copy of the source tree: allowed, and warned
@@ -515,12 +553,16 @@ pub fn check(exe: Option<&Path>) -> Result<()> {
 pub fn before_execute(cfg: &Config) -> Result<()> {
     let skip = std::env::var(SKIP_PREFLIGHT_ENV).is_ok_and(|v| v == "1");
     let mut items = optional_files(cfg);
-    // A title that relaunched itself was checked when it first started, and
-    // the software adapter of a diagnostics build is not the default one.
+    // A title that relaunched itself was checked when it first started.
+    // With `VICTORY_D3D12_WARP=1` the graphics items are the software
+    // adapter's, the one the run will use (they were left out with every
+    // host item when the switch worked only in diagnostics builds).
     let relaunched = std::env::var_os("VICTORY_RELAUNCHED_FROM").is_some();
-    let warp = std::env::var("VICTORY_D3D12_WARP").is_ok_and(|v| !v.is_empty() && v != "0");
-    if !relaunched && !warp {
-        items.extend(host_items());
+    let mut device = true;
+    if !relaunched {
+        let (host, has_device) = host_items_and_device();
+        items.extend(host);
+        device = has_device;
     }
     for item in items.iter().filter(|i| i.state == State::Warn) {
         eprintln!("warning: {}", item.message());
@@ -539,11 +581,15 @@ pub fn before_execute(cfg: &Config) -> Result<()> {
         }
         return Ok(());
     }
-    anyhow::bail!(
+    let message = format!(
         "this PC or its configuration cannot run a title yet:\n  - {}\n\
          (`victory check` shows every prerequisite; {SKIP_PREFLIGHT_ENV}=1 starts anyway)",
         missing.join("\n  - ")
-    )
+    );
+    if !device {
+        return Err(NoDevice(message).into());
+    }
+    anyhow::bail!(message)
 }
 
 /// What to add to an error Windows gave for lack of memory, if it is one.
@@ -737,13 +783,18 @@ mod tests {
             shader_model: (6, 6),
             mesh_shaders: true,
         };
-        assert!(gpu_items(Ok(gpu.clone())).iter().all(|i| i.state == State::Ok));
-        let old = gpu_items(Ok(Gpu { shader_model: (6, 5), mesh_shaders: false, ..gpu.clone() }));
+        assert!(gpu_items(Ok(gpu.clone()), false).iter().all(|i| i.state == State::Ok));
+        let old = gpu_items(Ok(Gpu { shader_model: (6, 5), mesh_shaders: false, ..gpu.clone() }), false);
         assert_eq!(old[1].state, State::Missing);
         assert!(old[1].message().contains("6.5") && old[1].message().contains("driver"));
         assert_eq!(old[2].state, State::Warn);
-        assert_eq!(gpu_items(Ok(Gpu { software: true, ..gpu }))[0].state, State::Warn);
-        let none = gpu_items(Err(NoDevice { adapter: None, reason: "refused".into() }));
+        let software = Gpu { software: true, ..gpu };
+        let unasked = &gpu_items(Ok(software.clone()), false)[0];
+        assert!(unasked.state == State::Warn && unasked.message().contains("install the graphics driver"));
+        // Asked for by `VICTORY_D3D12_WARP=1`: said so, still a warning.
+        let asked = &gpu_items(Ok(software), true)[0];
+        assert!(asked.state == State::Warn && asked.message().contains("VICTORY_D3D12_WARP"), "{}", asked.message());
+        let none = gpu_items(Err(NoDevice { adapter: None, reason: "refused".into() }), true);
         assert!(none.len() == 1 && none[0].state == State::Missing);
         assert!(none[0].message().contains("Direct3D 12"));
     }

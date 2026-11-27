@@ -1,0 +1,18 @@
+[package]
+name = "victory-standin"
+description = "The title side of a stand-in title: D3D12.X reached only through its entry points and function tables."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure crates only: the open demo title (tests/fixtures/demo-title) links
+# this crate into an executable of its own, which must not carry the
+# graphics layer it is run on.
+[dependencies]
+victory-shader.workspace = true
+victory-formats.workspace = true
+
+[lints]
+workspace = true

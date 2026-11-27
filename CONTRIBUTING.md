@@ -153,6 +153,11 @@ maintainer at once, so that history can be rewritten.
   stage or extend one ([docs/selftest.md](docs/selftest.md)). Shader programs
   for tests are assembled with `victory_shader::native::synth` from the public
   instruction encodings, never taken from a title.
+- **A whole run without a title.** `apps/victory/tests/demo_title.rs` builds
+  the open demo title (`tests/fixtures/demo-title`) and runs it with
+  `victory run --execute` on the software adapter, checking its run report;
+  a change to the loader, the runtime or the report on that path shows there
+  ([docs/demo-title.md](docs/demo-title.md)).
 - **The run report.** A new counter is a `report::Stat` fed with one relaxed
   atomic; never pass a runtime string to it
   ([docs/run-report.md](docs/run-report.md), "Adding to it").

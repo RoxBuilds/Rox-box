@@ -397,8 +397,9 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
 }
 
 /// The method at byte `offset` of an object's table, as title code calls
-/// it (the tests, and `crate::selftest`, which drives objects only so).
-#[cfg(any(test, windows))]
+/// it (the tests; the self-test has its own, `victory_standin`, which
+/// drives objects only so).
+#[cfg(test)]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     // SAFETY: `object` is ours and its table has the slot.
     let f = unsafe { *(*object).functions.add(offset / 8) };

@@ -1,5 +1,6 @@
 //! What the host has, asked before a run: the Windows build, the commit
-//! memory left and what the default graphics adapter can do. Nothing here
+//! memory left and what the default graphics adapter (or the software
+//! adapter, when a run is asked to use it) can do. Nothing here
 //! needs a title; `victory check` prints it and `victory run --execute`
 //! refuses to start without what a run cannot do without.
 
@@ -97,20 +98,50 @@ fn adapter_name(description: &[u16]) -> String {
     String::from_utf16_lossy(&description[..end]).trim().to_owned()
 }
 
+/// Whether a run's host device is to be made on the software adapter
+/// (`VICTORY_D3D12_WARP=1`, read as `host.rs` reads it): then that adapter,
+/// not the default one, is the one a run needs ([`software_gpu`]).
+pub fn software_asked() -> bool {
+    crate::switch::on("VICTORY_D3D12_WARP")
+}
+
 /// Makes a Direct3D 12 device on the default adapter, as a run does, asks it
 /// what it can do and lets it go again.
 pub fn gpu() -> Result<Gpu, NoDevice> {
+    ask(false)
+}
+
+/// [`gpu`], of the software adapter (WARP), on which a run with
+/// [`software_asked`] makes its device.
+pub fn software_gpu() -> Result<Gpu, NoDevice> {
+    ask(true)
+}
+
+fn ask(software: bool) -> Result<Gpu, NoDevice> {
     // SAFETY: plain DXGI and D3D12 queries; each writes the structure it is
     // given, of the size it is given.
     unsafe {
         let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok();
-        let first = factory
-            .as_ref()
-            .and_then(|f| f.EnumAdapters1(0).ok())
-            .and_then(|a| a.GetDesc1().ok())
-            .map(|d| adapter_name(&d.Description));
+        let warp: Option<IDXGIAdapter1> = if software {
+            match factory.as_ref().map(|f| f.EnumWarpAdapter::<IDXGIAdapter1>()) {
+                Some(Ok(warp)) => Some(warp),
+                Some(Err(e)) => return Err(NoDevice { adapter: None, reason: e.to_string() }),
+                None => return Err(NoDevice { adapter: None, reason: "no DXGI factory".into() }),
+            }
+        } else {
+            None
+        };
+        let first = match &warp {
+            Some(warp) => warp.GetDesc1().ok(),
+            None => factory.as_ref().and_then(|f| f.EnumAdapters1(0).ok()).and_then(|a| a.GetDesc1().ok()),
+        }
+        .map(|d| adapter_name(&d.Description));
         let mut device: Option<ID3D12Device> = None;
-        if let Err(e) = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) {
+        let made = match &warp {
+            Some(warp) => D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, &mut device),
+            None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device),
+        };
+        if let Err(e) = made {
             return Err(NoDevice { adapter: first, reason: e.to_string() });
         }
         let Some(device) = device else {
@@ -185,6 +216,11 @@ mod tests {
     fn the_adapter_is_described_or_refused() {
         match gpu() {
             Ok(gpu) => assert!(!gpu.name.is_empty()),
+            Err(none) => assert!(!none.reason.is_empty()),
+        }
+        // The one `VICTORY_D3D12_WARP=1` runs on, which is no graphics card.
+        match software_gpu() {
+            Ok(gpu) => assert!(gpu.software && !gpu.name.is_empty(), "{gpu:?}"),
             Err(none) => assert!(!none.reason.is_empty()),
         }
     }

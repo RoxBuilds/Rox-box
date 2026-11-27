@@ -1919,11 +1919,18 @@ fn render(s: &Snapshot) -> String {
     d.comment("per window since the start of the run (warm-up first, then steady state)");
     d.int("window_s", window_s);
     d.ints("presents", &shown.iter().map(|w| w.0).collect::<Vec<_>>());
+    // The last window ends with the run, so its rate is over the time it
+    // covered (at least a second, so that a present just after a window
+    // began is no burst): over the whole window it said 3 fps for 30
+    // presents in the 0.7 s of a short run, and every run seemed to slow
+    // down in its last seconds.
+    let last_s = (s.duration_us as f64 / 1e6 - (window_s * (shown.len().max(1) as u64 - 1)) as f64).max(1.0);
     d.floats(
         "fps",
         &shown
             .iter()
-            .map(|w| w.0 as f64 / window_s as f64)
+            .enumerate()
+            .map(|(i, w)| w.0 as f64 / if i + 1 == shown.len() { last_s } else { window_s as f64 })
             .collect::<Vec<_>>(),
     );
     d.ints(
@@ -2456,6 +2463,22 @@ mod tests {
         assert_eq!(summary("not = 'a report'"), None);
         // The sample in docs/run-report.md is this test's output.
         println!("{text}");
+    }
+
+    /// The last window's rate is over the time the run spent in it: the
+    /// demo title's short runs (30 presents in 0.7 s) said 3 fps.
+    #[test]
+    fn the_last_window_rate_is_over_the_time_it_covered() {
+        let fps = |duration_us: u64, timeline: Vec<(u32, u32)>| {
+            let text = render(&Snapshot { duration_us, timeline, ..synthetic() });
+            let parsed: toml::Table = toml::from_str(&text).unwrap();
+            parsed["timeline"]["fps"].as_array().unwrap().iter().map(|v| v.as_float().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(fps(2_000_000, vec![(60, 17)]), [30.0]);
+        // Under a second in it counts as a second.
+        assert_eq!(fps(500_000, vec![(30, 17)]), [30.0]);
+        // Full windows as before; the last one 5 s long.
+        assert_eq!(fps(25_000_000, vec![(300, 17), (600, 17), (150, 17)]), [30.0, 60.0, 30.0]);
     }
 
     #[test]

@@ -416,7 +416,10 @@ target\release\victory.exe run <title.exe> --execute --console series-x
 `victory selftest --warp` runs the whole frame path with a stand-in title of
 our own code on the software adapter, so a change to the graphics layer or the
 translator can be tried with no title files; `cargo test --workspace` runs it
-too ([docs/selftest.md](docs/selftest.md)).
+too ([docs/selftest.md](docs/selftest.md)). The open demo title, an executable
+of our own, takes the same scene through a whole `victory run --execute`
+(loader, runtime, run report), so anyone can perform a real run
+([docs/demo-title.md](docs/demo-title.md)).
 
 ### Package a release
 

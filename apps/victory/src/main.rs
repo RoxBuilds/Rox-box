@@ -241,6 +241,11 @@ fn main() -> std::process::ExitCode {
             if !error.is::<preflight::Reported>() {
                 report(&error);
             }
+            // No Direct3D 12 device at all: the self-test's code, which the
+            // tests skip on (`apps/victory/tests/demo_title.rs`).
+            if error.is::<preflight::NoDevice>() {
+                return std::process::ExitCode::from(selftest::NO_DEVICE as u8);
+            }
             std::process::ExitCode::FAILURE
         }
     }

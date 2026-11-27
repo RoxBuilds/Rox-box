@@ -6,7 +6,7 @@
 //! callbacks, then a DLL's `DllMain`.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,7 +82,9 @@ const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 /// order: the title's exit functions have run; every other thread ends
 /// (title threads and ours); every attached image gets
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
-/// exe's TLS callbacks; then the CRT ends the process.
+/// exe's TLS callbacks; then the process ends with the title's exit code
+/// (the host's DLLs are not detached, see the end), or, for an exit the
+/// title did not ask for, the CRT ends it.
 extern "C" fn detach_all() {
     let attached: Vec<_> = images()
         .iter_mut()
@@ -99,6 +101,8 @@ extern "C" fn detach_all() {
         "process exit: ending other threads, detaching title images"
     );
     EXITING.store(true, Ordering::SeqCst);
+    // Read now: a thread ended below may hold the environment's lock.
+    let detach_host = std::env::var_os("VICTORY_EXIT_DETACH_HOST").is_some_and(|v| v != "0");
     // As on Windows, a lock a thread held when it ended stays taken; detach
     // code that waits for one would hang the exit. The watchdog runs before
     // the other threads end: a thread that ends can hold the heap lock or
@@ -112,7 +116,7 @@ extern "C" fn detach_all() {
         let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         WATCHDOG.store(id, Ordering::SeqCst);
         std::thread::sleep(DETACH_DEADLINE);
-        end_process();
+        end_process(1);
     }));
     // Its start (loader notices, Rust's thread set-up) is done only when
     // it runs its own code. The loader notices need the loader lock. This
@@ -122,7 +126,7 @@ extern "C" fn detach_all() {
     let waiting = Instant::now();
     let watchdog = loop {
         match WATCHDOG.load(Ordering::SeqCst) {
-            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
+            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(1),
             0 => std::thread::yield_now(),
             id => break id,
         }
@@ -139,16 +143,43 @@ extern "C" fn detach_all() {
             )
         };
     }
+    // The title is done with: the process ends here, with the title's exit
+    // code, and the host's own DLLs are not detached. `TerminateThread`
+    // above frees each thread's stack at once (`ExitProcess`'s own ending of
+    // the other threads does not), and a thread that was waiting on a lock
+    // leaves its wait record, on that stack, in the lock's chain: the host
+    // DLLs' process-detach code that takes such a lock then read freed
+    // memory (an access violation in `directxdatabasehelper.dll` or
+    // `winnsi.dll`, after the title's `exit`, in six of ten runs of the demo
+    // title on a graphics card, docs/demo-title.md). The host frees what
+    // they hold with the process. `VICTORY_EXIT_DETACH_HOST=1`: back to the
+    // C runtime, which detaches them and ends the process, as before.
+    match EXIT_CODE.load(Ordering::SeqCst) {
+        code if code != NO_EXIT_CODE && !detach_host => end_process(code as u32),
+        _ => {}
+    }
 }
 
-/// Ends this process when the title images do not detach in time. It does
-/// not use the heap or any lock: a thread that ended can hold them.
-fn end_process() {
+/// The code the title's `exit` was called with ([`exiting_with`]).
+static EXIT_CODE: AtomicI64 = AtomicI64::new(NO_EXIT_CODE);
+const NO_EXIT_CODE: i64 = i64::MIN;
+
+/// The title calls `exit(code)`: the code the process ends with once the
+/// title images have detached (`detach_all`). An exit the title did not
+/// ask for (none recorded) goes back to the C runtime as before.
+pub fn exiting_with(code: i32) {
+    EXIT_CODE.store(i64::from(code), Ordering::SeqCst);
+}
+
+/// Ends this process with `code`: when the title images do not detach in
+/// time (1), or once they have (the title's). It does not use the heap or
+/// any lock: a thread that ended can hold them.
+fn end_process(code: u32) {
     // SAFETY: ends this process, which is exiting anyway.
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            1,
+            code,
         )
     };
 }

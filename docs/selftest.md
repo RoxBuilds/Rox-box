@@ -25,8 +25,11 @@ passes. Only the checks look behind the tables: a picture is read back from
 the host texture the layer made for the title's render target, and the swap
 chain is asked how many presents it took.
 
-The driver is `crates/victory-gpu/src/selftest.rs`; the shader containers come
-from `crates/victory-shader/src/native/synth.rs`.
+The driver is `crates/victory-gpu/src/selftest.rs`; the title side it drives
+(the PC-layout structures, the table offsets, the calls and the scene) is
+`crates/victory-standin`, which the open demo title links too
+([demo-title.md](demo-title.md)); the shader containers come from
+`crates/victory-shader/src/native/synth.rs`.
 
 ## Reading the output
 
@@ -127,6 +130,10 @@ removed), which ends the run at once as it would end a title's.
 
 ## What it does not prove
 
+- The path of a real run: the loader, import binding, the title's thread,
+  its C runtime and exit, frame pacing, the shader cache on disk and the run
+  report. The open demo title runs the same scene that way
+  ([demo-title.md](demo-title.md)).
 - Anything about a particular title: its shaders use far more of the
   instruction set than the one program here, and its frames far more state.
 - Most of a graphics pipeline: the draw's programs read no texture, sampler,
@@ -179,12 +186,18 @@ programs translate (the pixel program only with its export patch).
 
 ## Adding a stage
 
-1. Write the stage as a method of `Title` in
-   `crates/victory-gpu/src/selftest.rs` returning `Result<String, Failed>`:
-   the `String` is the `OK` line's detail, the `Failed` reason the `FAIL`
-   line's. Reach the layer only through the tables (`slot::<F>(object,
-   offset)` at the offsets the table modules list), pass PC-layout
-   structures, and wait with `sync`. Call `Watchdog::pet` in long loops.
+1. Write what the title does in `crates/victory-standin`: a call through
+   the tables is a method of `Title` (`slot::<F>(object, offset)` at the
+   offsets the table modules list), a structure goes in `pc.rs` with the PC
+   layout (and a check of it against the host's bindings in
+   `structures_have_the_pc_layouts`), and a piece of the scene in
+   `scene.rs`, checking only what lands in title memory. Then write the
+   stage as a function in `crates/victory-gpu/src/selftest.rs` returning
+   `Result<String, Failed>`: the `String` is the `OK` line's detail, the
+   `Failed` reason the `FAIL` line's; the checks that look behind the
+   tables (pictures read back, a pipeline's first use waited for) live
+   there. Wait with `sync`; `Watchdog::pet` is called at every submission
+   and wait, call it in other long loops.
 2. Add its name to `STAGES` and call it from `run`; return
    `Outcome::Skip` with the reason where the PC cannot run it.
 3. Programs come from `victory_shader::native::synth`: write them from the

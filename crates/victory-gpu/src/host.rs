@@ -1576,15 +1576,17 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
-        // Diagnostics: the software adapter, on which a shader's wild access
-        // is an access violation in this process (a crash report with the
-        // address and instruction) instead of a GPU fault and driver reset.
-        // (This crate's own tests too: how they run on a PC without a card;
-        // and `victory selftest --warp`, which tells a driver's fault from
-        // the layer's, in any build.)
-        if (cfg!(any(test, feature = "diagnostics")) || crate::selftest::running())
-            && crate::switch::on("VICTORY_D3D12_WARP")
-        {
+        // `VICTORY_D3D12_WARP=1`: the software adapter, on which a shader's
+        // wild access is an access violation in this process (a crash report
+        // with the address and instruction) instead of a GPU fault and driver
+        // reset; on which this crate's tests and `victory selftest --warp` run
+        // on a PC without a card; and on which CI runs the demo title
+        // (docs/demo-title.md), since a hosted runner has no graphics card.
+        // Honoured in every build: it only ever selects an adapter the user
+        // asked for by name, and `preflight` checks that adapter instead of
+        // the default one when it is set. (It was honoured only in test and
+        // diagnostics builds and in the self-test; unset, nothing changes.)
+        if crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");

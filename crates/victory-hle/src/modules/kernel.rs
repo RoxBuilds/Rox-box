@@ -235,10 +235,13 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 }
 
 /// The CRT's `exit`, through which the title's entry point returns: logs
-/// the code and the caller, then exits on the host.
+/// the code and the caller, then exits on the host (the loader ends the
+/// process with `code` once the title images have detached).
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
     let _ = victory_loader::report::finish(victory_loader::report::End::TitleExited(code));
+    #[cfg(windows)]
+    victory_loader::exiting_with(code);
     host::exit(code)
 }
 

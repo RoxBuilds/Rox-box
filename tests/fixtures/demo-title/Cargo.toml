@@ -1,0 +1,20 @@
+# The open demo title: a real executable of our own that behaves as a small
+# console title does, so that `victory run <demo-title.exe> --execute` is a
+# complete run anyone may perform (docs/demo-title.md). It is NOT a
+# workspace member: `apps/victory/tests/demo_title.rs` builds it on demand
+# into its own target directory, like `hle-probe`. It imports the console's
+# graphics entry points from `d3d12_xs.dll` (via raw-dylib), a DLL no PC
+# has, so it only runs through Rox-box. Its title side is the self-test's
+# (`victory-standin`); every crate it needs is in the workspace's own lock
+# file, at the same versions.
+[package]
+name = "demo-title"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+victory-standin = { path = "../../../crates/victory-standin" }
+
+[workspace]

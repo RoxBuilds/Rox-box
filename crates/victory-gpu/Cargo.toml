@@ -15,6 +15,8 @@ anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+# The self-test's stand-in title (`selftest.rs`), shared with the demo title.
+victory-standin.workspace = true
 serde.workspace = true
 toml.workspace = true
 

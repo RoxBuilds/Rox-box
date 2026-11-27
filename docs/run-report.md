@@ -169,7 +169,7 @@ what it holds and what it never does. Sections and keys, in order:
 | `average_fps`, `frame_ms_mean` | Over the presents' intervals |
 | `frame_ms_p50`, `_p90`, `_p99`, `_max` | Present-to-present time percentiles, from buckets of 0.25 ms (to 100 ms) and 10 ms (to 2 s) |
 | **`[frames.histogram]`** | Frames by present-to-present time, buckets at 120, 90, 60, 45, 30, 20, 10, 4 and 1 frames a second |
-| **`[timeline]`** | Per window since the start (10 s; merged into longer windows to show at most 180): `presents`, `fps`, `worst_frame_ms`. Loading and warm-up come first, then the steady state |
+| **`[timeline]`** | Per window since the start (10 s; merged into longer windows to show at most 180): `presents`, `fps` (the last window's over the time the run spent in it, at least 1 s), `worst_frame_ms`. Loading and warm-up come first, then the steady state |
 | **`[gpu_work]`** | Per frame (between two presents; the first present's loading is left out), average and most: `submissions`, `draws` (with mesh dispatches) and `dispatches` run on the host, and those `left_out`; `left_out_avg_steady`, the same over the steady state (below); `submissions_total` |
 | **`[gpu_work.left_out]`** | Draws and dispatches the title recorded and the host did not run, the whole run, by reason: `pipeline_not_ready` (not made within the frame's wait budget), `shader_not_translated`, `pipeline_refused` (by the host), `out_of_memory` (constants, scratch, vertices refused), `no_descriptor_slots`, `indirect_not_bounded`, `ray_tracing_builder_off`, `no_pipeline_set`, `other` |
 | **`[frame_time]`** | What a frame cost, per frame over the whole run, from the meters of the log's once-a-second frame line (["Reading the frame figures"](#reading-the-frame-figures)) |

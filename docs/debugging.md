@@ -49,7 +49,7 @@ do something only in a diagnostics build.
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight (`play.ps1` sets `light`) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver), in every build; `run --execute` then checks that adapter before it starts |
 | `VICTORY_PANEL=1` | the run's numbers drawn on the picture; F3 shows and hides it |
 | `VICTORY_PIPELINE_WAIT_MS=24` | the per-frame wait for background pipeline creation (default 500 ms). A draw is left out until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | leaves out draws and dispatches whose pipeline contains a listed 16-digit shader hash |
