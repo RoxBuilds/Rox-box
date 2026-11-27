@@ -36,6 +36,20 @@
 #               a command prompt and PowerShell):  -More "VICTORY_AMBIENT=0.8;VICTORY_PIPELINE_BOOK=0"
 #               From PowerShell a hashtable works as well:  -More @{ VICTORY_AMBIENT = '0.8' }
 # -ShowSettings prints the environment switches (and settings overrides) these options give, and starts nothing
+# -Prepare      does the preparation below without asking (shaders, and the pipeline warm-up when it is stale and
+#               pipelines are recorded) and starts nothing afterwards; exit code 0 when everything that ran succeeded
+# -NoPrepare    skips the preparation below: the launcher behaves as it did before it existed
+# -SettleMax    minutes: passed on as `--settle-max` to the warm-up (default: the program's own, 40)
+#
+# Preparation before a run (not for -Check, -ShowSettings, -SelfTest, or when the check before a run fails). It uses
+# the executable that will run (-Build / -Fast choose it) and the path variables of this run, and none of its switches.
+#   Shaders   <cache_dir>\shaders\prepared-stamp.txt names the victory.exe and the game folder `victory.exe shaders`
+#             last finished for. Missing, or naming another executable or folder: it is run now, with its output
+#             shown, and the stamp is written only when it exits with 0. If it fails the run starts anyway (a run
+#             translates shaders on first use). No question is asked.
+#   Warm-up   when the warm-up stamp says it is stale and earlier runs recorded pipelines: a person at a normal window
+#             is asked once (default yes) and `victory.exe warm --used --settle` runs; without a person, or when no
+#             pipelines are recorded yet, only the WARNING: / advice line is printed. The run follows either way.
 #
 # Every run records the pipelines the title creates (VICTORY_PIPELINE_BOOK=1: each is hashed and written
 # once, to the cache folder), which is what `victory warm --used --settle` makes ahead of the next run.
@@ -68,7 +82,10 @@ param(
     [string]$LocalConfig,
     [switch]$SelfTest,
     $More = @{},
-    [switch]$ShowSettings
+    [switch]$ShowSettings,
+    [switch]$Prepare,
+    [switch]$NoPrepare,
+    [ValidateRange(1, 10000)][int]$SettleMax
 )
 
 # -More and -SettingsValues as a table: a hashtable as it is, or text of `NAME=value` pairs separated
@@ -320,10 +337,16 @@ function Get-ConfigValue($Lines, [string]$Name) {
     $null
 }
 
+# Whether earlier runs wrote pipelines down in this cache folder.
+function Test-PipelinesRecorded([string]$CacheDir) {
+    if (-not $CacheDir) { return $false }
+    Test-Path -LiteralPath (Join-Path $CacheDir 'pipelines\known-pipelines.bin')
+}
+
 function Get-WarmWarning([string]$Victory, [string]$Build, [string]$CacheDir, [string]$Root) {
     if (-not $CacheDir) { return $null }
     $path = Join-Path $CacheDir 'pipelines\warm-stamp.txt'
-    $recorded = Test-Path -LiteralPath (Join-Path $CacheDir 'pipelines\known-pipelines.bin')
+    $recorded = Test-PipelinesRecorded $CacheDir
     try { Compare-WarmStamp (Read-WarmStamp $path) (Get-ExeStamp $Victory) $Build $path (Get-WarmCommand $Victory $Root) $recorded }
     catch { "The warm-up stamp ($path) could not be compared: $($_.Exception.Message)" }
 }
@@ -570,8 +593,129 @@ function Select-GameFolder([scriptblock]$Pick = { Get-FolderChoice 'Pick the fol
     }
 }
 
+# ---- Preparation before a run: shader translation and pipeline warm-up ------------------------------
+
+function Get-PreparedStampPath([string]$CacheDir) { Join-Path $CacheDir 'shaders\prepared-stamp.txt' }
+
+# What is written once `victory shaders` has finished: which executable (the fields the warm-up stamp
+# compares) prepared which game folder.
+function Get-PreparedStampText($ExeStamp, [string]$Build, [string]$GameDir) {
+    "# play.ps1: victory shaders finished for this executable and game folder`n" +
+    "exe=$($ExeStamp.exe)`nbuild=$Build`nsize=$($ExeStamp.size)`nmodified=$($ExeStamp.modified)`nhead_sha256=$($ExeStamp.head_sha256)`ngame_dir=$GameDir`n"
+}
+
+# Null when the stamp names this executable and this game folder, else what differs.
+function Get-PreparedReason($Stamp, $ExeStamp, [string]$Build, [string]$GameDir) {
+    if (-not $Stamp) { return 'there is no stamp' }
+    $differ = @()
+    if (("$($Stamp.exe)" -replace '^\\\\\?\\', '') -ne $ExeStamp.exe) { $differ += 'the exe' }
+    if ($Stamp.build -ne $Build) { $differ += 'the build' }
+    foreach ($k in 'size', 'modified', 'head_sha256') { if ($Stamp[$k] -ne $ExeStamp[$k]) { $differ += $k } }
+    if ("$($Stamp.game_dir)".TrimEnd('\') -ne "$GameDir".TrimEnd('\')) { $differ += 'the game folder' }
+    if ($differ) { "the stamp differs in $($differ -join ', ')" }
+}
+
+# What to do before a run. Shaders: translate them now (no question, ever). Warm: 'none', 'run' (no
+# question), 'ask' (a person is asked once) or 'warn' (only the WARNING: / advice line is printed).
+# $Explicit: -Prepare. $NoPrepare: nothing is done. The warm-up needs pipelines that earlier runs recorded.
+function Get-PreparePlan([bool]$Explicit, [bool]$NoPrepare, [bool]$Interactive, [bool]$ShadersStale, [bool]$WarmStale, [bool]$Recorded) {
+    $plan = @{ Shaders = $false; Warm = 'none' }
+    if ($NoPrepare) { return $plan }
+    $plan.Shaders = $ShadersStale
+    if ($WarmStale) {
+        if (-not $Recorded) { $plan.Warm = 'warn' }
+        elseif ($Explicit) { $plan.Warm = 'run' }
+        elseif ($Interactive) { $plan.Warm = 'ask' }
+        else { $plan.Warm = 'warn' }
+    }
+    $plan
+}
+
+function Get-WarmArguments([int]$SettleMax) {
+    @('warm', '--used', '--settle') + $(if ($SettleMax -gt 0) { @('--settle-max', "$SettleMax") })
+}
+
+# Runs $Command with only the path variables among the VICTORY_* variables (the run's behaviour switches
+# are taken out for the time), and puts the others back.
+function Invoke-WithPathEnv([string[]]$Keep, [scriptblock]$Command) {
+    $saved = @{}
+    foreach ($e in @(Get-ChildItem Env:VICTORY_*)) {
+        if ($e.Name -notin $Keep) { $saved[$e.Name] = $e.Value; Remove-Item "Env:$($e.Name)" }
+    }
+    try { & $Command } finally { foreach ($k in $saved.Keys) { Set-Item "Env:$k" $saved[$k] } }
+}
+
+# The exit code a preparation command gives (its last output); -1 when it cannot be started.
+function Invoke-PrepareCommand([scriptblock]$Command) {
+    try {
+        $out = @(& $Command)
+        if ($out.Count -eq 0) { return -1 }
+        [int]$out[$out.Count - 1]
+    } catch {
+        Write-Host "The command could not be started: $($_.Exception.Message)"
+        -1
+    }
+}
+
+# Does what Get-PreparePlan says. $WarmReason: what Get-WarmWarning says (null when the warm-up is current).
+# $RunShaders and $RunWarm give the exit code of the real commands (tests give their own); $Ask answers the
+# one question. Returns @{ Failed; Shaders; Warm } (each 'skipped', 'ok', 'failed' or, for Warm, 'declined').
+function Invoke-Prepare($ExeStamp, [string]$Build, [string]$GameDir, [string]$CacheDir, [bool]$Interactive,
+    [bool]$Explicit, [bool]$NoPrepare, $WarmReason, [bool]$Recorded, [bool]$StartsRun,
+    [scriptblock]$RunShaders, [scriptblock]$RunWarm, [scriptblock]$Ask) {
+    $result = @{ Failed = $false; Shaders = 'skipped'; Warm = 'skipped' }
+    if ($NoPrepare) { return $result }
+    if (-not $GameDir -or -not $CacheDir) {
+        Write-Host 'Not preparing ahead: the game folder or the cache folder is not known (victory.exe config).'
+        $result.Failed = $Explicit
+        return $result
+    }
+    $stampPath = Get-PreparedStampPath $CacheDir
+    $stamp = $null
+    try { $stamp = Read-WarmStamp $stampPath } catch { }
+    $why = Get-PreparedReason $stamp $ExeStamp $Build $GameDir
+    $plan = Get-PreparePlan $Explicit $NoPrepare $Interactive ([bool]$why) ([bool]$WarmReason) $Recorded
+    $after = $(if ($StartsRun) { 'The run starts anyway' } else { 'Nothing was started' })
+
+    if ($plan.Shaders) {
+        Write-Host ''
+        Write-Host 'Rox-box translates the title''s shaders once, before a run: it is done once per Rox-box version and game folder.'
+        Write-Host 'This takes a few minutes; the run is much smoother afterwards.'
+        $code = Invoke-PrepareCommand $RunShaders
+        if ($code -eq 0) {
+            $result.Shaders = 'ok'
+            try {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stampPath) | Out-Null
+                [System.IO.File]::WriteAllText($stampPath, (Get-PreparedStampText $ExeStamp $Build $GameDir), (New-Object System.Text.UTF8Encoding($false)))
+            } catch { Write-Host "The shaders are translated, but the stamp ($stampPath) could not be written: $($_.Exception.Message)" }
+        } else {
+            $result.Shaders = 'failed'
+            $result.Failed = $true
+            Write-Host "Translating the shaders failed (exit code $code), so no stamp was written. $after$(if ($StartsRun) { ': a run translates shaders when it first needs them, with stutter' })."
+        }
+    }
+
+    $go = ($plan.Warm -eq 'run')
+    if ($plan.Warm -eq 'ask') {
+        $go = [bool](& $Ask 'Warm up the pipelines of your earlier runs now? It takes 10 to 40 minutes and makes the run far smoother.')
+        if (-not $go) { $result.Warm = 'declined' }
+    }
+    if ($go) {
+        Write-Host ''
+        Write-Host 'Warming up the pipelines of your earlier runs (victory.exe warm --used --settle): 10 to 40 minutes.'
+        $code = Invoke-PrepareCommand $RunWarm
+        if ($code -eq 0) { $result.Warm = 'ok' }
+        else {
+            $result.Warm = 'failed'
+            $result.Failed = $true
+            Write-Host "The warm-up did not finish (exit code $code). $after$(if ($StartsRun) { ', with the pipelines it has' })."
+        }
+    }
+    $result
+}
+
 if ($SelfTest) {
-    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('launcher-selftest-' + [guid]::NewGuid().ToString('N'))
+    $dir =Join-Path ([System.IO.Path]::GetTempPath()) ('launcher-selftest-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     try {
         $file = Join-Path $dir 'config.xml'
@@ -821,6 +965,102 @@ if ($SelfTest) {
             Check ($LASTEXITCODE -eq 0 -and ($viaCmdDrop -contains "VICTORY_GAME_DIR=$dropDir")) 'a dropped folder with spaces and parentheses arrives through play.cmd'
         }
 
+        # Preparation before a run: decisions only. Every command is a scriptblock of this test; victory.exe is never started.
+        $gd = 'D:\MyTitles\SomeTitle'
+        $cache = Join-Path $dir 'prep-cache'
+        $pstamp = Get-PreparedStampPath $cache
+        $pText = Get-PreparedStampText $e 'release' $gd
+        [System.IO.Directory]::CreateDirectory((Split-Path -Parent $pstamp)) | Out-Null
+        [System.IO.File]::WriteAllText($pstamp, $pText)
+        $ps = Read-WarmStamp $pstamp
+        Check ($null -eq (Get-PreparedReason $ps $e 'release' $gd) -and $null -eq (Get-PreparedReason $ps $e 'release' ($gd + '\'))) 'shader stamp: the same executable and game folder match'
+        Check ((Get-PreparedReason $null $e 'release' $gd) -match 'no stamp') 'shader stamp: missing'
+        $other = @{} + $e; $other.head_sha256 = 'ff'; $other.size = '1'
+        Check ((Get-PreparedReason $ps $other 'release' $gd) -match 'size, head_sha256') 'shader stamp: another executable'
+        Check ((Get-PreparedReason $ps $e 'diag' $gd) -match 'the build') 'shader stamp: another build'
+        Check ((Get-PreparedReason $ps $e 'release' 'D:\MyTitles\Other') -match 'the game folder') 'shader stamp: another game folder'
+
+        # Get-PreparePlan: explicit, no-prepare, interactive, shaders stale, warm stale, recorded
+        $p = Get-PreparePlan $false $false $false $false $false $true
+        Check (-not $p.Shaders -and $p.Warm -eq 'none') 'plan: stamps current: nothing to do'
+        $p = Get-PreparePlan $false $false $false $true $false $true
+        Check ($p.Shaders -and $p.Warm -eq 'none') 'plan: stale shaders are translated without a question, also when not interactive'
+        $p = Get-PreparePlan $false $true $true $true $true $true
+        Check (-not $p.Shaders -and $p.Warm -eq 'none') 'plan: -NoPrepare does nothing'
+        $p = Get-PreparePlan $true $false $false $true $true $true
+        Check ($p.Shaders -and $p.Warm -eq 'run') 'plan: -Prepare runs both without asking'
+        $p = Get-PreparePlan $false $false $true $false $true $true
+        Check ($p.Warm -eq 'ask') 'plan: a stale warm-up with pipelines recorded asks a person'
+        $p = Get-PreparePlan $false $false $false $false $true $true
+        Check ($p.Warm -eq 'warn') 'plan: no person: only the warning'
+        $p = Get-PreparePlan $false $false $true $false $true $false
+        Check ($p.Warm -eq 'warn') 'plan: no pipelines recorded: only the advice'
+        $p = Get-PreparePlan $true $false $true $false $true $false
+        Check ($p.Warm -eq 'warn') 'plan: -Prepare with no pipelines recorded: only the advice'
+        $p = Get-PreparePlan $false $false $true $false $false $true
+        Check ($p.Warm -eq 'none') 'plan: a current warm-up is left alone'
+        Check ((Get-WarmArguments 0) -join ' ' -eq 'warm --used --settle' -and (Get-WarmArguments 15) -join ' ' -eq 'warm --used --settle --settle-max 15') 'warm arguments: -SettleMax is passed on, else nothing'
+
+        # Invoke-Prepare with injected commands.
+        $script:calls = @(); $script:asked = 0
+        $okShaders = { $script:calls += 'shaders'; 0 }
+        $badShaders = { $script:calls += 'shaders'; 3 }
+        $okWarm = { $script:calls += 'warm'; 0 }
+        $badWarm = { $script:calls += 'warm'; 2 }
+        $yes = { param($q) $script:asked++; $true }
+        $no = { param($q) $script:asked++; $false }
+        $never = { param($q) $script:asked++; throw 'asked' }
+        function Test-Prepare($cacheDir, $interactive, $explicit, $noPrepare, $warmReason, $recorded, $shaders, $warm, $ask, $starts = $true) {
+            $script:calls = @(); $script:asked = 0
+            Invoke-Prepare $e 'release' $gd $cacheDir $interactive $explicit $noPrepare $warmReason $recorded $starts $shaders $warm $ask 6>$null
+        }
+        $fresh = Join-Path $dir 'prep-fresh'
+        $r = Test-Prepare $fresh $false $false $false $null $false $okShaders $okWarm $never
+        Check ($r.Shaders -eq 'ok' -and ($script:calls -join ',') -eq 'shaders' -and (Test-Path -LiteralPath (Get-PreparedStampPath $fresh))) 'prepare: no stamp: shaders run (not interactive too) and the stamp is written'
+        Check ($null -eq (Get-PreparedReason (Read-WarmStamp (Get-PreparedStampPath $fresh)) $e 'release' $gd)) 'prepare: the written stamp matches that executable and folder'
+        $r = Test-Prepare $fresh $true $false $false $null $true $okShaders $okWarm $never
+        Check ($r.Shaders -eq 'skipped' -and $script:calls.Count -eq 0 -and -not $r.Failed) 'prepare: a matching stamp: nothing runs'
+        $fresh2 = Join-Path $dir 'prep-fresh2'
+        $r = Test-Prepare $fresh2 $true $false $false $null $true $badShaders $okWarm $never
+        Check ($r.Shaders -eq 'failed' -and $r.Failed -and -not (Test-Path -LiteralPath (Get-PreparedStampPath $fresh2))) 'prepare: failing shaders leave no stamp'
+        $throwing = { throw 'cannot start' }
+        $r = Test-Prepare $fresh2 $true $false $false $null $true $throwing $okWarm $never
+        Check ($r.Shaders -eq 'failed' -and -not (Test-Path -LiteralPath (Get-PreparedStampPath $fresh2))) 'prepare: a command that cannot be started leaves no stamp'
+        $r = Invoke-Prepare $other 'release' $gd $cache $false $false $false $null $true $true $okShaders $okWarm $never 6>$null
+        Check ($r.Shaders -eq 'ok' -and (Read-WarmStamp (Get-PreparedStampPath $cache)).size -eq '1') 'prepare: another executable: shaders run again and the stamp is replaced'
+        $r = Invoke-Prepare $e 'release' 'D:\MyTitles\Other' $cache $false $false $false $null $true $true $okShaders $okWarm $never 6>$null
+        Check ($r.Shaders -eq 'ok' -and (Read-WarmStamp (Get-PreparedStampPath $cache)).game_dir -eq 'D:\MyTitles\Other') 'prepare: another game folder: shaders run again'
+        $r = Test-Prepare $fresh2 $true $true $true 'stale' $true $okShaders $okWarm $never
+        Check ($r.Shaders -eq 'skipped' -and $r.Warm -eq 'skipped' -and $script:calls.Count -eq 0 -and $script:asked -eq 0) 'prepare: -NoPrepare runs and asks nothing'
+        $r = Test-Prepare $fresh2 $true $true $false 'stale' $true $okShaders $okWarm $never $false
+        Check ($r.Shaders -eq 'ok' -and $r.Warm -eq 'ok' -and ($script:calls -join ',') -eq 'shaders,warm' -and $script:asked -eq 0 -and -not $r.Failed) 'prepare: -Prepare runs shaders then warm-up without asking'
+        $r = Test-Prepare $fresh2 $true $true $false 'stale' $true $okShaders $badWarm $never $false
+        Check ($r.Warm -eq 'failed' -and $r.Failed) 'prepare: -Prepare with a failing warm-up fails'
+        $r = Test-Prepare $fresh2 $true $false $false 'stale' $true $okShaders $okWarm $yes
+        Check ($r.Warm -eq 'ok' -and $script:asked -eq 1 -and ($script:calls -join ',') -eq 'warm') 'prepare: interactive, stale and recorded: asked once, yes runs the warm-up'
+        $r = Test-Prepare $fresh2 $true $false $false 'stale' $true $okShaders $okWarm $no
+        Check ($r.Warm -eq 'declined' -and $script:asked -eq 1 -and $script:calls.Count -eq 0 -and -not $r.Failed) 'prepare: interactive, answer no: no warm-up'
+        $r = Test-Prepare $fresh2 $true $false $false 'stale' $true $okShaders $badWarm $yes
+        Check ($r.Warm -eq 'failed' -and $script:asked -eq 1) 'prepare: interactive yes, warm-up fails: reported, the run goes on'
+        $r = Test-Prepare $fresh2 $false $false $false 'stale' $true $okShaders $okWarm $never
+        Check ($r.Warm -eq 'skipped' -and $script:asked -eq 0 -and $script:calls.Count -eq 0) 'prepare: not interactive: no question and no warm-up'
+        $r = Test-Prepare $fresh2 $true $false $false 'stale' $false $okShaders $okWarm $never
+        Check ($r.Warm -eq 'skipped' -and $script:asked -eq 0 -and $script:calls.Count -eq 0) 'prepare: warm-up stale but nothing recorded: no question and no warm-up'
+        $r = Test-Prepare $fresh2 $true $false $false $null $true $okShaders $okWarm $never
+        Check ($r.Warm -eq 'skipped' -and $script:asked -eq 0) 'prepare: a current warm-up: no question'
+        $r = Test-Prepare '' $true $true $false $null $true $okShaders $okWarm $never
+        Check ($r.Failed -and $script:calls.Count -eq 0) 'prepare: -Prepare without a cache folder cannot prepare and says so'
+
+        # Only the path variables reach a preparation command, and everything is put back.
+        $env:VICTORY_SELFTEST_PATH = 'p'; $env:VICTORY_SELFTEST_SWITCH = 's'
+        try {
+            $seen = @(Invoke-WithPathEnv @('VICTORY_SELFTEST_PATH') { "$env:VICTORY_SELFTEST_PATH|$env:VICTORY_SELFTEST_SWITCH" })
+            Check ($seen[0] -eq 'p|' -and $env:VICTORY_SELFTEST_SWITCH -eq 's' -and $env:VICTORY_SELFTEST_PATH -eq 'p') 'prepare environment: run switches are out of the way for the command and back after it'
+            $threw = $false
+            try { Invoke-WithPathEnv @() { throw 'x' } } catch { $threw = $true }
+            Check ($threw -and $env:VICTORY_SELFTEST_SWITCH -eq 's') 'prepare environment: put back when the command throws'
+        } finally { Remove-Item Env:VICTORY_SELFTEST_PATH, Env:VICTORY_SELFTEST_SWITCH -ErrorAction SilentlyContinue }
+
         if ($fail) { Write-Host "$fail check(s) failed"; exit 1 }
         Write-Host 'self-test passed'
     } finally { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
@@ -831,6 +1071,7 @@ try {
     $More = ConvertTo-PairTable $More '-More'
     $SettingsValues = ConvertTo-PairTable $SettingsValues '-SettingsValues'
 } catch { Write-Host $_.Exception.Message; exit 1 }
+if ($Prepare -and $NoPrepare) { Write-Host '-Prepare and -NoPrepare contradict each other: give one.'; exit 1 }
 # A path as the first argument (what dropping a folder or an .exe on play.cmd gives).
 $dropFolder = $null
 $droppedExe = $false
@@ -953,7 +1194,7 @@ try {
             Write-Host 'Not starting: fix what is MISSING above (QUICKSTART.txt / README.md), then run this again.'
             exit 1
         }
-        if (-not $interactive -or -not (Read-YesNo 'Start now?')) {
+        if (-not $Prepare -and (-not $interactive -or -not (Read-YesNo 'Start now?'))) {
             Write-Host 'Run play.cmd whenever you want to start.'
             exit 0
         }
@@ -973,6 +1214,29 @@ try {
         if ($report[$i] -match '^\[ WARN') { Write-Host $report[$i]; if ($report[$i + 1] -match '^\s+fix:') { Write-Host $report[$i + 1] } }
     }
     $config = @(& $victory config 2>&1 | ForEach-Object { "$_" })
+
+    # Shaders translated and pipelines warmed ahead of the run (-NoPrepare skips it; -Prepare stops after it).
+    if (-not $NoPrepare) {
+        $cacheDir = Get-ConfigValue $config 'cache_dir'
+        $exeStamp = $null
+        try { $exeStamp = Get-ExeStamp $victory } catch { Write-Host "Not preparing ahead: $victory cannot be read ($($_.Exception.Message))." }
+        $prepFailed = $Prepare.IsPresent -and -not $exeStamp
+        if ($exeStamp) {
+            $prep = Invoke-Prepare $exeStamp $Build (Get-ConfigValue $config 'game_dir') $cacheDir $interactive $Prepare.IsPresent $false `
+                (Get-WarmWarning $victory $Build $cacheDir $root) (Test-PipelinesRecorded $cacheDir) (-not $Prepare) `
+                { Invoke-WithPathEnv $keep { & $victory shaders | Out-Host; $LASTEXITCODE } } `
+                { $warmArgs = Get-WarmArguments $SettleMax; Invoke-WithPathEnv $keep { & $victory @warmArgs | Out-Host; $LASTEXITCODE } } `
+                { param($question) Read-YesNo $question }
+            $prepFailed = [bool]$prep.Failed
+        }
+        if ($Prepare) {
+            # Nothing is started: what is still stale is said, and the exit code says whether it all worked.
+            @(Get-WarmWarning $victory $Build $cacheDir $root | Where-Object { $_ }) | ForEach-Object { Write-Host "WARNING: $_" }
+            if ($prepFailed) { Write-Host 'Preparation did not complete: see above.'; exit 1 }
+            Write-Host 'Prepared. Nothing was started.'
+            exit 0
+        }
+    }
 
     $localPath = $(if ($LocalConfig) { $LocalConfig } else { Join-Path $root 'local\play.toml' })
     if ($LocalConfig -and -not (Test-Path -LiteralPath $LocalConfig)) { Write-Host "No local file at $LocalConfig."; exit 1 }

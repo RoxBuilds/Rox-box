@@ -149,34 +149,67 @@ line.
 ### The first run: shader translation and warm-up
 
 Every shader a title uses has to be translated to DXIL, and every pipeline has
-to be compiled by your graphics driver. Both happen on first use and both are
-kept on disk, so the **first run of a title is slow and stutters**; later runs
-start from the caches. Two optional commands do the work ahead of time. Run
-them in a terminal in the Rox-box folder:
+to be compiled by your graphics driver. Both are kept on disk, and without
+them the first minutes of a run stutter badly. `play.cmd` does both ahead of
+the run, so there is nothing to type:
+
+- **Shaders, automatically.** Before a run, `play.cmd` checks a stamp in the
+  cache folder (`shaders\prepared-stamp.txt`) that names the `victory.exe` and
+  the game folder the shaders were last translated for. If the stamp is
+  missing, or names another `victory.exe` (after a Rox-box update) or another
+  game folder, it says so in a line or two and runs `victory.exe shaders`,
+  with its progress on screen. That takes a few minutes, once. No question is
+  asked. The stamp is written only when the command succeeds; if it fails,
+  `play.cmd` says so and starts the run anyway (a run translates shaders when
+  it first needs them, with stutter), and tries again next time.
+- **Pipelines, with one question.** After a Rox-box or graphics-driver update,
+  or when the pipelines were never warmed, and when earlier runs have recorded
+  pipelines, `play.cmd` asks once:
+  `Warm up the pipelines of your earlier runs now? It takes 10 to 40 minutes and
+  makes the run far smoother. [Y/n]`. Enter (or `y`) runs
+  `victory.exe warm --used --settle`, which compiles the pipelines earlier runs
+  drew with, in separate processes, and then waits until the driver's
+  background compilation has gone quiet. When it ends, whatever its result,
+  the run starts. `n` skips it and prints the `WARNING:` line described below.
+  Without a person at the window (a scheduled task, redirected input) nothing is
+  asked and nothing is warmed: only the `WARNING:` line is printed.
+- **Nothing recorded yet.** `victory warm` only knows the pipelines that earlier
+  runs wrote down, so the very first run is still the slow one: `play.cmd`
+  switches the recording on for every run (`VICTORY_PIPELINE_BOOK=1`; each
+  pipeline is hashed and written to the cache folder once, the first time the
+  title creates it). Until something is recorded `play.cmd` only prints a line
+  of advice. `play.cmd -More "VICTORY_PIPELINE_BOOK=0"` switches the recording
+  off.
+
+Two switches change this:
 
 ```
-victory.exe shaders
+play.cmd -Prepare
 ```
 
-translates every shader it finds under `game_dir` into the shader cache (a few
-minutes; needed again only after a Rox-box update that changes the translator).
+does both steps without asking (the warm-up too, when it is due and pipelines are
+recorded) and starts nothing afterwards: to prepare ahead of time, or from a
+script. Its exit code is 0 when everything that ran succeeded.
+`play.cmd -Prepare -SettleMax 20` stops the settling wait of the warm-up after
+20 minutes instead of 40 (`-SettleMax` works the same on a normal run).
 
 ```
-victory.exe warm --used --settle
+play.cmd -NoPrepare
 ```
 
-compiles, in separate processes, the pipelines that earlier runs drew with, and
-then waits until the driver's background compilation has gone quiet (up to 40
-minutes; `--settle-max <minutes>` changes that). It is worth doing again after
-a Rox-box or graphics-driver update. `victory warm` only knows the pipelines
-that earlier runs wrote down, so play once first: `play.cmd` switches the
-recording on for every run (`VICTORY_PIPELINE_BOOK=1`; each pipeline is hashed
-and written to the cache folder once, the first time the title creates it).
-`play.cmd -More "VICTORY_PIPELINE_BOOK=0"` switches it off.
+skips all of it, and `play.cmd` behaves as it did before this existed. Nothing
+is prepared for `-Check`, `-ShowSettings`, or when the check before a run fails.
 
-`play.cmd` prints a `WARNING:` line before a run when the pipelines were not
-warmed with the `victory.exe` it is about to start, with the exact command to
-run after you close the title. That is advice, not an error.
+The two commands still exist for doing it by hand, in a terminal in the Rox-box
+folder: `victory.exe shaders` translates every shader it finds under `game_dir`
+into the shader cache (a few minutes), and `victory.exe warm --used --settle`
+compiles the pipelines earlier runs drew with (up to 40 minutes;
+`--settle-max <minutes>` changes that).
+
+When the pipelines were not warmed with the `victory.exe` the run is about to
+start (and you did not warm them, or said no), `play.cmd` prints a `WARNING:`
+line before the run with the exact command to run after you close the title.
+That is advice, not an error.
 
 ### Settings
 
@@ -198,6 +231,9 @@ run after you close the title. That is advice, not an error.
 | `-Fps <N>`, `-SettingsXml`, `-SettingsValues` | Optional helpers that edit a title's own XML settings file before launch; they read `local\play.toml`, described at the top of `play.ps1` |
 | `-More "NAME=value;NAME2=value2"` | Sets additional `VICTORY_*` environment switches for this run |
 | `-ShowSettings` | Prints the environment switches these options give and starts nothing |
+| `-Prepare` | Translates the shaders and warms up the pipelines (see [The first run](#the-first-run-shader-translation-and-warm-up)) without asking, and starts nothing; exit code 0 when everything that ran succeeded |
+| `-NoPrepare` | Skips that preparation before a run |
+| `-SettleMax <minutes>` | The longest the warm-up waits for the driver's background work to go quiet (default 40) |
 
 Two things to know about switches:
 

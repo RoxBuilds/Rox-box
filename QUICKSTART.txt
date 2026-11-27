@@ -70,14 +70,29 @@ PLAY
   Enter / Backspace / X / Y the buttons, Esc the Menu button.
 
 THE FIRST RUN IS SLOW
-  Shaders are translated and compiled the first time they are used, and
-  kept. To do that work ahead of time, in the terminal:
-         victory.exe shaders
-     translates every shader found in the game folder (a few minutes).
+  Without prepared shaders and pipelines the first minutes of a run stutter
+  badly, so play.cmd prepares them before the run:
+  - Shaders: the first time (and after a Rox-box update, or for another game
+    folder) play.cmd translates the title's shaders, with its progress on
+    screen. It takes a few minutes, needs no answer, and is done once.
+    If it fails, the run starts anyway.
+  - Pipelines: after a Rox-box or graphics-driver update, play.cmd asks once
+    "Warm up the pipelines of your earlier runs now? [Y/n]". It takes 10 to
+    40 minutes and makes the run far smoother; press Enter to do it, n to
+    skip it. It only knows what earlier runs wrote down (play.cmd records
+    the pipelines of every run), so the very first run is still a slow one.
+  To prepare ahead of time without starting anything (exit code 0 when it
+  all worked), or to turn it off:
+         play.cmd -Prepare             does both without asking
+         play.cmd -Prepare -SettleMax 20   (the warm-up waits at most 20
+                                       minutes for the driver; default 40)
+         play.cmd -NoPrepare           skips all of it
+  The two commands behind it still work in a terminal in the folder:
+         victory.exe shaders           translates every shader found in the
+                                       game folder (a few minutes)
          victory.exe warm --used --settle
-     after you have played, compiles the pipelines earlier runs drew with.
-     It only knows what earlier runs wrote down: play.cmd records the
-     pipelines of every run, so play once first.
+                                       compiles the pipelines earlier runs
+                                       drew with
   A "WARNING: ..." line about warm-up or recorded pipelines before a run is
   advice, not an error; it names the command to run after you close the title.
 
