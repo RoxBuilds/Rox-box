@@ -56,6 +56,9 @@ pub struct Spec {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
+    /// Started with no pipes to the launcher, so that it goes on when the
+    /// launcher closes (its output is then only in its own log file).
+    pub detached: bool,
 }
 
 impl Spec {
@@ -77,6 +80,7 @@ pub fn victory(kind: Kind, exe: &Path, args: &[&str], title: Option<&str>) -> Sp
         args: args.iter().map(|a| a.to_string()).collect(),
         envs: title.map(|t| ("VICTORY_GAME_DIR".to_string(), t.to_string())).into_iter().collect(),
         cwd: exe.parent().map(Path::to_path_buf),
+        detached: false,
     }
 }
 
@@ -129,6 +133,7 @@ pub fn play(script: &Path, lib: &Library, source_tree: bool, prepare: bool) -> S
         // play.cmd's own pause is not ours, but a script that looks for it finds it off.
         envs: vec![("ROXBOX_NO_PAUSE".to_string(), "1".to_string())],
         cwd: script.parent().map(Path::to_path_buf),
+        detached: false,
     }
 }
 
@@ -150,12 +155,19 @@ pub struct Job {
     pub started: std::time::Instant,
     /// Everything it printed (quiet jobs are read from here when they end).
     pub output: Vec<String>,
+    /// The Windows job the process and everything it starts belong to.
+    tree: Option<Tree>,
 }
 
 /// Starts `spec`. `wake` is called whenever there is something to read.
 pub fn start(spec: Spec, wake: impl Fn() + Send + Sync + Clone + 'static) -> Result<Job, String> {
     let mut command = Command::new(&spec.program);
-    command.args(&spec.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.args(&spec.args).stdin(Stdio::null());
+    if spec.detached {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     command.creation_flags(CREATE_NO_WINDOW);
     for (k, v) in &spec.envs {
         command.env(k, v);
@@ -165,6 +177,8 @@ pub fn start(spec: Spec, wake: impl Fn() + Send + Sync + Clone + 'static) -> Res
     }
     let mut child = command.spawn().map_err(|e| format!("{}: {e}", spec.program.display()))?;
     let pid = child.id();
+    // Before it has started anything of its own: what it starts is then in the job too.
+    let tree = Tree::of(&child);
     let (tx, events) = channel();
     let mut readers = Vec::new();
     let out = child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>);
@@ -183,7 +197,7 @@ pub fn start(spec: Spec, wake: impl Fn() + Send + Sync + Clone + 'static) -> Res
         });
         wake();
     });
-    Ok(Job { spec, pid, events, started: std::time::Instant::now(), output: Vec::new() })
+    Ok(Job { spec, pid, events, started: std::time::Instant::now(), output: Vec::new(), tree })
 }
 
 fn pump(
@@ -210,18 +224,93 @@ fn pump(
     })
 }
 
-/// Ends a job and everything it started (play.ps1 starts victory.exe, which
-/// starts the title): `taskkill /PID <pid> /T /F`.
-pub fn stop(pid: u32) -> Result<(), String> {
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if status.success() { Ok(()) } else { Err(format!("taskkill ended with {status}")) }
+/// A Windows job object holding a started process and every process it
+/// starts, however deep, also those whose parent has ended since. It is how
+/// Stop ends all of them at once. Closing the handle ends nothing: a title
+/// goes on when the launcher closes.
+struct Tree(usize);
+
+// SAFETY: a job object's handle may be used from any thread.
+unsafe impl Send for Tree {}
+
+impl Tree {
+    fn of(child: &std::process::Child) -> Option<Tree> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: no attributes and no name; the child's handle is alive.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Tree(job as usize))
+        }
+    }
+
+    fn end(&self) -> bool {
+        // SAFETY: the handle is the job's, open for as long as `self` lives.
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0 as _, 1) != 0 }
+    }
+
+    /// How many processes of the job are alive.
+    #[cfg(test)]
+    fn alive(&self) -> Option<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation, QueryInformationJobObject,
+        };
+        // SAFETY: plain numbers; all zeros is a value of it.
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is the structure the class asks for, of its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.0 as _,
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info.ActiveProcesses)
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        // SAFETY: ours, closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0 as _) };
+    }
+}
+
+impl Job {
+    /// Ends the job and everything it started (play.ps1 starts victory.exe,
+    /// which starts the title): the whole Windows job at once, so nothing
+    /// stays behind, also not a process whose parent ended first. Where the
+    /// job could not be made, `taskkill /PID <pid> /T /F`.
+    pub fn stop(&self) -> Result<(), String> {
+        if self.tree.as_ref().is_some_and(Tree::end) {
+            return Ok(());
+        }
+        let status = Command::new("taskkill")
+            .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() { Ok(()) } else { Err(format!("taskkill ended with {status}")) }
+    }
+
+    /// Processes of the job still alive (none known: the job was not made).
+    #[cfg(test)]
+    pub fn alive(&self) -> Option<u32> {
+        self.tree.as_ref().and_then(Tree::alive)
+    }
 }
 
 /// The newest release's tag, asked of GitHub's public API with the curl.exe
@@ -236,6 +325,7 @@ pub fn latest_release() -> Spec {
             .collect(),
         envs: Vec::new(),
         cwd: None,
+        detached: false,
     }
 }
 
@@ -332,6 +422,7 @@ mod tests {
             args: ["/c", "echo one& echo two 1>&2& exit /b 7"].iter().map(|a| a.to_string()).collect(),
             envs: Vec::new(),
             cwd: None,
+            detached: false,
         };
         let job = start(spec, || {}).unwrap();
         let mut lines = Vec::new();
@@ -345,6 +436,38 @@ mod tests {
         lines.sort();
         assert_eq!(lines, ["one", "two"]);
         assert_eq!(code, Some(7));
-        assert!(start(Spec { kind: Kind::Check, program: "no-such-program-here.exe".into(), args: vec![], envs: vec![], cwd: None }, || {}).is_err());
+        assert!(start(Spec { kind: Kind::Check, program: "no-such-program-here.exe".into(), args: vec![], envs: vec![], cwd: None, detached: false }, || {}).is_err());
+    }
+
+    #[test]
+    fn stop_ends_the_whole_tree() {
+        // A shell that starts a shell that starts a program that waits: three deep.
+        let spec = Spec {
+            kind: Kind::Launch,
+            program: PathBuf::from("cmd.exe"),
+            args: ["/c", "cmd.exe /c ping -n 60 127.0.0.1 >nul"].iter().map(|a| a.to_string()).collect(),
+            envs: Vec::new(),
+            cwd: None,
+            detached: false,
+        };
+        let job = start(spec, || {}).unwrap();
+        // Until the inner processes are there.
+        for _ in 0..200 {
+            if job.alive().is_some_and(|n| n >= 3) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(job.alive().is_some_and(|n| n >= 3), "the job holds what the shell started: {:?}", job.alive());
+        job.stop().unwrap();
+        let code = loop {
+            match job.events.recv().unwrap() {
+                Event::Exit(code) => break code,
+                Event::Line(_) => {}
+                Event::Failed(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(code, Some(1));
+        assert_eq!(job.alive(), Some(0), "nothing of the tree is left");
     }
 }

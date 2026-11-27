@@ -144,6 +144,9 @@ pub struct Library {
     pub console: String,
     /// Extra `NAME=value;NAME=value` for play.ps1's `-More`.
     pub more: String,
+    /// What the launcher's window does when a title starts: `"stay"`,
+    /// `"minimize"` (and come back when the title ends) or `"close"`.
+    pub on_play: String,
 }
 
 impl Default for Library {
@@ -158,6 +161,7 @@ impl Default for Library {
             build: String::new(),
             console: "SeriesX".to_string(),
             more: String::new(),
+            on_play: "stay".to_string(),
         }
     }
 }
@@ -179,6 +183,8 @@ impl Library {
                 lib.console = v;
             } else if let Some(v) = string_value(line, "more") {
                 lib.more = v;
+            } else if let Some(v) = string_value(line, "on_play") {
+                lib.on_play = v;
             } else if let Some((key, value)) = line.split_once('=') {
                 let on = value.trim() == "true";
                 match key.trim() {
@@ -192,6 +198,9 @@ impl Library {
         }
         if !crate::paths::BUILDS.contains(&lib.build.as_str()) {
             lib.build.clear();
+        }
+        if !["minimize", "close"].contains(&lib.on_play.as_str()) {
+            lib.on_play = "stay".to_string();
         }
         if lib.console != "SeriesS" {
             lib.console = "SeriesX".to_string();
@@ -213,14 +222,15 @@ impl Library {
             out += &format!("active = {}\n", toml_path(a));
         }
         out += &format!(
-            "\nfast = {}\nlog = {}\nprepare = {}\nsafe = {}\nbuild = {}\nconsole = {}\nmore = {}\n",
+            "\nfast = {}\nlog = {}\nprepare = {}\nsafe = {}\nbuild = {}\nconsole = {}\nmore = {}\non_play = {}\n",
             self.fast,
             self.log,
             self.prepare,
             self.safe,
             toml_path(&self.build),
             toml_path(&self.console),
-            toml_path(&self.more)
+            toml_path(&self.more),
+            toml_path(&self.on_play)
         );
         out
     }
@@ -311,6 +321,7 @@ mod tests {
         lib.build = "release".to_string();
         lib.console = "SeriesS".to_string();
         lib.more = "VICTORY_AMBIENT=0.8;VICTORY_PIPELINE_BOOK=0".to_string();
+        lib.on_play = "minimize".to_string();
         assert_eq!(Library::parse(&lib.render()), lib);
         lib.remove("C:\\Titles\\One");
         assert_eq!(lib.active.as_deref(), Some("D:\\Two"));
@@ -318,7 +329,7 @@ mod tests {
 
     #[test]
     fn what_the_library_does_not_know_falls_back() {
-        let lib = Library::parse("build = 'fastest'\nconsole = 'Other'\nactive = 'C:\\gone'\nfast = yes\n");
+        let lib = Library::parse("build = 'fastest'\nconsole = 'Other'\nactive = 'C:\\gone'\nfast = yes\non_play = 'explode'\n");
         assert_eq!(lib, Library::default());
     }
 

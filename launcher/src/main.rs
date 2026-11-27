@@ -35,15 +35,11 @@ pub const RELEASE_API: &str = "https://api.github.com/repos/RoxBuilds/Rox-box/re
 /// The console drawer keeps this many lines.
 const CONSOLE_LINES: usize = 5000;
 
-/// What the status indicator says.
+/// How the last thing a person started ended (what runs now is the job itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
     Idle,
-    Preparing,
-    Running,
-    /// A maintenance command is at work.
-    Working(Kind),
-    /// The last thing ended: what it was, its exit code (none: stopped).
+    /// What it was, and its exit code (none: it was stopped).
     Exited(Kind, Option<i32>),
 }
 
@@ -98,6 +94,7 @@ struct App {
     note: String,
     picking: Option<Receiver<Option<PathBuf>>>,
     confirm_reset: bool,
+    page: Page,
 }
 
 impl App {
@@ -131,6 +128,12 @@ impl App {
             note: String::new(),
             picking: None,
             confirm_reset: false,
+            // `ROXBOX_PAGE` opens on another page (for pictures of the launcher).
+            page: match std::env::var("ROXBOX_PAGE").as_deref() {
+                Ok("diagnostics") => Page::Diagnostics,
+                Ok("settings") => Page::Settings,
+                _ => Page::Play,
+            },
         };
         match &app.home {
             None => {
@@ -178,7 +181,15 @@ impl App {
         if self.lib.prepare {
             self.queue.push_back(runner::play(&script, &self.lib, source, true));
         }
-        self.queue.push_back(runner::play(&script, &self.lib, source, false));
+        let mut run = runner::play(&script, &self.lib, source, false);
+        if self.lib.on_play == "close" {
+            // The launcher will be gone: no pipes to it, and the log file keeps the output.
+            let mut logged = self.lib.clone();
+            logged.log = true;
+            run = runner::play(&script, &logged, source, false);
+            run.detached = true;
+        }
+        self.queue.push_back(run);
     }
 
     /// Starts the next queued command when nothing runs.
@@ -194,16 +205,18 @@ impl App {
         let wake = ctx.clone();
         match runner::start(spec, move || wake.request_repaint()) {
             Ok(job) => {
-                self.status = match kind {
-                    Kind::Launch => Status::Running,
-                    Kind::Prepare => Status::Preparing,
-                    Kind::Check | Kind::Version | Kind::Report | Kind::Latest if self.status != Status::Idle => self.status.clone(),
-                    kind => Status::Working(kind),
-                };
                 if kind == Kind::SelfTest {
                     self.selftest = None;
                 }
                 self.job = Some(job);
+                if kind == Kind::Launch {
+                    // A window that is not shown draws nothing and holds no frame.
+                    match self.lib.on_play.as_str() {
+                        "minimize" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        _ => {}
+                    }
+                }
             }
             Err(e) => {
                 self.say(format!("could not start: {e}"));
@@ -286,6 +299,10 @@ impl App {
                 self.note = "Preparing did not finish: the title was not started. The console says why.".to_string();
             }
             Kind::Launch | Kind::Shaders | Kind::Warm => {
+                if kind == Kind::Launch && self.lib.on_play == "minimize" {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 // What a run or a preparation changed, the check should show.
                 self.enqueue_victory(Kind::Check, &["check"]);
             }
@@ -336,16 +353,54 @@ impl App {
     }
 }
 
+/// The pages of the rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Play,
+    Diagnostics,
+    Settings,
+}
+
+/// `m:ss` of a number of seconds.
+fn clock(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// `path` cut in its middle to at most `most` characters, both ends kept.
+fn elide(path: &str, most: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    let most = most.max(12);
+    if chars.len() <= most {
+        return path.to_string();
+    }
+    let head = most / 3;
+    let tail = most - head - 1;
+    chars[..head].iter().chain(std::iter::once(&'\u{2026}')).chain(&chars[chars.len() - tail..]).collect()
+}
+
+/// The last part of a folder's path: what a title is called here.
+fn title_name(folder: &str) -> String {
+    Path::new(folder).file_name().map_or_else(|| folder.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BG.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        if self.job.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Nothing is drawn unless something happened: the only timer is the
+        // run's clock, once a second, and not while the window is minimized.
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if self.job.as_ref().is_some_and(|j| !j.spec.kind.quiet()) && !minimized {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         // A folder (or a title's executable) dropped on the window.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         for path in dropped {
             self.add_title(&path);
+            self.page = Page::Play;
         }
         if let Some(rx) = &self.picking
             && let Ok(picked) = rx.try_recv()
@@ -355,18 +410,26 @@ impl eframe::App for App {
                 self.add_title(&path);
             }
         }
-
-        self.top_bar(ctx);
+        self.resize_edges(ctx);
+        self.title_bar(ctx);
+        self.rail(ctx);
+        self.footer(ctx);
         self.console_drawer(ctx);
-        self.library_panel(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().frame(theme::surface(theme::BG, egui::vec2(0.0, 0.0))).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.run_section(ui, ctx);
-                self.system_section(ui);
-                self.maintenance_section(ui);
-                self.version_section(ui, ctx);
+                egui::Frame::none().inner_margin(egui::Margin { left: 36.0, right: 36.0, top: 28.0, bottom: 28.0 }).show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(940.0));
+                    match self.page {
+                        Page::Play => self.play_page(ui, ctx),
+                        Page::Diagnostics => self.diagnostics_page(ui),
+                        Page::Settings => self.settings_page(ui, ctx),
+                    }
+                });
             });
         });
+        // The window's own edge, over everything.
+        let edge = ctx.screen_rect().shrink(0.5);
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("edge"))).rect_stroke(edge, egui::Rounding::ZERO, egui::Stroke::new(1.0_f32, theme::LINE));
 
         if self.lib != self.saved
             && let Some(home) = &self.home
@@ -380,65 +443,128 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").frame(theme::bar()).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("ROX-BOX").color(theme::ACCENT).strong().size(16.0));
-                ui.label(RichText::new("// LAUNCHER").color(theme::DIM).size(16.0));
-                if let Some(v) = &self.version {
-                    ui.label(RichText::new(format!("v{v}")).color(theme::DIM));
+    /// The window has no frame of Windows' own: its edges resize it here.
+    fn resize_edges(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let (at, pressed) = ctx.input(|i| (i.pointer.hover_pos(), i.pointer.primary_pressed()));
+        let Some(direction) = at.and_then(|at| theme::resize_direction(ctx.screen_rect(), at, 5.0)) else { return };
+        use egui::{CursorIcon as C, ResizeDirection as D};
+        ctx.set_cursor_icon(match direction {
+            D::North | D::South => C::ResizeVertical,
+            D::East | D::West => C::ResizeHorizontal,
+            D::NorthWest | D::SouthEast => C::ResizeNwSe,
+            D::NorthEast | D::SouthWest => C::ResizeNeSw,
+        });
+        if pressed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    fn title_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("title-bar").exact_height(34.0).frame(theme::surface(theme::RAIL, egui::vec2(0.0, 0.0))).show(ctx, |ui| {
+            let bar = ui.max_rect();
+            let drag = ui.interact(bar, egui::Id::new("title-bar-drag"), egui::Sense::click_and_drag());
+            if drag.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            if drag.double_clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            ui.painter().text(egui::pos2(bar.left() + 16.0, bar.center().y), egui::Align2::LEFT_CENTER, "Rox-Box", egui::FontId::proportional(12.5), theme::DIM);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if theme::window_button(ui, theme::Sign::Close).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (word, color) = match &self.status {
-                        Status::Idle => ("IDLE".to_string(), theme::DIM),
-                        Status::Preparing => ("PREPARING".to_string(), theme::WARN),
-                        Status::Running => ("RUNNING".to_string(), theme::ACCENT),
-                        Status::Working(kind) => (kind.label().to_uppercase(), theme::WARN),
-                        Status::Exited(kind, Some(0)) => (format!("{} EXITED 0", kind.label().to_uppercase()), theme::TEXT),
-                        Status::Exited(kind, Some(c)) => (format!("{} EXITED {c}", kind.label().to_uppercase()), theme::BAD),
-                        Status::Exited(kind, None) => (format!("{} STOPPED", kind.label().to_uppercase()), theme::WARN),
-                    };
-                    theme::chip(ui, &word, color);
-                    if let Some(job) = &self.job
-                        && !job.spec.kind.quiet()
-                    {
-                        ui.label(RichText::new(format!("{} s", job.started.elapsed().as_secs())).color(theme::DIM));
+                if theme::window_button(ui, theme::Sign::Maximize).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if theme::window_button(ui, theme::Sign::Minimize).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+            });
+        });
+    }
+
+    fn rail(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("rail").exact_width(236.0).resizable(false).frame(theme::surface(theme::RAIL, egui::vec2(14.0, 0.0))).show(ctx, |ui| {
+            // The brand: the emblem and the wordmark, both drawn.
+            let (brand, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 86.0), egui::Sense::hover());
+            theme::emblem(ui, egui::pos2(brand.left() + 30.0, brand.center().y), 20.0);
+            theme::wordmark(ui, egui::pos2(brand.left() + 62.0, brand.center().y), 17.0);
+            ui.add_space(6.0);
+            for (page, sign, label) in [
+                (Page::Play, theme::Sign::Play, "Library / Play"),
+                (Page::Diagnostics, theme::Sign::Pulse, "Diagnostics"),
+                (Page::Settings, theme::Sign::Sliders, "Settings"),
+            ] {
+                if theme::nav(ui, sign, label, self.page == page).clicked() {
+                    self.page = page;
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    match (&self.latest, &self.version) {
+                        (Some(Ok(tag)), Some(local)) if runner::newer(&runner::version_of(tag).unwrap_or_default(), local) => {
+                            theme::badge(ui, &format!("{tag} is out"), theme::WARN);
+                        }
+                        (Some(Ok(_)), Some(_)) => theme::badge(ui, "up to date", theme::GOOD),
+                        _ => {}
                     }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let version = self.version.as_ref().map_or_else(|| "engine not found".to_string(), |v| format!("Rox-Box {v}"));
+                    ui.label(RichText::new(version).color(theme::DIM).small());
                 });
             });
         });
     }
 
-    fn console_drawer(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("console-bar").frame(theme::bar()).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let arrow = if self.console_open { "v" } else { ">" };
-                if theme::flat(ui, &format!("{arrow} CONSOLE  {} lines", self.console.len())).clicked() {
+    fn footer(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("footer").exact_height(34.0).frame(theme::surface(theme::RAIL, egui::vec2(16.0, 0.0))).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                let label = if self.console_open { "Hide console" } else { "Console" };
+                if theme::link(ui, label).clicked() {
                     self.console_open = !self.console_open;
                 }
-                if theme::flat(ui, "COPY LOG").clicked() {
-                    ctx.copy_text(self.console.iter().cloned().collect::<Vec<_>>().join("\n"));
-                    self.note = format!("Log copied ({} lines). It can hold paths of this PC: read it before posting.", self.console.len());
-                }
-                if theme::flat(ui, "CLEAR").clicked() {
-                    self.console.clear();
-                }
-                ui.add(egui::Label::new(RichText::new(&self.note).color(theme::DIM)).truncate());
+                ui.add(egui::Label::new(RichText::new(&self.note).color(theme::FAINT).small()).truncate());
             });
         });
+    }
+
+    fn console_drawer(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("console")
-            .frame(theme::well())
+            .frame(theme::surface(theme::WELL, egui::vec2(16.0, 10.0)))
             .resizable(true)
-            .default_height(220.0)
-            .min_height(80.0)
+            .default_height(240.0)
+            .min_height(100.0)
             .show_animated(ctx, self.console_open, |ui| {
+                ui.horizontal(|ui| {
+                    theme::eyebrow(ui, "CONSOLE");
+                    ui.label(RichText::new(format!("{} lines", self.console.len())).color(theme::FAINT).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::link(ui, "Clear").clicked() {
+                            self.console.clear();
+                        }
+                        if theme::link(ui, "Copy log").clicked() {
+                            ctx.copy_text(self.console.iter().cloned().collect::<Vec<_>>().join("\n"));
+                            self.note = format!("Log copied ({} lines). It can hold paths of this PC: read it before posting.", self.console.len());
+                        }
+                    });
+                });
                 egui::ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(true).show_rows(
                     ui,
                     ui.text_style_height(&egui::TextStyle::Monospace),
                     self.console.len(),
                     |ui, rows| {
                         for line in self.console.range(rows) {
-                            let color = if line.starts_with("> ") || line.starts_with('[') { theme::ACCENT } else { theme::TEXT };
+                            let color = if line.starts_with("> ") || line.starts_with('[') { theme::ACCENT } else { theme::DIM };
                             ui.add(egui::Label::new(RichText::new(line).color(color).monospace()).extend());
                         }
                     },
@@ -446,272 +572,402 @@ impl App {
             });
     }
 
-    fn library_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("library").frame(theme::panel()).resizable(false).exact_width(280.0).show(ctx, |ui| {
-            theme::heading(ui, "TITLES");
-            if self.lib.titles.is_empty() {
-                ui.label(RichText::new("No title folder yet.\n\nAdd the folder with your own, legally obtained title files, or drop it on this window.").color(theme::DIM));
-            }
-            let mut activate = None;
-            for title in &self.lib.titles {
-                let active = self.lib.active.as_deref() == Some(title.as_str());
-                let name = Path::new(title).file_name().map_or_else(|| title.clone(), |n| n.to_string_lossy().into_owned());
-                let text = RichText::new(format!("{} {name}", if active { ">" } else { " " }))
-                    .color(if active { theme::ACCENT } else { theme::TEXT });
-                if ui.add(egui::SelectableLabel::new(active, text)).on_hover_text(title).clicked() && !active {
-                    activate = Some(title.clone());
+    /// The job a person sees as running (not the quiet ones behind the scenes).
+    fn visible_job(&self) -> Option<(Kind, u64)> {
+        self.job.as_ref().filter(|j| !j.spec.kind.quiet()).map(|j| (j.spec.kind, j.started.elapsed().as_secs()))
+    }
+
+    fn stop(&mut self) {
+        self.queue.clear();
+        let Some(job) = &self.job else { return };
+        let label = job.spec.kind.label();
+        match job.stop() {
+            Ok(()) => self.say(format!("[stopping {label} and everything it started]")),
+            Err(e) => self.note = format!("Could not stop it: {e}"),
+        }
+    }
+
+    fn pick_folder(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(rfd::FileDialog::new().set_title("The folder with your title files").pick_folder());
+            wake.request_repaint();
+        });
+        self.picking = Some(rx);
+    }
+
+    fn play_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let running = self.visible_job();
+        let alive = matches!(running, Some((Kind::Launch | Kind::Prepare, _)));
+        theme::hero(alive).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match self.lib.active.clone() {
+                None => {
+                    theme::eyebrow(ui, "WELCOME");
+                    ui.label(RichText::new("Add your first title").size(34.0).strong());
+                    ui.label(RichText::new("Choose the folder that holds your own, legally obtained title files, or drop it anywhere on this window.").color(theme::DIM));
+                    ui.add_space(14.0);
+                    if theme::big_button(ui, "ADD FOLDER", if self.picking.is_none() { theme::Big::Play } else { theme::Big::Off }).clicked() {
+                        self.pick_folder(ctx);
+                    }
                 }
-            }
-            if let Some(title) = activate {
-                self.lib.active = Some(title);
-                self.enqueue_victory(Kind::Check, &["check"]);
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if theme::button(ui, "+ ADD FOLDER", self.picking.is_none()).clicked() {
-                    let (tx, rx) = channel();
-                    let wake = ctx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(rfd::FileDialog::new().set_title("The folder with your title files").pick_folder());
-                        wake.request_repaint();
+                Some(active) => {
+                    theme::eyebrow(ui, "ACTIVE TITLE");
+                    ui.label(RichText::new(title_name(&active)).size(38.0).strong());
+                    ui.add(egui::Label::new(RichText::new(&active).font(theme::mono(12.5)).color(theme::DIM)).truncate()).on_hover_text(&active);
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        let ready = self.home.is_some() && !self.busy();
+                        match running {
+                            Some(_) => {
+                                if theme::big_button(ui, "STOP", theme::Big::Stop).clicked() {
+                                    self.stop();
+                                }
+                            }
+                            None => {
+                                if theme::big_button(ui, "PLAY", if ready { theme::Big::Play } else { theme::Big::Off }).clicked() {
+                                    self.launch();
+                                    self.pump(ctx);
+                                }
+                            }
+                        }
+                        ui.add_space(14.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(8.0);
+                            let missing = self.checks.iter().filter(|c| c.status != "OK" && c.status != "WARN").count();
+                            let (state, color, detail) = match (&running, &self.status) {
+                                (Some((Kind::Launch, secs)), _) => ("Running".to_string(), theme::ACCENT, clock(*secs)),
+                                (Some((Kind::Prepare, secs)), _) => ("Preparing shaders".to_string(), theme::WARN, format!("{}  ·  the title starts when this is done", clock(*secs))),
+                                (Some((kind, secs)), _) => (format!("Working: {}", kind.label()), theme::WARN, clock(*secs)),
+                                (None, _) if missing > 0 => {
+                                    ("Not ready".to_string(), theme::BAD, format!("the preflight check misses {missing} thing(s): Diagnostics says which"))
+                                }
+                                (None, Status::Exited(kind, Some(0))) => ("Ready".to_string(), theme::GOOD, format!("last {} ended normally", kind.label())),
+                                (None, Status::Exited(kind, Some(code))) => ("Ready".to_string(), theme::BAD, format!("last {} ended with exit code {code}", kind.label())),
+                                (None, Status::Exited(kind, None)) => ("Ready".to_string(), theme::WARN, format!("last {} was stopped", kind.label())),
+                                (None, _) => ("Ready".to_string(), theme::GOOD, String::new()),
+                            };
+                            ui.horizontal(|ui| {
+                                let (spot, _) = ui.allocate_exact_size(egui::vec2(14.0, 20.0), egui::Sense::hover());
+                                theme::dot(ui, spot.center(), color);
+                                ui.label(RichText::new(state).size(17.0).strong());
+                            });
+                            ui.label(RichText::new(detail).color(theme::DIM).small());
+                        });
                     });
-                    self.picking = Some(rx);
+                    ui.add_space(18.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if theme::pill(ui, "Fast", self.lib.fast).on_hover_text("The low-memory preset: smaller console model, 1920x1080, release build (play.cmd -Fast).").clicked() {
+                            self.lib.fast = !self.lib.fast;
+                        }
+                        if theme::pill(ui, "Log", self.lib.log).on_hover_text("Also write the run's output under %LOCALAPPDATA%\\victory\\logs (play.cmd -Log).").clicked() {
+                            self.lib.log = !self.lib.log;
+                        }
+                        if theme::pill(ui, "Safe", self.lib.safe).on_hover_text("Newer experimental optimizations off (play.cmd -Safe).").clicked() {
+                            self.lib.safe = !self.lib.safe;
+                        }
+                        if theme::pill(ui, "Prepare first", self.lib.prepare)
+                            .on_hover_text("Translate shaders and warm the pipelines before the run (play.cmd -Prepare). The title starts only if that succeeds.")
+                            .clicked()
+                        {
+                            self.lib.prepare = !self.lib.prepare;
+                        }
+                        ui.add_space(8.0);
+                        if let Some(model) = theme::segmented(ui, &[("SeriesX", "Series X"), ("SeriesS", "Series S")], &self.lib.console) {
+                            self.lib.console = model.to_string();
+                        }
+                    });
                 }
-                if theme::button(ui, "REMOVE", self.lib.active.is_some() && !self.busy()).clicked()
-                    && let Some(active) = self.lib.active.clone()
-                {
-                    self.lib.remove(&active);
-                    self.note = "Removed from the list. No file was touched.".to_string();
+            }
+        });
+
+        ui.add_space(22.0);
+        self.readiness_strip(ui);
+
+        ui.add_space(26.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Library").size(20.0).strong());
+            ui.label(RichText::new(format!("{} title folder(s)", self.lib.titles.len())).color(theme::DIM));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::button(ui, "+  Add folder", self.picking.is_none()).clicked() {
+                    self.pick_folder(ctx);
                 }
             });
-            ui.add_space(8.0);
-            let default = self
-                .home
-                .as_ref()
-                .and_then(|h| std::fs::read_to_string(h.config_file()).ok())
-                .and_then(|t| config::game_dir_of(&t));
-            let is_default = default.is_some() && default.as_deref() == self.lib.active.as_deref();
-            if theme::button(ui, "WRITE TO victory.toml", self.lib.active.is_some() && !is_default && self.home.is_some())
-                .on_hover_text("Sets game_dir to this folder. Every other line stays; a timestamped copy of the file is kept.")
-                .clicked()
-                && let (Some(home), Some(active)) = (&self.home, &self.lib.active)
-            {
-                self.note = match config::write_game_dir(&home.config_file(), active) {
-                    Ok(done) => done,
-                    Err(e) => format!("victory.toml could not be written: {e}"),
-                };
+        });
+        ui.add_space(4.0);
+        let mut activate = None;
+        let mut remove = None;
+        for title in self.lib.titles.clone() {
+            let active = self.lib.active.as_deref() == Some(title.as_str());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::click());
+            let t = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+            ui.painter().rect(
+                rect,
+                egui::Rounding::same(theme::RADIUS),
+                theme::mix(theme::CARD, theme::CARD_HI, t),
+                egui::Stroke::new(1.0_f32, if active { theme::mix(theme::LINE, theme::ACCENT, 0.6) } else { theme::mix(theme::LINE, theme::DIM, t) }),
+            );
+            theme::emblem(ui, egui::pos2(rect.left() + 30.0, rect.center().y), if active { 13.0 } else { 10.0 });
+            ui.painter().text(egui::pos2(rect.left() + 58.0, rect.top() + 22.0), egui::Align2::LEFT_CENTER, title_name(&title), egui::FontId::proportional(16.0), theme::TEXT);
+            ui.painter().text(egui::pos2(rect.left() + 58.0, rect.top() + 43.0), egui::Align2::LEFT_CENTER, elide(&title, ((rect.width() - 250.0) / 7.2) as usize), theme::mono(11.5), theme::DIM);
+            let side = egui::Rect::from_min_max(egui::pos2(rect.right() - 170.0, rect.top()), rect.right_bottom()).shrink2(egui::vec2(14.0, 14.0));
+            let mut side_ui = ui.new_child(egui::UiBuilder::new().max_rect(side).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            if active {
+                theme::badge(&mut side_ui, "ACTIVE", theme::ACCENT);
+            } else if theme::link(&mut side_ui, "Remove").clicked() {
+                remove = Some(title.clone());
             }
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !active && remove.is_none() {
+                activate = Some(title.clone());
+            }
+            ui.add_space(2.0);
+        }
+        if let Some(title) = remove {
+            self.lib.remove(&title);
+            self.note = "Removed from the library. No file was touched.".to_string();
+        } else if let Some(title) = activate
+            && !self.busy()
+        {
+            self.lib.active = Some(title);
+            self.enqueue_victory(Kind::Check, &["check"]);
+        }
+        if self.lib.titles.is_empty() {
+            ui.label(RichText::new("Nothing here yet. A title is a folder on your PC: the launcher knows no title by name and ships none.").color(theme::DIM));
+        }
+    }
+
+    /// The PC's facts as pills with a dot each; what a dot means is on hover.
+    fn readiness_strip(&mut self, ui: &mut egui::Ui) {
+        let gpu = system::gpu_of(&self.checks);
+        let vram = gpu.as_ref().and_then(|g| g.1);
+        let warnings = system::warnings(&self.host, vram);
+        let about = |subject: system::Subject| -> (egui::Color32, String) {
+            match warnings.iter().find(|w| w.0 == subject) {
+                Some((_, Level::Warn, text)) => (theme::BAD, text.clone()),
+                Some((_, Level::Note, text)) => (theme::WARN, text.clone()),
+                None => (theme::GOOD, String::new()),
+            }
+        };
+        theme::eyebrow(ui, "SYSTEM READINESS");
+        ui.horizontal_wrapped(|ui| {
+            let card = self.checks.iter().find(|c| c.name == "Graphics card");
+            let (gpu_color, gpu_tip) = match card {
+                Some(c) if c.status == "OK" => (theme::GOOD, c.detail.clone()),
+                Some(c) => (theme::BAD, c.detail.clone()),
+                None => (theme::FAINT, "Not read yet: the engine's own check names it.".to_string()),
+            };
+            theme::fact(ui, "GPU", &gpu.as_ref().map_or_else(|| "not read".to_string(), |g| g.0.clone()), gpu_color, &gpu_tip);
+            let (c, tip) = about(system::Subject::Vram);
+            theme::fact(ui, "VRAM", &vram.map_or_else(|| "-".to_string(), system::gb), if vram.is_some() { c } else { theme::FAINT }, &tip);
+            let (c, tip) = about(system::Subject::Ram);
+            theme::fact(ui, "RAM", &self.host.ram_mb.map_or_else(|| "-".to_string(), system::gb), c, &tip);
+            let (c, tip) = about(system::Subject::PageFile);
+            let page = match &self.host.page_file {
+                system::PageFile::None => "none".to_string(),
+                system::PageFile::SystemManaged => "system-managed".to_string(),
+                system::PageFile::Fixed { maximum_mb, .. } => format!("fixed, {}", system::gb(*maximum_mb)),
+                system::PageFile::Unknown => "not read".to_string(),
+            };
+            theme::fact(ui, "PAGE FILE", &page, c, &tip);
+            let missing = self.checks.iter().filter(|c| c.status != "OK" && c.status != "WARN").count();
+            let warned = self.checks.iter().filter(|c| c.status == "WARN").count();
+            let (value, color) = match (self.checks.is_empty(), missing, warned) {
+                (true, ..) => ("not run".to_string(), theme::FAINT),
+                (_, 0, 0) => ("ready".to_string(), theme::GOOD),
+                (_, 0, w) => (format!("{w} warning(s)"), theme::WARN),
+                (_, m, _) => (format!("{m} missing"), theme::BAD),
+            };
+            let tip: Vec<String> = self.checks.iter().filter(|c| c.status != "OK").map(|c| format!("{}: {}", c.name, c.detail)).collect();
+            if theme::fact(ui, "PREFLIGHT", &value, color, &if tip.is_empty() { "Everything a run needs is there.".to_string() } else { tip.join("\n") })
+                .interact(egui::Sense::click())
+                .clicked()
+            {
+                self.page = Page::Diagnostics;
+            }
+        });
+    }
+
+    fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
+        theme::page_title(ui, "Diagnostics", "What a run needs, and the tools that keep it ready. Nothing here starts a title.");
+        let idle = self.home.is_some() && !self.busy();
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::eyebrow(ui, "PREFLIGHT");
+                if let Some(summary) = &self.check_summary {
+                    ui.label(RichText::new(summary).color(theme::DIM).small());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, "Check again", idle).on_hover_text("victory check: everything a run needs, and how to fix what is missing.").clicked() {
+                        self.host = Host::read();
+                        self.enqueue_victory(Kind::Check, &["check"]);
+                    }
+                });
+            });
             ui.add_space(4.0);
+            if self.checks.is_empty() {
+                ui.label(RichText::new("Not checked yet.").color(theme::DIM));
+            }
+            egui::Grid::new("checks").num_columns(3).spacing([14.0, 9.0]).show(ui, |ui| {
+                for check in &self.checks {
+                    let color = match check.status.as_str() {
+                        "OK" => theme::GOOD,
+                        "WARN" => theme::WARN,
+                        _ => theme::BAD,
+                    };
+                    let (spot, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+                    theme::dot(ui, spot.center(), color);
+                    ui.label(&check.name);
+                    ui.add(egui::Label::new(RichText::new(&check.detail).font(theme::mono(12.0)).color(if check.status == "OK" { theme::DIM } else { theme::TEXT })).wrap());
+                    ui.end_row();
+                }
+            });
+        });
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "MAINTENANCE");
+            ui.add_space(4.0);
+            let tool = |ui: &mut egui::Ui, name: &str, about: &str, action: &str, enabled: bool| -> bool {
+                let mut clicked = false;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 190.0).max(200.0));
+                        ui.label(RichText::new(name).size(15.5).strong());
+                        ui.add(egui::Label::new(RichText::new(about).color(theme::DIM).small()).wrap());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        clicked = theme::button(ui, action, enabled).clicked();
+                    });
+                });
+                ui.add_space(8.0);
+                clicked
+            };
+            if tool(ui, "Prepare shaders", "Translate every shader of the title into the cache, so no run has to. A few minutes, once per version.  victory shaders", "Prepare", idle) {
+                self.enqueue_victory(Kind::Shaders, &["shaders"]);
+            }
+            if tool(ui, "Warm cache", "Make the pipelines earlier runs drew with before a run needs them.  victory warm --used --settle", "Warm", idle) {
+                self.enqueue_victory(Kind::Warm, &["warm", "--used", "--settle"]);
+            }
+            let verdict = match self.selftest {
+                Some(true) => "Self-test  ·  PASS",
+                Some(false) => "Self-test  ·  FAIL",
+                None => "Self-test",
+            };
+            if tool(ui, verdict, "The frame path end to end with a stand-in of our own. Needs no title.  victory selftest", "Run", idle) {
+                self.enqueue_victory(Kind::SelfTest, &["selftest"]);
+            }
+            if tool(ui, "Run report", "The newest run's report, to the clipboard. Numbers and Rox-Box's own words only: safe for a public issue.  victory report", "Copy", idle) {
+                self.enqueue_victory(Kind::Report, &["report"]);
+            }
+            if !self.confirm_reset {
+                if tool(ui, "Reset pipeline cache", "For a cache gone stale after a driver or version change. Removes the pipeline library and the warm-up's marks; what runs recorded stays.", "Reset", idle) {
+                    self.confirm_reset = true;
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Remove the pipeline library? Warm cache makes it again.").color(theme::WARN));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, "Keep it", true).clicked() {
+                            self.confirm_reset = false;
+                        }
+                        if theme::danger(ui, "Yes, reset", idle).clicked() {
+                            self.confirm_reset = false;
+                            self.reset_cache();
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        theme::page_title(ui, "Settings", "Kept in local\\launcher.toml beside the engine. Nothing here leaves this PC.");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "WHEN A TITLE STARTS");
+            if let Some(choice) = theme::segmented(ui, &[("stay", "Keep the launcher open"), ("minimize", "Minimize it"), ("close", "Close it")], &self.lib.on_play) {
+                self.lib.on_play = choice.to_string();
+            }
             ui.label(
-                RichText::new(match (&default, is_default) {
-                    (_, true) => "victory.toml names this folder.".to_string(),
-                    (Some(_), false) => "victory.toml names another folder. Launching uses the one chosen here for that run.".to_string(),
-                    (None, _) => "victory.toml names no folder yet.".to_string(),
+                RichText::new(match self.lib.on_play.as_str() {
+                    "minimize" => "Minimized, the launcher draws nothing and comes back when the title ends.",
+                    "close" => "The launcher exits and uses no memory at all. The run's output is then only in its log file (Log is switched on for it).",
+                    _ => "The launcher stays and draws only when something changes: once a second for the run's clock.",
                 })
                 .color(theme::DIM)
                 .small(),
             );
-        });
-    }
-
-    fn run_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        theme::heading(ui, "RUN");
-        ui.horizontal(|ui| {
-            let running = self.job.as_ref().filter(|j| !j.spec.kind.quiet()).map(|j| (j.pid, j.spec.kind));
-            let ready = self.home.is_some() && self.lib.active.is_some() && !self.busy();
-            if theme::primary(ui, "LAUNCH", ready).clicked() {
-                self.launch();
-                self.pump(ctx);
-            }
-            if theme::danger(ui, "STOP", running.is_some()).clicked()
-                && let Some((pid, kind)) = running
-            {
-                self.queue.clear();
-                match runner::stop(pid) {
-                    Ok(()) => self.say(format!("[stopping {} and everything it started]", kind.label())),
-                    Err(e) => self.note = format!("Could not stop it: {e}"),
-                }
-            }
-            ui.add_space(12.0);
-            ui.label(RichText::new(match &self.lib.active {
-                Some(title) => title.clone(),
-                None => "add a title folder first".to_string(),
-            })
-            .color(theme::DIM));
-        });
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut self.lib.fast, "FAST").on_hover_text("play.cmd -Fast: the low-memory preset (smaller console model, 1920x1080, release build).");
-            ui.toggle_value(&mut self.lib.log, "LOG").on_hover_text("play.cmd -Log: the run's output is also written under %LOCALAPPDATA%\\victory\\logs.");
-            ui.toggle_value(&mut self.lib.prepare, "PREPARE FIRST")
-                .on_hover_text("Before the run: play.cmd -Prepare (translate shaders, warm the pipelines). The title starts only if that succeeds.");
-            ui.toggle_value(&mut self.lib.safe, "SAFE").on_hover_text("play.cmd -Safe: newer experimental optimizations off.");
-            ui.add_space(12.0);
-            ui.label(RichText::new("CONSOLE").color(theme::DIM));
-            egui::ComboBox::from_id_salt("console-model").selected_text(self.lib.console.clone()).show_ui(ui, |ui| {
-                for model in ["SeriesX", "SeriesS"] {
-                    ui.selectable_value(&mut self.lib.console, model.to_string(), model);
-                }
-            });
             if self.source_tree() {
-                ui.label(RichText::new("BUILD").color(theme::DIM));
-                let shown = if self.lib.build.is_empty() { "auto".to_string() } else { self.lib.build.clone() };
-                egui::ComboBox::from_id_salt("build").selected_text(shown).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.lib.build, String::new(), "auto (first built)");
-                    for build in self.home.as_ref().map(|h| h.builds()).unwrap_or_default() {
-                        ui.selectable_value(&mut self.lib.build, build.to_string(), build);
+                ui.add_space(14.0);
+                theme::eyebrow(ui, "ENGINE BUILD");
+                let builds = self.home.as_ref().map(|h| h.builds()).unwrap_or_default();
+                let mut choices = vec![("", "First built")];
+                choices.extend(builds.iter().map(|b| (*b, *b)));
+                if let Some(choice) = theme::segmented(ui, &choices, &self.lib.build) {
+                    self.lib.build = choice.to_string();
+                }
+            }
+            ui.add_space(14.0);
+            theme::eyebrow(ui, "EXTRA SWITCHES");
+            ui.add(egui::TextEdit::singleline(&mut self.lib.more).font(theme::mono(12.5)).hint_text("VICTORY_NAME=value;VICTORY_OTHER=value").desired_width(f32::INFINITY).margin(egui::vec2(10.0, 8.0)));
+            ui.label(RichText::new("Passed to every run as play.cmd -More. docs/switches.md lists them.").color(theme::DIM).small());
+        });
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "CONFIG FILE  ·  VICTORY.TOML");
+            let default = self.home.as_ref().and_then(|h| std::fs::read_to_string(h.config_file()).ok()).and_then(|t| config::game_dir_of(&t));
+            let is_default = default.is_some() && default.as_deref() == self.lib.active.as_deref();
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width((ui.available_width() - 230.0).max(200.0));
+                    ui.label(match (&default, is_default) {
+                        (_, true) => "It names the active title's folder.".to_string(),
+                        (Some(_), false) => "It names another folder. Playing uses the active title for that run all the same.".to_string(),
+                        (None, _) => "It names no folder yet.".to_string(),
+                    });
+                    ui.label(RichText::new("Writing sets game_dir only. Every other line stays, and a timestamped copy of the file is kept.").color(theme::DIM).small());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, "Write active title", self.lib.active.is_some() && !is_default && self.home.is_some()).clicked()
+                        && let (Some(home), Some(active)) = (&self.home, &self.lib.active)
+                    {
+                        self.note = match config::write_game_dir(&home.config_file(), active) {
+                            Ok(done) => done,
+                            Err(e) => format!("victory.toml could not be written: {e}"),
+                        };
                     }
                 });
-            }
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("MORE").color(theme::DIM)).on_hover_text("play.cmd -More: NAME=value pairs separated by ';'");
-            ui.add(egui::TextEdit::singleline(&mut self.lib.more).hint_text("VICTORY_NAME=value;VICTORY_OTHER=value").desired_width(f32::INFINITY));
-        });
-        if self.lib.fast && self.lib.console == "SeriesX" {
-            ui.label(RichText::new("FAST chooses the smaller console model unless one is given: CONSOLE stays as -Fast sets it.").color(theme::DIM).small());
-        }
-    }
-
-    fn system_section(&mut self, ui: &mut egui::Ui) {
-        theme::heading(ui, "SYSTEM");
-        let gpu = system::gpu_of(&self.checks);
-        let vram = gpu.as_ref().and_then(|g| g.1);
-        egui::Grid::new("facts").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            let mut row = |name: &str, value: String| {
-                ui.label(RichText::new(name).color(theme::DIM));
-                ui.label(value);
-                ui.end_row();
-            };
-            row("GPU", gpu.as_ref().map_or_else(|| "not read yet (victory check names it)".to_string(), |g| g.0.clone()));
-            row("VRAM", vram.map_or_else(|| "-".to_string(), system::gb));
-            row("RAM", self.host.ram_mb.map_or_else(|| "-".to_string(), system::gb));
-            row("WINDOWS", self.host.windows.clone());
-            row(
-                "PAGE FILE",
-                match &self.host.page_file {
-                    system::PageFile::None => "none".to_string(),
-                    system::PageFile::SystemManaged => "system-managed".to_string(),
-                    system::PageFile::Fixed { initial_mb, maximum_mb } => {
-                        format!("fixed, {} to {}", system::gb(*initial_mb), system::gb(*maximum_mb))
-                    }
-                    system::PageFile::Unknown => "not read".to_string(),
-                },
-            );
-            row("COMMIT LIMIT", self.host.commit_limit_mb.map_or_else(|| "-".to_string(), system::gb));
-        });
-        for (level, text) in system::warnings(&self.host, vram) {
-            let (tag, color) = if level == Level::Warn { ("WARN", theme::WARN) } else { ("NOTE", theme::DIM) };
-            ui.horizontal_wrapped(|ui| {
-                theme::chip(ui, tag, color);
-                ui.label(text);
             });
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if theme::button(ui, "RE-CHECK", self.home.is_some() && !self.busy()).on_hover_text("victory check: everything a run needs, and how to fix what is missing. Starts nothing.").clicked() {
-                self.host = Host::read();
-                self.enqueue_victory(Kind::Check, &["check"]);
-            }
-            if let Some(summary) = &self.check_summary {
-                ui.label(RichText::new(summary).color(theme::DIM));
-            }
         });
-        for check in &self.checks {
-            let color = match check.status.as_str() {
-                "OK" => theme::DIM,
-                "WARN" => theme::WARN,
-                _ => theme::BAD,
-            };
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "VERSION");
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("{:<7}", check.status)).color(color));
-                ui.label(RichText::new(format!("{:<17}", check.name)).color(theme::TEXT));
-                ui.label(RichText::new(&check.detail).color(if check.status == "OK" { theme::DIM } else { theme::TEXT }));
-            });
-        }
-    }
-
-    fn maintenance_section(&mut self, ui: &mut egui::Ui) {
-        theme::heading(ui, "MAINTENANCE");
-        let idle = self.home.is_some() && !self.busy();
-        ui.horizontal_wrapped(|ui| {
-            if theme::button(ui, "PREPARE SHADERS", idle).on_hover_text("victory shaders: translate every shader of the title into the cache. A few minutes, once per version.").clicked() {
-                self.enqueue_victory(Kind::Shaders, &["shaders"]);
-            }
-            if theme::button(ui, "WARM CACHE", idle).on_hover_text("victory warm --used --settle: make the pipelines earlier runs drew with, before a run needs them.").clicked() {
-                self.enqueue_victory(Kind::Warm, &["warm", "--used", "--settle"]);
-            }
-            if theme::button(ui, "RUN SELF-TEST", idle).on_hover_text("victory selftest: the frame path with a stand-in of our own. Needs no title.").clicked() {
-                self.enqueue_victory(Kind::SelfTest, &["selftest"]);
-            }
-            match self.selftest {
-                Some(true) => theme::chip(ui, "PASS", theme::ACCENT),
-                Some(false) => theme::chip(ui, "FAIL", theme::BAD),
-                None => {}
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if theme::button(ui, "COPY RUN REPORT", idle)
-                .on_hover_text("victory report: the newest run's report, to the clipboard. Numbers and Rox-box's own words only: safe for a public issue.")
-                .clicked()
-            {
-                self.enqueue_victory(Kind::Report, &["report"]);
-            }
-            if !self.confirm_reset {
-                if theme::button(ui, "RESET PIPELINE CACHE", idle)
-                    .on_hover_text("For a stale or damaged cache (pipelines refused after a driver or version change). Removes the pipeline library and the warm-up's marks; what runs recorded stays.")
-                    .clicked()
-                {
-                    self.confirm_reset = true;
-                }
-            } else {
-                ui.label(RichText::new("Remove the pipeline library? Warm Cache makes it again.").color(theme::WARN));
-                if theme::danger(ui, "YES, RESET", idle).clicked() {
-                    self.confirm_reset = false;
-                    self.reset_cache();
-                }
-                if theme::button(ui, "NO", true).clicked() {
-                    self.confirm_reset = false;
-                }
-            }
-        });
-    }
-
-    fn version_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        theme::heading(ui, "VERSION");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("ROX-BOX").color(theme::DIM));
-            ui.label(self.version.clone().unwrap_or_else(|| "-".to_string()));
-            ui.label(RichText::new("LAUNCHER").color(theme::DIM));
-            ui.label(env!("CARGO_PKG_VERSION"));
-            if theme::button(ui, "CHECK LATEST", !self.busy())
-                .on_hover_text("Asks GitHub for the newest release's name. Nothing is downloaded or installed.")
-                .clicked()
-            {
-                self.latest = None;
-                self.queue.push_back(runner::latest_release());
-            }
-            match (&self.latest, &self.version) {
-                (Some(Ok(tag)), Some(local)) => {
-                    let latest = runner::version_of(tag).unwrap_or_default();
-                    if runner::newer(&latest, local) {
-                        theme::chip(ui, &format!("{tag} IS OUT"), theme::WARN);
-                    } else {
-                        theme::chip(ui, &format!("UP TO DATE ({tag})"), theme::ACCENT);
+                ui.label(RichText::new(format!("Engine {}", self.version.clone().unwrap_or_else(|| "-".to_string()))).size(15.5).strong());
+                ui.label(RichText::new(format!("Launcher {}", env!("CARGO_PKG_VERSION"))).color(theme::DIM));
+                match (&self.latest, &self.version) {
+                    (Some(Ok(tag)), Some(local)) if runner::newer(&runner::version_of(tag).unwrap_or_default(), local) => theme::badge(ui, &format!("{tag} is out"), theme::WARN),
+                    (Some(Ok(tag)), _) => theme::badge(ui, &format!("newest: {tag}"), theme::GOOD),
+                    (Some(Err(e)), _) => {
+                        ui.label(RichText::new(e).color(theme::DIM).small());
                     }
+                    (None, _) => {}
                 }
-                (Some(Ok(tag)), None) => theme::chip(ui, tag, theme::DIM),
-                (Some(Err(e)), _) => {
-                    ui.label(RichText::new(e).color(theme::DIM));
-                }
-                (None, _) => {}
-            }
-            if theme::flat(ui, "RELEASES PAGE").clicked() {
-                ctx.open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
-            }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, "Releases page", true).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(RELEASES_PAGE));
+                    }
+                    if theme::button(ui, "Check for a newer release", !self.busy()).on_hover_text("Asks GitHub for the newest release's name. Nothing is downloaded or installed.").clicked() {
+                        self.latest = None;
+                        self.queue.push_back(runner::latest_release());
+                    }
+                });
+            });
         });
-        ui.add_space(12.0);
     }
 }
 
@@ -734,7 +990,7 @@ fn probe() {
     println!("ram_mb: {:?}  commit_limit_mb: {:?}", host.ram_mb, host.commit_limit_mb);
     println!("page file: {:?}", host.page_file);
     println!("windows: {}", host.windows);
-    for (level, text) in system::warnings(&host, None) {
+    for (_, level, text) in system::warnings(&host, None) {
         println!("{level:?}: {text}");
     }
 }
@@ -746,19 +1002,32 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Rox-box Launcher")
-            .with_inner_size([1040.0, 760.0])
-            .with_min_inner_size([820.0, 520.0])
+            .with_title("Rox-Box")
+            .with_inner_size([1180.0, 800.0])
+            .with_min_inner_size([940.0, 600.0])
+            // The title bar is the launcher's own (drawn, with its three buttons).
+            .with_decorations(false)
             .with_drag_and_drop(true)
             .with_icon(theme::icon()),
         ..Default::default()
     };
-    eframe::run_native("Rox-box Launcher", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
+    eframe::run_native("Rox-Box", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_paths_are_cut_in_the_middle_and_times_are_clocks() {
+        assert_eq!(elide("C:\\short", 40), "C:\\short");
+        let cut = elide("C:\\a very long folder\\with more folders\\and the title", 24);
+        assert_eq!(cut.chars().count(), 24);
+        assert!(cut.starts_with("C:\\a ver") && cut.ends_with("and the title") && cut.contains('\u{2026}'), "{cut}");
+        assert_eq!(clock(0), "0:00");
+        assert_eq!(clock(754), "12:34");
+        assert_eq!(title_name("D:\\Titles\\My Title"), "My Title");
+    }
 
     #[test]
     fn the_cache_folder_is_read_from_victory_config() {

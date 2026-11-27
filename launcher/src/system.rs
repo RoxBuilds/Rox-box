@@ -141,6 +141,14 @@ fn windows() -> String {
     windows_name(build, &display)
 }
 
+/// What a warning is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    Vram,
+    Ram,
+    PageFile,
+}
+
 /// How much a warning matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -150,14 +158,16 @@ pub enum Level {
 
 /// The launcher's own warnings from the facts. Plain statements of what to
 /// expect; nothing here stops a run.
-pub fn warnings(host: &Host, vram_mb: Option<u64>) -> Vec<(Level, String)> {
+pub fn warnings(host: &Host, vram_mb: Option<u64>) -> Vec<(Subject, Level, String)> {
     let mut out = Vec::new();
     match vram_mb {
         Some(v) if v <= 4_608 => out.push((
+            Subject::Vram,
             Level::Warn,
             format!("{:.0} GB of video memory: below what the layer is written for. Expect missing or low-detail textures and long stalls; use Fast.", v as f64 / 1024.0),
         )),
         Some(v) if v <= 8_704 => out.push((
+            Subject::Vram,
             Level::Note,
             format!("{:.0} GB of video memory: textures are cut to fit (docs/low-memory-gpus.md). Fast is the preset for this card.", v as f64 / 1024.0),
         )),
@@ -165,19 +175,22 @@ pub fn warnings(host: &Host, vram_mb: Option<u64>) -> Vec<(Level, String)> {
     }
     match host.ram_mb {
         Some(r) if r <= 16_896 => out.push((
+            Subject::Ram,
             Level::Warn,
             format!("{:.0} GB of RAM: a large title can use more than this PC has, and then runs from the page file, slowly. Close other programs first.", r as f64 / 1024.0),
         )),
-        Some(r) if r <= 24_576 => out.push((Level::Note, format!("{:.0} GB of RAM: enough to start; a large title may still fill it.", r as f64 / 1024.0))),
+        Some(r) if r <= 24_576 => out.push((Subject::Ram, Level::Note, format!("{:.0} GB of RAM: enough to start; a large title may still fill it.", r as f64 / 1024.0))),
         _ => {}
     }
     match &host.page_file {
-        PageFile::None => out.push((Level::Warn, "No page file: a run that needs more memory than is installed stops instead of slowing down.".to_string())),
+        PageFile::None => out.push((Subject::PageFile, Level::Warn, "No page file: a run that needs more memory than is installed stops instead of slowing down.".to_string())),
         PageFile::SystemManaged => out.push((
+            Subject::PageFile,
             Level::Note,
             "Page file is system-managed: Windows grows it only when memory runs short, and a run can stall while it grows. A fixed size avoids that.".to_string(),
         )),
         PageFile::Fixed { maximum_mb, .. } if *maximum_mb < 16_384 => out.push((
+            Subject::PageFile,
             Level::Warn,
             format!("Page file is fixed at {:.0} GB at most: small for a large title. 16 GB or more leaves room.", *maximum_mb as f64 / 1024.0),
         )),
@@ -236,13 +249,13 @@ mod tests {
         let roomy = host(65_536, PageFile::Fixed { initial_mb: 32_768, maximum_mb: 32_768 });
         assert!(warnings(&roomy, Some(24_000)).is_empty());
         let small = warnings(&host(16_200, PageFile::SystemManaged), Some(4_096));
-        assert_eq!(small.iter().filter(|w| w.0 == Level::Warn).count(), 2, "{small:?}");
-        assert_eq!(small.iter().filter(|w| w.0 == Level::Note).count(), 1);
+        assert_eq!(small.iter().filter(|w| w.1 == Level::Warn).count(), 2, "{small:?}");
+        assert_eq!(small.iter().filter(|w| w.1 == Level::Note).count(), 1);
         let eight = warnings(&host(32_768, PageFile::None), Some(7_956));
-        assert_eq!(eight[0].0, Level::Note);
-        assert!(eight[0].1.starts_with("8 GB"));
-        assert_eq!(eight.last().unwrap().0, Level::Warn);
-        assert!(warnings(&host(65_536, PageFile::Fixed { initial_mb: 2048, maximum_mb: 4096 }), None)[0].1.contains("4 GB"));
+        assert_eq!((eight[0].0, eight[0].1), (Subject::Vram, Level::Note));
+        assert!(eight[0].2.starts_with("8 GB"));
+        assert_eq!((eight.last().unwrap().0, eight.last().unwrap().1), (Subject::PageFile, Level::Warn));
+        assert!(warnings(&host(65_536, PageFile::Fixed { initial_mb: 2048, maximum_mb: 4096 }), None)[0].2.contains("4 GB"));
     }
 
     #[test]
