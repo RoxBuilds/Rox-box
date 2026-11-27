@@ -59,6 +59,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # No game folder and no graphics card here: the report is what is tried.
           .\victory.exe check
+          # The frame path with the binary as shipped, on the software adapter
+          # (docs/selftest.md). Shown, not enforced yet: what a hosted runner's
+          # adapter can do is read from these lines first.
+          .\victory.exe selftest --warp --bench
+          Write-Host "selftest exit code: $LASTEXITCODE"
           exit 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
