@@ -199,15 +199,51 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
 }
 
-/// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
-/// took no reference on them, so the host's count must not drop.
+/// Our pseudo modules stay loaded, and the host's count of a title image
+/// must not drop: `LoadLibrary` took no host reference on them. A title DLL
+/// the title loaded itself is counted by the loader ([`title_dll_free`]):
+/// its last `FreeLibrary` detaches and unmaps it, as the Windows loader
+/// does.
 pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
-    if registry().iter().any(|m| handle(m) == module)
-        || runtime::image_path(module as usize).is_some()
-    {
+    if registry().iter().any(|m| handle(m) == module) {
+        return 1;
+    }
+    if runtime::image_path(module as usize).is_some() {
+        if title_dll_free() {
+            let gone = runtime::free_title_dll(module as usize) == Some(false);
+            if gone {
+                tracing::info!(module = format_args!("{module:?}"), "a title DLL the title freed is unloaded");
+            }
+        }
         return 1;
     }
     host::free_library(module)
+}
+
+/// [`FreeLibrary`], then the thread's end, as a thread a DLL started ends
+/// (the host's would take a reference off a title image the host counts
+/// once, and unmap it under every thread that still hears of its starts and
+/// ends: the next thread notice ran code that was gone). Ours with
+/// [`title_dll_free`] only.
+pub extern "system" fn FreeLibraryAndExitThread(module: *mut c_void, code: u32) -> ! {
+    FreeLibrary(module);
+    host::exit_thread(code)
+}
+
+/// Whether the title's `FreeLibrary` of a title DLL it loaded counts, as
+/// the Windows loader counts: every `LoadLibrary` of it takes
+/// a reference, every `FreeLibrary` gives one back, and the last detaches it
+/// (`DLL_PROCESS_DETACH`, then unmapping; a later `LoadLibrary` maps and
+/// attaches it again); `FreeLibraryAndExitThread` is ours too. A DLL the
+/// title imports stays for the process's life, as on Windows. On by
+/// default. `VICTORY_TITLE_DLL_FREE=0`: as before, `FreeLibrary` of a title
+/// image does nothing (its process detach comes at the process's end, its
+/// statics outlive a reload, and it still hears of threads), and
+/// `FreeLibraryAndExitThread` is the host's, which unmaps a title DLL from
+/// under the loader. Read once.
+pub fn title_dll_free() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_DLL_FREE").is_none_or(|v| v != "0"))
 }
 
 /// Title images hear of thread starts and ends from us, not from the
@@ -749,6 +785,9 @@ fn exports() -> Vec<crate::HleExport> {
             hle_export!(_get_wide_winmain_command_line),
         ]);
     }
+    if title_dll_free() {
+        exports.push(hle_export!(FreeLibraryAndExitThread));
+    }
     if title_exits() {
         exports.extend([
             hle_export!(ExitProcess),
@@ -837,6 +876,11 @@ mod host {
     pub(super) fn free_library(module: *mut c_void) -> i32 {
         // SAFETY: see above.
         unsafe { FreeLibrary(module) }
+    }
+
+    pub(super) fn exit_thread(code: u32) -> ! {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Threading::ExitThread(code) }
     }
 
     pub(super) fn disable_thread_library_calls(module: *mut c_void) -> i32 {
@@ -970,6 +1014,10 @@ mod host {
 
     pub(super) fn free_library(_: *mut c_void) -> i32 {
         0
+    }
+
+    pub(super) fn exit_thread(_: u32) -> ! {
+        panic!("threads end only on Windows")
     }
 
     pub(super) fn disable_thread_library_calls(_: *mut c_void) -> i32 {

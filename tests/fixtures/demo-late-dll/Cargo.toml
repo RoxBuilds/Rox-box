@@ -1,0 +1,22 @@
+# The DLL the open demo title loads by name at run time (docs/demo-title.md,
+# "Its DLLs"): `demo_late.dll`, which a game folder holds beside
+# `demo-title.exe` and nothing imports, so `victory run` maps it when the
+# title calls `LoadLibraryW`. The same code as `demo-static-dll`. NOT a
+# workspace member: `apps/victory/tests/demo_title.rs` builds it on demand
+# into its own target directory. It depends on no crate.
+[package]
+name = "demo-late-dll"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "demo_late"
+crate-type = ["cdylib"]
+
+# Nothing may unwind out of `DllMain` or an export.
+[profile.dev]
+panic = "abort"
+
+[workspace]

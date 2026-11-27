@@ -76,14 +76,24 @@ jobs:
       - name: Record the benchmark
         shell: pwsh
         run: |
-          cargo build --locked --manifest-path tests\fixtures\demo-title\Cargo.toml --target-dir target\demo-title
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The demo title and its two DLLs, put together as its game folder
+          # (docs/demo-title.md): the twin is the late DLL under a second name.
+          foreach ($f in 'demo-title', 'demo-static-dll', 'demo-late-dll') {
+            cargo build --locked --manifest-path tests\fixtures\$f\Cargo.toml --target-dir target\$f
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          $game = Join-Path $env:RUNNER_TEMP 'demo-game'
+          New-Item -ItemType Directory -Force -Path $game | Out-Null
+          Copy-Item target\demo-title\debug\demo-title.exe $game
+          Copy-Item target\demo-static-dll\debug\demo_static.dll $game
+          Copy-Item target\demo-late-dll\debug\demo_late.dll $game
+          Copy-Item target\demo-late-dll\debug\demo_late.dll (Join-Path $game 'demo_twin.dll')
           # The script's own tests first: its parsing and comparison need no victory.exe.
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\bench-record.ps1 -SelfTest
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $unzipped = (Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'unzipped') -Directory)[0].FullName
           $out = Join-Path $env:RUNNER_TEMP 'bench'
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\bench-record.ps1 -Victory (Join-Path $unzipped 'victory.exe') -Out $out -DemoTitle (Resolve-Path target\demo-title\debug\demo-title.exe).Path
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\bench-record.ps1 -Victory (Join-Path $unzipped 'victory.exe') -Out $out -DemoTitle (Join-Path $game 'demo-title.exe')
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Content -LiteralPath (Join-Path $out 'bench.md') -Raw | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
       # The two files, for comparing with another run's by hand.

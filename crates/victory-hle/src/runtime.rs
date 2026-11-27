@@ -84,6 +84,25 @@ pub fn load_title_dll(file: &str) -> Result<Option<usize>, String> {
     TITLE_DLL_LOADER.get().map_or(Ok(None), |load| load(file))
 }
 
+/// Lets go of one reference the title took on a title DLL it loaded
+/// (`LoadLibrary`): `Some(true)` if the DLL stays loaded, `Some(false)` if
+/// that was the last and it is gone (detached and unmapped), `None` if
+/// `base` is no DLL the loader counts (one the title imports stays for the
+/// process's life).
+pub type TitleDllFreer = Box<dyn Fn(usize) -> Option<bool> + Send + Sync>;
+
+static TITLE_DLL_FREER: std::sync::OnceLock<TitleDllFreer> = std::sync::OnceLock::new();
+
+/// Set once, with the loader ([`set_title_dll_loader`]); later calls are
+/// ignored.
+pub fn set_title_dll_freer(free: TitleDllFreer) {
+    let _ = TITLE_DLL_FREER.set(free);
+}
+
+pub fn free_title_dll(base: usize) -> Option<bool> {
+    TITLE_DLL_FREER.get().and_then(|free| free(base))
+}
+
 /// What the title's manifest (`MicrosoftGame.config` beside its executable)
 /// says about it, and where its persistent local storage lives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

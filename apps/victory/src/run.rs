@@ -155,17 +155,20 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
-    let late = LateDlls {
+    let late = Arc::new(LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
         cache_dir: images,
         policy,
         mapped: std::sync::Mutex::new(dlls.clone()),
+        held: std::sync::Mutex::new(std::collections::HashMap::new()),
         lock: LoaderLock::default(),
-    };
+    });
+    let freer = late.clone();
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    victory_hle::runtime::set_title_dll_freer(Box::new(move |base| freer.free(base)));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let joined = main
@@ -307,7 +310,20 @@ struct LateDlls {
     policy: victory_loader::UnimplementedPolicy,
     /// Every title DLL mapped so far, to bind new ones against.
     mapped: std::sync::Mutex<Vec<(String, victory_loader::LoadedImage)>>,
+    /// The references on DLLs mapped here, by base: those the title loaded
+    /// by name and those they import (`kernel::title_dll_free`). DLLs mapped
+    /// at the start, which the title imports, are not here: they stay.
+    held: std::sync::Mutex<std::collections::HashMap<usize, Held>>,
     lock: LoaderLock,
+}
+
+/// What holds a DLL mapped here: `count` references (each `LoadLibrary` of
+/// it, and each DLL mapped here that imports it), and the DLLs it holds.
+#[cfg(windows)]
+#[derive(Default)]
+struct Held {
+    count: usize,
+    holds: Vec<usize>,
 }
 
 #[cfg(windows)]
@@ -326,6 +342,9 @@ impl LateDlls {
         // loads another DLL re-enters.
         self.lock.hold(|| {
             if let Some(base) = image_named(file) {
+                if let Some(held) = self.held().get_mut(&base) {
+                    held.count += 1;
+                }
                 return Ok(Some(base));
             }
             let new = {
@@ -366,6 +385,7 @@ impl LateDlls {
                     .map(|e| (i, e.context(format!("attaching {name}"))))
             });
             let Some((i, error)) = failed else {
+                self.hold(&new);
                 return Ok(new.last().map(|(_, dll)| dll.base()));
             };
             // As `LoadLibrary` does when a `DllMain` fails: detach what this
@@ -385,6 +405,80 @@ impl LateDlls {
                 unsafe { dll.unload() };
             }
             Err(error)
+        })
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<usize, Held>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The references a load that mapped `new` (dependencies first, the DLL
+    /// asked for last) takes: one on the DLL asked for, which holds the
+    /// others, and the DLLs mapped here earlier that any of them imports.
+    fn hold(&self, new: &[(String, victory_loader::LoadedImage)]) {
+        let Some(((_, asked), deps)) = new.split_last() else {
+            return;
+        };
+        let bases: Vec<usize> = new.iter().map(|(_, d)| d.base()).collect();
+        let mut held = self.held();
+        let mut holds: Vec<usize> = deps.iter().map(|(_, d)| d.base()).collect();
+        for &base in &holds {
+            held.insert(base, Held { count: 1, holds: Vec::new() });
+        }
+        for (_, dll) in new {
+            for import in &dll.info().imports {
+                let Some(base) = victory_hle::runtime::image_named(&import.dll) else {
+                    continue;
+                };
+                if !bases.contains(&base) && !holds.contains(&base)
+                    && let Some(earlier) = held.get_mut(&base)
+                {
+                    earlier.count += 1;
+                    holds.push(base);
+                }
+            }
+        }
+        held.insert(asked.base(), Held { count: 1, holds });
+    }
+
+    /// The title's `FreeLibrary` of the DLL at `base` (`kernel::FreeLibrary`):
+    /// one reference less; at the last, as the Windows loader does, its
+    /// `DLL_PROCESS_DETACH` (its TLS callbacks, then `DllMain`) on the
+    /// calling thread, then it is unmapped and lets go of what it held.
+    /// `None` for a DLL not counted here (one the title imports stays).
+    ///
+    /// shortcut: Windows also holds its loader lock while it sends thread
+    /// notices, so none reaches a DLL after its process detach; here a
+    /// thread that started or ended just then may still be told (the unmap
+    /// itself waits for the Windows loader lock, which such a thread holds
+    /// while it tells the images).
+    fn free(&self, base: usize) -> Option<bool> {
+        use victory_hle::runtime::forget_image;
+        self.lock.hold(|| {
+            let holds = {
+                let mut held = self.held();
+                let h = held.get_mut(&base)?;
+                h.count = h.count.saturating_sub(1);
+                if h.count > 0 {
+                    return Some(true);
+                }
+                held.remove(&base)?.holds
+            };
+            let dll = {
+                let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+                let at = mapped.iter().position(|(_, d)| d.base() == base)?;
+                mapped.remove(at).1
+            };
+            // SAFETY: attached when it was loaded; the title gave its last
+            // reference back, so no title code uses it any more.
+            unsafe { dll.detach() };
+            forget_image(base);
+            // SAFETY: detached, and forgotten by the runtime and the loader.
+            unsafe { dll.unload() };
+            for held in holds {
+                self.free(held);
+            }
+            Some(false)
         })
     }
 }

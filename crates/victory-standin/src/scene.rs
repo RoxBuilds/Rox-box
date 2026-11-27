@@ -1,8 +1,9 @@
 //! The pieces of the scene, each made once and recorded into lists as
 //! often as the caller likes. A piece checks what a title can check by its
-//! own means: what landed in its own memory. Pictures are the caller's
-//! business (a title cannot read its swap chain back; the self-test reads
-//! the host's copy).
+//! own means: what landed in its own memory, its picture included: a title
+//! cannot read its swap chain back, but it can copy its render target into
+//! a buffer it maps ([`ReadBack`]). The self-test also reads the host's
+//! copy, behind the tables.
 
 use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use victory_shader::native::synth;
@@ -422,4 +423,99 @@ impl Drawing {
             title.draw(3);
         }
     }
+}
+
+/// The render target read back as a title reads its own picture:
+/// `CopyTextureRegion` of the target's one subresource into a placed
+/// footprint of a buffer on a read-back heap, which the title maps (the
+/// layer copies the texels into the title's memory once the list has run,
+/// `list.rs`, `read_back`). Rows of [`READ_BACK_PITCH`] bytes.
+pub struct ReadBack {
+    pub buffer: Obj,
+    memory: Memory,
+}
+
+/// The rows' pitch: a whole row of the target, at the 256-byte pitch
+/// alignment copies into buffers ask for.
+pub const READ_BACK_PITCH: u32 = (SIDE * 4).next_multiple_of(256);
+
+impl ReadBack {
+    pub fn new(title: &Title) -> Result<ReadBack, Failed> {
+        let len = u64::from(READ_BACK_PITCH * SIDE);
+        let desc = ResourceDesc {
+            dimension: BUFFER,
+            alignment: 0,
+            width: len,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        // A read-back heap's resources start as copy destinations.
+        let buffer = title.committed(READBACK_HEAP, &desc, COPY_DEST)?;
+        let memory = Title::mapped(buffer, len as usize)?;
+        Ok(ReadBack { buffer, memory })
+    }
+
+    /// Every byte of the buffer set to `value`, before a copy: one that did
+    /// not land shows as that.
+    pub fn poison(&mut self, value: u8) {
+        self.memory.bytes_mut().fill(value);
+    }
+
+    /// The copy of the whole target into the buffer, into the list being
+    /// recorded (the target must be a copy source by then).
+    pub fn record(&self, title: &Title) {
+        let to = CopyLocation {
+            resource: self.buffer,
+            kind: COPY_FOOTPRINT,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: RGBA8,
+                width: SIDE,
+                height: SIDE,
+                depth: 1,
+                row_pitch: READ_BACK_PITCH,
+            },
+        };
+        let from = CopyLocation {
+            resource: title.target,
+            kind: COPY_SUBRESOURCE,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            },
+        };
+        title.copy_texture_region(&to, &from);
+    }
+
+    /// The picture in the buffer, as rows of [`SIDE`] RGBA8 pixels (the
+    /// copy must have been waited for).
+    pub fn picture(&self) -> Vec<u8> {
+        let row = SIDE as usize * 4;
+        self.memory
+            .bytes()
+            .chunks_exact(READ_BACK_PITCH as usize)
+            .flat_map(|r| &r[..row])
+            .copied()
+            .collect()
+    }
+}
+
+/// The first pixel `(x, y)` of `got` that is not within one step of each
+/// channel of `want` (a conversion of `n / 255` may round either way);
+/// both are rows of [`SIDE`] RGBA8 pixels.
+pub fn first_far(got: &[u8], want: &[u8]) -> Option<(u32, u32)> {
+    got.chunks_exact(4)
+        .zip(want.chunks_exact(4))
+        .position(|(a, b)| a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > 1))
+        .map(|i| (i as u32 % SIDE, i as u32 / SIDE))
 }

@@ -4,8 +4,12 @@
 //! the software adapter, with temporary folders and no config file, the
 //! way a player's run goes. The self-test covers the frame path in one
 //! process of ours; this covers what it cannot: the loader, import binding,
-//! the title's own thread, C runtime and command line, its exit, and the run
-//! report, which is the oracle here.
+//! the title's own thread, C runtime and command line, its threads and their
+//! TLS, its two DLLs (one imported, one loaded by name), its exit (also with
+//! threads waiting, a DLL loaded and a frame in flight), and the run report.
+//! The oracle is the report, the exit code and the demo's own lines (its
+//! checks, by its own means, of its memory, its picture, its threads' and
+//! DLLs' notices, and at its very end each DLL's process detach).
 //!
 //! The binary runs in a process of its own (the host device is one per
 //! process). Like `selftest.rs`, the test is skipped where there is no
@@ -23,22 +27,38 @@ const FEW: u32 = 10;
 /// The longest the run may take (it takes a few seconds; a hang fails).
 const PATIENCE: Duration = Duration::from_secs(120);
 
-/// Builds the fixture into its own target folder (the outer cargo holds the
-/// lock on the main one while tests run), in the outer one's scratch folder
-/// for tests, as `victory-loader`'s `load_probe.rs` builds `hle-probe`.
-fn build_demo() -> PathBuf {
-    let manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/demo-title/Cargo.toml");
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("demo-title");
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--locked", "--quiet", "--manifest-path"])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&target)
-        .status()
-        .expect("running cargo");
-    assert!(status.success(), "building the demo title failed");
-    target.join("debug").join("demo-title.exe")
+/// The game folder's files: the demo title and its two DLLs.
+const FILES: [(&str, &str); 3] = [
+    ("demo-title", "demo-title.exe"),
+    ("demo-static-dll", "demo_static.dll"),
+    ("demo-late-dll", "demo_late.dll"),
+];
+
+/// Builds the fixtures, once per test process, each into its own target
+/// folder (the outer cargo holds the lock on the main one while tests run),
+/// in the outer one's scratch folder for tests, as `victory-loader`'s
+/// `load_probe.rs` builds `hle-probe`. The files of a game folder.
+fn build_demo() -> &'static [PathBuf] {
+    static BUILT: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
+        FILES
+            .iter()
+            .map(|(fixture, file)| {
+                let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../../tests/fixtures/{fixture}/Cargo.toml"));
+                let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(fixture);
+                let status = Command::new(env!("CARGO"))
+                    .args(["build", "--locked", "--quiet", "--manifest-path"])
+                    .arg(&manifest)
+                    .arg("--target-dir")
+                    .arg(&target)
+                    .status()
+                    .expect("running cargo");
+                assert!(status.success(), "building {fixture} failed");
+                target.join("debug").join(file)
+            })
+            .collect()
+    })
 }
 
 /// A fresh folder under the system's temporary folder, outside any source
@@ -65,6 +85,21 @@ struct Ran {
     report: toml::Table,
     root: PathBuf,
     cache: PathBuf,
+    data: PathBuf,
+}
+
+/// Every file below `dir`.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 impl Ran {
@@ -97,14 +132,43 @@ impl Ran {
         value.get(key)
     }
 
-    /// The demo's line after its frames: they all matched.
+    /// The demo's lines after its frames: they all matched, its picture
+    /// too; its threads and DLLs were as a title's must be; and, the last
+    /// thing it said, each DLL heard of the process's end once. Nothing
+    /// failed, and nothing went into a crash log.
     fn finished(&self, frames: u32) {
         let done = format!(
             "demo title: {frames} frames rendered and presented; every value it read back from its own memory matched"
         );
+        self.said(&done);
+        self.said("demo title: its picture, copied into a buffer it maps (CopyTextureRegion), matched what it drew in every frame");
+        self.said("demo title: 7 threads of its own (CreateThread, _beginthreadex, std::thread; ended by returning, ExitThread, _endthreadex, FreeLibraryAndExitThread)");
+        self.said("demo title: demo_twin.dll, a copy of demo_late.dll under another name, is a module of its own, freed and unloaded");
+        self.said("demo title: its DLLs demo_static.dll (imported) and demo_late.dll (LoadLibraryW, GetProcAddress) were each attached once");
+        self.said("demo title: at its exit, each of its DLLs heard of the process's end once, and no thread's start or end came twice");
+        assert!(!self.stdout.contains("demo title failed"), "{}", self.tail());
+        // Both DLLs mapped as the title's, every import of theirs bound.
+        for (dll, how) in [("demo_static.dll", " at "), ("demo_late.dll", " (loaded by the title)")] {
+            assert!(
+                self.stdout.lines().any(|l| l.starts_with(&format!("title dll      {dll} at ")) && l.contains(how)),
+                "{dll} not mapped as the title's:\n{}",
+                self.tail()
+            );
+            assert!(
+                self.stdout.lines().any(|l| l.starts_with(&format!("bound          {dll}: ")) && l.ends_with(" 0 missing")),
+                "{dll}'s imports not all bound:\n{}",
+                self.tail()
+            );
+        }
+        let logs: Vec<_> = walk(&self.data).into_iter().filter(|p| p.ends_with("crashes.log")).collect();
+        assert!(logs.is_empty(), "{logs:?}:\n{}", self.tail());
+    }
+
+    /// A line of stdout starts with `start`.
+    fn said(&self, start: &str) {
         assert!(
-            self.stdout.lines().any(|l| l == done),
-            "no line {done:?}:\n{}",
+            self.stdout.lines().any(|l| l.starts_with(start)),
+            "no line {start:?}:\n{}",
             self.tail()
         );
     }
@@ -123,16 +187,21 @@ impl Ran {
 /// with temporary folders, no config file and no other `VICTORY_*` variable;
 /// `None` where there is no Direct3D 12 device at all.
 fn run_demo(what: &str, args: &[&str]) -> Option<Ran> {
-    let demo = build_demo();
+    let built = build_demo();
     let root = scratch(what);
     let (game, cache, data) = (root.join("game"), root.join("cache"), root.join("data"));
     for dir in [&game, &cache, &data] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    // The executable alone is a whole game folder: it ships no DLLs, and
-    // the manifest a run reads for the title's id and storage is optional.
+    // The executable and its two DLLs are a whole game folder: the
+    // manifest a run reads for the title's id and storage is optional.
+    for (file, (_, name)) in built.iter().zip(FILES) {
+        std::fs::copy(file, game.join(name)).unwrap();
+    }
+    // The late DLL once more, under another name: a title's DLL shipped
+    // twice must be two modules.
+    std::fs::copy(game.join("demo_late.dll"), game.join("demo_twin.dll")).unwrap();
     let exe = game.join("demo-title.exe");
-    std::fs::copy(&demo, &exe).unwrap();
 
     let mut run = Command::new(env!("CARGO_BIN_EXE_victory"));
     run.args(["run"]).arg(&exe).args(["--execute", "--"]).args(args);
@@ -187,7 +256,7 @@ fn run_demo(what: &str, args: &[&str]) -> Option<Ran> {
     let text = std::fs::read_to_string(&reports[0]).unwrap();
     let report: toml::Table =
         toml::from_str(&text).unwrap_or_else(|e| panic!("the report is not TOML: {e}\n{text}"));
-    Some(Ran { status, stdout, stderr, text, report, root, cache })
+    Some(Ran { status, stdout, stderr, text, report, root, cache, data })
 }
 
 #[test]
@@ -198,6 +267,10 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
     assert!(ran.status.success(), "the run failed ({:?}):\n{}", ran.status, ran.tail());
     ran.finished(FRAMES);
     ran.exited_with(0);
+    // The late DLL freed (after a thread gave back a reference of its own):
+    // detached and unloaded at its last `FreeLibrary`, and loaded afresh
+    // after (`VICTORY_TITLE_DLL_FREE`).
+    ran.said("demo title: demo_late.dll: its last FreeLibrary ran its process detach and unloaded it");
     let text = &ran.text;
     assert_eq!(ran.report["kind"].as_str(), Some("run"), "{text}");
     assert_eq!(
@@ -303,4 +376,35 @@ fn a_title_that_calls_exit_ends_the_run_with_its_code() {
     ran.finished(FEW);
     ran.exited_with(9);
     let _ = std::fs::remove_dir_all(&ran.root);
+}
+
+/// The end with everything alive (`--alive`): two of the title's threads
+/// waiting for ever, the late DLL loaded and a frame in flight. The run
+/// ends with the title's code, said in the report, and no crash log; each
+/// DLL heard of the process's end once (`finished`).
+fn ends_alive(what: &str, end: &[&str], code: i32) {
+    let mut args = vec!["--frames", "10", "--alive"];
+    args.extend_from_slice(end);
+    let Some(ran) = run_demo(what, &args) else {
+        return;
+    };
+    ran.finished(FEW);
+    ran.said("demo title: ends with 2 threads waiting, demo_late.dll loaded and a frame in flight");
+    ran.exited_with(code);
+    let _ = std::fs::remove_dir_all(&ran.root);
+}
+
+#[test]
+fn a_title_that_returns_with_everything_alive_ends_with_its_code() {
+    ends_alive("alive-return", &["--return", "7"], 7);
+}
+
+#[test]
+fn a_title_that_calls_exit_with_everything_alive_ends_with_its_code() {
+    ends_alive("alive-exit", &["--exit", "9"], 9);
+}
+
+#[test]
+fn a_title_that_calls_exit_process_with_everything_alive_ends_with_its_code() {
+    ends_alive("alive-exit-process", &["--exit-process", "5"], 5);
 }

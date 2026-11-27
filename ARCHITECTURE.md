@@ -51,7 +51,8 @@ project this one descends from.
 | `crates/victory-standin` | The title side of a stand-in title (PC-layout structures, table offsets, the self-test's scene), shared by the self-test and the demo title | `src/lib.rs`, `src/scene.rs` |
 | `xtask` | Repository tasks: `policy`, `install-hooks`, `dist`, `verify-dist` | `src/main.rs` |
 | `tests/fixtures/hle-probe` | A stand-in "title" of our own code, built on demand by the loader tests | |
-| `tests/fixtures/demo-title` | The open demo title: an executable of our own that `victory run --execute` runs end to end ([docs/demo-title.md](docs/demo-title.md)) | `src/main.rs` |
+| `tests/fixtures/demo-title` | The open demo title: an executable of our own that `victory run --execute` runs end to end, with threads of its own and two DLLs ([docs/demo-title.md](docs/demo-title.md)) | `src/main.rs` |
+| `tests/fixtures/demo-static-dll`, `demo-late-dll` | The demo title's DLLs: the one it imports and the one it loads by name (one source) | `demo-static-dll/src/dll.rs` |
 
 Everything is platform-level: no crate holds knowledge of a particular title.
 What a single title needs (a byte patch, the names of shaders that want special
@@ -134,6 +135,11 @@ The whole sequence is `apps/victory/src/run.rs::run`. In order:
   DLL it gets another slot, so those loads are redirected.
 - `threads.rs`: the prepared images have no entry point, so thread start and
   end notices are passed on to them by us.
+- Title DLLs the title loads by name are mapped, bound and attached by
+  `apps/victory/src/run.rs` (`LateDlls`), which counts their references as
+  Windows does: the last `FreeLibrary` detaches and unmaps one
+  (`VICTORY_TITLE_DLL_FREE`). Prepared copies are named by their bytes and
+  their file name, so one DLL shipped under two names is two modules.
 - `console_insn.rs`, `console_insn_decode.rs`: instructions the console's CPU
   has and some host CPUs lack are emulated from a vectored exception handler.
   The decoder is a clean-room implementation from the public AMD64 manuals.

@@ -4,7 +4,9 @@
 # workspace member: `apps/victory/tests/demo_title.rs` builds it on demand
 # into its own target directory, like `hle-probe`. It imports the console's
 # graphics entry points from `d3d12_xs.dll` (via raw-dylib), a DLL no PC
-# has, so it only runs through Rox-box. Its title side is the self-test's
+# has, so it only runs through Rox-box; it also imports `demo_static.dll`
+# (`tests/fixtures/demo-static-dll`, raw-dylib too), which its game folder
+# must hold, with `demo_late.dll`. Its title side is the self-test's
 # (`victory-standin`); every crate it needs is in the workspace's own lock
 # file, at the same versions.
 [package]

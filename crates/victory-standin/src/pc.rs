@@ -87,6 +87,7 @@ pub const RGBA8: u32 = 28;
 pub const RG32_FLOAT: u32 = 16;
 pub const DEFAULT_HEAP: u32 = 1;
 pub const UPLOAD_HEAP: u32 = 2;
+pub const READBACK_HEAP: u32 = 3;
 pub const RENDER_TARGET_FLAG: u32 = 1;
 pub const UNORDERED_FLAG: u32 = 4;
 pub const COMMON: u32 = 0;
@@ -205,6 +206,33 @@ pub struct Planes {
     pub destination: u64,
     pub rest: [u8; 0x90 - 0x28],
 }
+
+/// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`: where in a buffer a texture's rows
+/// are, and their format, size and pitch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PlacedFootprint {
+    pub offset: u64,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub row_pitch: u32,
+}
+
+/// `D3D12_TEXTURE_COPY_LOCATION`: a resource and, by `kind`, one of its
+/// subresources (0: the index, in the first four bytes of `footprint`) or
+/// a placed footprint in it (1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CopyLocation {
+    pub resource: Obj,
+    pub kind: u32,
+    pub footprint: PlacedFootprint,
+}
+
+pub const COPY_SUBRESOURCE: u32 = 0;
+pub const COPY_FOOTPRINT: u32 = 1;
 
 /// `D3D12_VERTEX_BUFFER_VIEW`.
 #[repr(C)]

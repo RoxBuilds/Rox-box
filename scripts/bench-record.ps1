@@ -7,7 +7,8 @@
 # What it does
 #   1. Runs `victory.exe selftest --warp --bench` -Runs times (on the software adapter, as docs\selftest.md says) and keeps,
 #      per rate, the median, the minimum and the maximum of the runs.
-#   2. With -DemoTitle: one run of the demo title (docs\demo-title.md) with `victory.exe run <demo> --execute -- --frames
+#   2. With -DemoTitle: one run of the demo title (docs\demo-title.md; the executable in a folder that also holds its
+#      DLLs, which are taken along) with `victory.exe run <demo> --execute -- --frames
 #      <n>`, in a game, a cache and a data folder made under -Out (never anywhere else; the three VICTORY_*_DIR variables and
 #      VICTORY_D3D12_WARP are set for that child process only), from a current folder that holds no victory.toml. The figures
 #      are read from the newest run report (average_fps, frame_ms_p50, frame_ms_p99, preparing_ms, waiting_for_card_ms).
@@ -501,6 +502,11 @@ if ($DemoTitle) {
     New-Item -ItemType Directory -Force -Path $game, $cache, $data | Out-Null
     $exe = Join-Path $game 'demo-title.exe'
     Copy-Item -LiteralPath $DemoTitle -Destination $exe
+    # The demo ships DLLs of its own (docs\demo-title.md): those beside the executable given are its
+    # game folder's, and go with it. A build folder of the executable alone holds none.
+    Get-ChildItem -LiteralPath (Split-Path -Parent $DemoTitle) -Filter '*.dll' -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $game $_.Name)
+    }
     Write-Host "demo title run ($DemoFrames frames) ..."
     # The current folder is $root: it holds no victory.toml, so only the three variables are read.
     $env4 = @{ VICTORY_GAME_DIR = $game; VICTORY_CACHE_DIR = $cache; VICTORY_DATA_DIR = $data; VICTORY_D3D12_WARP = '1' }

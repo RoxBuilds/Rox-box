@@ -53,9 +53,14 @@ pub struct BindReport {
 ///
 /// `dir` receives derived game data, so it must be outside the repository.
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
+    load_as(prepared, dir, &prepared.file_name())
+}
+
+/// [`load`] from the copy called `file` in `dir`.
+fn load_as(prepared: &PreparedImage, dir: &Path, file: &str) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(prepared.file_name());
+    let path = dir.join(file);
     write_if_changed(&path, &prepared.bytes)?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -157,7 +162,14 @@ fn map_dll(
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
-    let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
+    // Named after the DLL too, not only its bytes: a title that ships one
+    // DLL twice, under two names, gets two modules, as from Windows. Named
+    // only after the bytes, both were one copy, so the Windows loader gave
+    // the second load the first's module, and the title's two DLLs shared
+    // one image, its statics and its `DllMain`, which then heard of its
+    // process's start twice (docs/demo-title.md, `demo_twin.dll`).
+    let file = prepared.file_name().replace(".dll", &format!("-{name}"));
+    let image = load_as(&prepared, dirs.1, &file).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())

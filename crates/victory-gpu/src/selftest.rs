@@ -900,6 +900,12 @@ mod tests {
         assert_eq!(size_of::<pc::Viewport>(), size_of::<D3D12_VIEWPORT>());
         // `D3D12_RECT` is `RECT`: four 32-bit edges.
         assert_eq!(size_of::<pc::Rect>(), 16);
+        // The demo title's read back of its picture (`scene::ReadBack`).
+        assert_eq!(size_of::<pc::PlacedFootprint>(), size_of::<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>());
+        assert_eq!(size_of::<pc::CopyLocation>(), size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        assert_eq!(offset_of!(pc::CopyLocation, footprint), offset_of!(D3D12_TEXTURE_COPY_LOCATION, Anonymous));
+        assert_eq!(pc::READBACK_HEAP, D3D12_HEAP_TYPE_READBACK.0 as u32);
+        assert_eq!(pc::COPY_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT.0 as u32);
         // The two sides of one header: what the stand-in passes and what
         // the layer checked its layouts against.
         assert_eq!(victory_standin::INTERFACE_VERSION, crate::device::CHECKED_VERSION);

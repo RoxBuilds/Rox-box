@@ -137,6 +137,8 @@ type Barriers = extern "system" fn(Obj, u32, *const Barrier);
 type ClearRtv = extern "system" fn(Obj, u64, *const [f32; 4], u32, *const Rect);
 type CopyBuffer = extern "system" fn(Obj, Obj, u64, Obj, u64, u64);
 type CopyResource = extern "system" fn(Obj, Obj, Obj);
+type CopyRegion =
+    extern "system" fn(Obj, *const CopyLocation, u32, u32, u32, *const CopyLocation, *const [u32; 6]);
 type SetPipeline = extern "system" fn(Obj, Obj);
 type SetRoot = extern "system" fn(Obj, Obj);
 type SetHeaps = extern "system" fn(Obj, u32, *const Obj);
@@ -462,6 +464,11 @@ impl Title {
 
     pub fn copy_resource(&self, to: Obj, from: Obj) {
         slot::<CopyResource>(self.list, 0x88)(self.list, to, from);
+    }
+
+    /// `CopyTextureRegion`: all of `from` to the corner of `to`.
+    pub fn copy_texture_region(&self, to: &CopyLocation, from: &CopyLocation) {
+        slot::<CopyRegion>(self.list, 0x80)(self.list, to, 0, 0, 0, from, std::ptr::null());
     }
 
     pub fn set_pipeline(&self, pipeline: Obj) {
