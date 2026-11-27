@@ -307,6 +307,9 @@ so two runs can be compared. Switches the shader translator reads are
 collected at build time (`victory-shader/build.rs`) and are part of the shader
 cache key.
 
+[docs/switches.md](docs/switches.md) lists every switch, collected from those
+comments (`cargo xtask switches`; it is generated, never edited by hand).
+
 `scripts\play.ps1` sets a tested combination of switches for a run
 (`Get-RunSettings`), clears any other `VICTORY_*` variable, and accepts more
 through `-More`. Logging is filtered with `VICTORY_LOG`
@@ -341,6 +344,7 @@ marked `shortcut:` in the code.
   translation in more depth.
 - [docs/asset-policy.md](docs/asset-policy.md)
 - [docs/debugging.md](docs/debugging.md)
+- [docs/switches.md](docs/switches.md): every `VICTORY_*` switch, generated from the source
 - [docs/replay.md](docs/replay.md)
 - [docs/findings.md](docs/findings.md)
 - [docs/selftest.md](docs/selftest.md)

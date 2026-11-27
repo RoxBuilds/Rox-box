@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod switches;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,13 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Generate `docs/switches.md`, a reference of every `VICTORY_*` switch
+    /// collected from the source (the comments where each is read).
+    Switches {
+        /// Write nothing; fail if the file on disk is not what would be generated.
+        #[arg(long)]
+        check: bool,
+    },
     /// Build the hermetic distribution binary (`target/release-dist/victory.exe`):
     /// `[profile.release-dist]`, the C runtime linked in (no redistributable
     /// to install), no timestamp, no build-machine paths; then check it
@@ -56,6 +64,7 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Switches { check } => switches::run(&root, check),
         Cmd::Dist => run_dist(&root),
         Cmd::VerifyDist { file } => verify_dist(&root, &file.unwrap_or_else(|| dist_binary(&root))),
     }

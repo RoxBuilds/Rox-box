@@ -124,7 +124,9 @@ maintainer at once, so that history can be rewritten.
   two runs can be compared and a regression can be switched off. Read it
   where it is used (`switch::on`, `toggled!`, see
   [ARCHITECTURE.md](ARCHITECTURE.md#configuration-and-switches)), read it
-  once, and describe it in a comment there. If `scripts\play.ps1` should set
+  once, and describe it in a comment there; run `cargo xtask switches` to
+  refresh the generated [docs/switches.md](docs/switches.md) (the tests fail
+  while it is stale). If `scripts\play.ps1` should set
   it by default, add it to `Get-RunSettings`.
 - **Game-agnostic code.** No branch on a title's identity. If one title needs
   different behaviour, find the platform rule that explains it, or make it a

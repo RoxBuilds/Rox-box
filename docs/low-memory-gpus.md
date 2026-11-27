@@ -148,3 +148,23 @@ behaviour before it.
 - Optional user-supplied binary patches (`VICTORY_PATCHES_FILE` / `[paths].patches_file`)
   and external shader profiles (`VICTORY_SHADER_PROFILE` / `[paths].shader_profile`)
   enable per-title overrides cleanly outside the codebase.
+
+These five were written from one run's report and log and are tested on the
+software adapter against a made-up budget; **no run of a title has confirmed
+them yet**. What a run's report and log should show if they do what they are
+for:
+
+- the report's `[memory.pressure]` `resident_waits` and `mapped_waits` (and
+  their ms) fall sharply, and the log's wait lines name few "copies of views'
+  own bytes"; the view-bytes line's count of copies "made on a buffer let go
+  of before" is most of the copies made;
+- `[frame_time.steady]` `preparing_ms` falls with them;
+- `[memory]` `vram_peak` stays under `vram_budget_at_peak`, and
+  `[memory.pressure]` `vram_over_budget` is false;
+- `[textures]` `waiting_for_memory_most` is far lower (part of that is the
+  corrected count), `smallest_levels_only` grows more slowly, and the log's
+  detail line counts copies "made with fewer levels" and "cut down while
+  idle".
+
+If a run shows otherwise, switch them off one at a time (`=0`) and compare
+two reports with `victory report --diff`.

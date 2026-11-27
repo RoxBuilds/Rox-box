@@ -61,7 +61,7 @@ do something only in a diagnostics build.
 | `VICTORY_SKIP_CPU_CHECK=1` | skips the AVX2 check (under an instruction emulator, say) |
 
 Each switch is described in a comment where it is read: search the source for
-its name. A whole frame can be recorded and run again without the title: see
+its name, or browse [switches.md](switches.md), generated from those comments. A whole frame can be recorded and run again without the title: see
 [replay.md](replay.md).
 
 A heavy workload or a shader that translates wrongly can make Windows reset
