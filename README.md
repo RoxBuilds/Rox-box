@@ -188,7 +188,7 @@ run after you close the title. That is advice, not an error.
 | `-Setup` | Asks for the game folder again and updates `game_dir` in `victory.toml` (a copy of the old file is kept) |
 | `<folder>` or `<file.exe>` first | What dragging onto `play.cmd` passes: a folder is the game folder for this run, an `.exe` is `-Exe` |
 | `-Exe <file>` | The title executable, when `game_dir` holds several |
-| `-Fast` | Low-memory preset: `-Console SeriesS`, `-Display 1280x720`, `-Output 1280x720`, and timed waits instead of spinning |
+| `-Fast` | Low-memory preset: `-Console SeriesS`, `-Display 1920x1080`, and timed waits instead of spinning. It asks for no picture smaller than 1920x1080: a title can ship its upscaler for one output size and stop when given a smaller one |
 | `-Safe` | Turns the newer, more experimental optimisations off |
 | `-Console SeriesX` / `SeriesS` | Which console model the title is told it runs on (default `SeriesX`); titles choose resolution and memory budgets by it |
 | `-Display <W>x<H>` | The display size reported to the title, e.g. `1920x1080` (default 3840x2160). The simplest way to lower the rendering load |

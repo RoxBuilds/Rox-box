@@ -59,7 +59,8 @@ PLAY
   Dragging a folder onto play.cmd uses it for that run only; if there is no
   victory.toml yet, you are asked whether to remember it.
   Useful switches:
-         play.cmd -Fast                lower memory use and resolution
+         play.cmd -Fast                lower memory use: the smaller console
+                                       model at 1920x1080
          play.cmd -Display 1920x1080   the display size the title is told
          play.cmd -Safe                turns the newer optimisations off
          play.cmd -Log                 writes everything the run says to a

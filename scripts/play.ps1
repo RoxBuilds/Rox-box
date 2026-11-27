@@ -15,8 +15,10 @@
 #               victory.toml) or a .exe (same as -Exe)
 # -Exe          the title executable; optional when the game folder (game_dir in victory.toml) holds exactly one .exe
 # -Check        runs `victory check` (every prerequisite as OK / WARN / MISSING with the fix) and starts nothing
-# -Fast         low-memory / fast preset: -Console SeriesS, -Display 1280x720, -Output 1280x720,
-#               -Build release (each unless specified), plus VICTORY_CARD_AWAKE=0 and VICTORY_MWAITX_WAIT=1.
+# -Fast         low-memory / fast preset: -Console SeriesS, -Display 1920x1080, -Build release (each unless
+#               specified), plus VICTORY_CARD_AWAKE=0 and VICTORY_MWAITX_WAIT=1. It sets no -Output and no display
+#               under 1920x1080: a title can ship its upscaler for one output size per console model, and stops
+#               when it is given a smaller one. -Display / -Output lower them for a title that takes it.
 # -Safe         disables newer experimental optimizations
 # -RayTracing   enables guest ray-tracing BVH builder translation (`VICTORY_BVH_BUILDER=1`)
 # -Build        source tree only: `diag` (`target\diag`), `release`, `release-dist` or `debug`;
@@ -182,9 +184,13 @@ function Find-Victory([string]$Here, [string]$Build) {
     $null
 }
 
+# What -Fast chooses where the command line does not. No output size, and no display smaller than the
+# smaller console model's own 1920x1080: a title that ships its upscaler for that one size stops (its
+# upscaler refuses the other size, and the title then divides by the size it never got) when the picture
+# it is asked for is smaller. The load is lowered by the console model, not by the picture's size.
 function Get-FastChoices($Given) {
     $choices = [ordered]@{
-        Console = 'SeriesS'; Display = '1280x720'; Output = '1280x720'; Build = 'release'
+        Console = 'SeriesS'; Display = '1920x1080'; Output = ''; Build = 'release'
     }
     foreach ($k in @($choices.Keys)) { if ($Given.Keys -contains $k) { $choices[$k] = $Given[$k] } }
     $choices
@@ -656,6 +662,11 @@ if ($SelfTest) {
 
         $s = Get-RunSettings -Fast -Display '1280x720' -Output '1280x720'
         Check ($s.VICTORY_CARD_AWAKE -eq '0' -and $s.VICTORY_MWAITX_WAIT -eq '1' -and $s.VICTORY_OUTPUT -eq '1280x720') 'fast run settings'
+        $f = Get-FastChoices @{}
+        $s = Get-RunSettings -Fast -Display $f.Display -Output $f.Output
+        Check ($f.Console -eq 'SeriesS' -and $f.Display -eq '1920x1080' -and -not $f.Output -and $s.VICTORY_DISPLAY_MODE -eq '1920x1080' -and -not $s.ContainsKey('VICTORY_OUTPUT')) 'the fast preset asks for no picture under 1920x1080 and no output size'
+        $f = Get-FastChoices @{ Display = '1280x720'; Output = '1280x720' }
+        Check ($f.Display -eq '1280x720' -and $f.Output -eq '1280x720') 'the fast preset keeps a display and an output size that were given'
         Check ($s.VICTORY_PIPELINE_BOOK -eq '1' -and (Get-RunSettings -Safe).VICTORY_PIPELINE_BOOK -eq '1') 'runs record the pipelines they create'
 
         # -More and -SettingsValues: text (all play.cmd can pass) and a hashtable give the same table.
@@ -839,7 +850,8 @@ if ($Path) {
     }
 }
 if ($ShowSettings) {
-    if ($Fast) { $f = Get-FastChoices $PSBoundParameters; $Display = $f.Display; $Output = $f.Output }
+    # ($Output keeps its pattern check: the preset's "none" is not assigned to it.)
+    if ($Fast) { $f = Get-FastChoices $PSBoundParameters; $Display = $f.Display; if ($f.Output) { $Output = $f.Output } }
     $shown = Get-RunSettings -Safe:$Safe -RayTracing:$RayTracing -Fast:$Fast -Display $Display -Output $Output -More $More
     $shown.Keys | Sort-Object | ForEach-Object { Write-Host "$_=$($shown[$_])" }
     $SettingsValues.Keys | Sort-Object | ForEach-Object { Write-Host "setting $_=$($SettingsValues[$_])" }
@@ -859,7 +871,8 @@ $victory = (Resolve-Path -LiteralPath $found.Victory).Path
 $root = (Resolve-Path -LiteralPath $found.Root).Path
 if ($Fast) {
     $f = Get-FastChoices $PSBoundParameters
-    $Console = $f.Console; $Display = $f.Display; $Output = $f.Output
+    $Console = $f.Console; $Display = $f.Display
+    if ($f.Output) { $Output = $f.Output }
 }
 $Build = $found.Build
 $settings = Get-RunSettings -Safe:$Safe -RayTracing:$RayTracing -Fast:$Fast -Display $Display -Output $Output -More $More
