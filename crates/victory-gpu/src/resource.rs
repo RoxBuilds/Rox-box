@@ -2947,7 +2947,8 @@ pub(crate) fn let_go_idle() {
 
 /// Of title texture `r` (at `at`), cuts the host copy down to its levels of
 /// at most `side` texels a side if it may be: the title places and fills it,
-/// nothing used it for `idle_ms` and four frames, no list holds it, a slot
+/// nothing used it for a while (`idle`, given when it was last asked for:
+/// the sweep's idle time and four frames), no list holds it, a slot
 /// does (one nothing holds goes whole, [`take_idle`]), and it has larger
 /// levels than that. The copy goes as one replaced by `want_level` goes: the
 /// slots that show it go on showing it, its texture's slots are due in the
@@ -2959,9 +2960,8 @@ pub(crate) fn let_go_idle() {
 /// pass or a draw asks for it, not when a shader reads it: one on screen
 /// may be cut too. Those idle longest go first.
 #[cfg(windows)]
-fn cut_idle(r: &Resource, at: usize, idle_ms: u64, side: u64) -> Option<u64> {
+fn cut_idle(r: &Resource, at: usize, side: u64, idle: &dyn Fn(u64) -> bool) -> Option<u64> {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     const TEXTURE_2D: u32 = 3;
     let desc = &r.desc;
     if side == u64::MAX
@@ -2978,7 +2978,7 @@ fn cut_idle(r: &Resource, at: usize, idle_ms: u64, side: u64) -> Option<u64> {
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     let (host, _) = made.as_ref()?;
     if host.tiled.is_some()
-        || !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+        || !idle(r.host.used.load(Relaxed))
         || std::sync::Arc::strong_count(host) != 1
         || crate::host::references(&host.texture) <= 1
         || alias_of(at as This).is_some()
@@ -3138,6 +3138,7 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
         // Still short: what slots hold is cut down (`VICTORY_TEXTURE_CUT`),
         // a few at a time (each is made and uploaded again).
         if cut_side != u64::MAX {
+            let idle = |used: u64| crate::host::long_ago(used, idle_ms, IDLE_FRAMES);
             let (mut cuts, mut cut_bytes) = (0, 0);
             for at in held {
                 if bytes + cut_bytes >= most || cuts >= CUTS_A_LOOK {
@@ -3145,7 +3146,7 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
                 }
                 // SAFETY: as above.
                 let r = unsafe { &*(at as *const Resource) };
-                if let Some(had) = cut_idle(r, at, idle_ms, cut_side) {
+                if let Some(had) = cut_idle(r, at, cut_side, &idle) {
                     cuts += 1;
                     // (What is left of it is a few hundredths of that.)
                     cut_bytes += had;
@@ -4957,13 +4958,17 @@ mod tests {
         let serial = held_copy.serial;
         drop((held_copy, free_copy));
         let side = 256;
-        for _ in 0..4 {
-            crate::frame::test_advance();
-        }
+        // Whether it is idle is the caller's to say: the sweep's time and
+        // frames. (Not by moving the process's frame count: every test's
+        // idle rule reads it, and windows other tests left became idle and
+        // were let go under them.)
+        let (idle, used) = (|_: u64| true, |_: u64| false);
+        // Used lately: left alone.
+        assert!(cut_idle(resource(held), held as usize, side, &used).is_none());
         // No slot holds it: the sweep lets that one go whole, not here.
-        assert!(cut_idle(resource(free), free as usize, 0, side).is_none());
+        assert!(cut_idle(resource(free), free as usize, side, &idle).is_none());
         let cuts = DETAILED[2].load(Relaxed);
-        assert!(cut_idle(resource(held), held as usize, 0, side).is_some_and(|had| had > 0));
+        assert!(cut_idle(resource(held), held as usize, side, &idle).is_some_and(|had| had > 0));
         assert!(DETAILED[2].load(Relaxed) > cuts);
         assert!(made_copy(held).is_none(), "the old copy is out; the slot holds its texture");
         assert!(crate::host::references(&slot) >= 1);
@@ -4975,7 +4980,7 @@ mod tests {
         assert!(cut.serial != serial && cut.grown.load(Relaxed), "its slots are made from it after its upload");
         // Down already: not again.
         drop(cut);
-        assert!(cut_idle(resource(held), held as usize, 0, side).is_none());
+        assert!(cut_idle(resource(held), held as usize, side, &idle).is_none());
         drop(slot);
     }
 

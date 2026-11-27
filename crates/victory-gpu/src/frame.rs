@@ -144,7 +144,11 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
-/// For tests of what is done once a frame.
+/// For tests of what is done once a frame, in a process of their own: every
+/// idle rule reads the frame count (`crate::host::long_ago`), so a test that
+/// moves it beside others makes what those left idle, and the emergency trim
+/// of windows (`crate::shadow::let_go_short`) let it go under them. A test
+/// of an idle rule takes whether a thing is idle as an argument instead.
 #[cfg(test)]
 pub(crate) fn test_advance() {
     FRAME.fetch_add(1, Ordering::Relaxed);

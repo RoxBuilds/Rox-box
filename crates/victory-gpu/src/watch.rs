@@ -2744,6 +2744,8 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -2858,6 +2860,8 @@ mod tests {
     /// read itself leaves it open: the read lands, and is seen.
     #[test]
     fn a_refresh_leaves_open_what_the_kernel_is_writing() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of two blocks, mapped read-write.
@@ -2909,6 +2913,8 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         let p = placeholder(3);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
@@ -2949,6 +2955,8 @@ mod tests {
     /// begun to unmap: no note of it stays behind.
     #[test]
     fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
@@ -2978,6 +2986,8 @@ mod tests {
     /// taken for them: code stays code, private memory is not guarded.
     #[test]
     fn other_memory_at_a_guarded_address_keeps_its_protection() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_EXECUTE_READ,
             PAGE_EXECUTE_READWRITE, UnmapViewOfFile2,
@@ -3041,6 +3051,8 @@ mod tests {
     /// its length or the allocation.
     #[test]
     fn freed_memory_leaves_no_notes() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         let p = placeholder(3);
         let noted = |block: usize| {
             let g = guards();
@@ -3097,6 +3109,8 @@ mod tests {
     /// title code.
     #[test]
     fn a_block_guarded_before_we_were_told_of_its_view_can_be_written() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -3139,6 +3153,8 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -3200,6 +3216,8 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -3291,6 +3309,8 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -4014,6 +4034,8 @@ mod many_askers_tests {
     }
 
     fn writes_to_views_are_not_lost<const VIEWS: usize>(rest: u64) {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         let rest = std::time::Duration::from_micros(rest);
         const PAGES: usize = 12;
         const THREADS: usize = 8;
@@ -4166,6 +4188,8 @@ mod many_askers_tests {
     /// allocated there. A hole that is no placeholder's is asked about.
     #[test]
     fn holes_are_known_until_the_runtime_tells() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
@@ -4251,6 +4275,8 @@ mod many_askers_tests {
     /// whoever asks after it, and blocks are known by their bits meanwhile.
     #[test]
     fn no_mapping_is_lost_between_askers() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 12;
@@ -4342,6 +4368,8 @@ mod many_askers_tests {
     /// or forgets it.
     #[test]
     fn bits_go_with_the_guard() {
+        // The process's guards and views of title memory (`crate::test_views_lock`).
+        let _views = crate::test_views_lock();
         // SAFETY: a view of a section of our own, which stays.
         let at = unsafe {
             let section =

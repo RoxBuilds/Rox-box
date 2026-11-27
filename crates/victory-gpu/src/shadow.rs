@@ -7711,15 +7711,27 @@ mod loose_tests {
         let ways = WAYS[1];
         let base = region(3, 0);
         let door: Arc<Door> = Arc::default();
+        // The first thread to try is refused every time it tries, not only the
+        // first time: an ask whose making is refused lets idle windows go and
+        // tries once more (`loose_try`'s retry), and windows other tests left
+        // in the process-wide table can be idle enough for that. Refused once
+        // only, the retry made the window itself, and this test failed with
+        // the suite's timing.
         let hooked = Hooked::new(base, {
             let door = door.clone();
-            let tries = AtomicU64::new(0);
+            let refused: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
             move |start, len| {
-                if tries.fetch_add(1, Ordering::SeqCst) == 0 {
-                    door.stand();
-                    return None;
+                let me = std::thread::current().id();
+                let first = {
+                    let mut refused = refused.lock().unwrap();
+                    *refused.get_or_insert(me)
+                };
+                if first != me {
+                    return unbacked(start, len);
                 }
-                unbacked(start, len)
+                // (Only the first try finds the door shut.)
+                door.stand();
+                None
             }
         });
         // (Without a length: an ask with one would get a window of just its
@@ -7737,8 +7749,12 @@ mod loose_tests {
         assert!(second.recv_timeout(Duration::from_millis(40)).is_err());
         door.open();
         let wait = Duration::from_secs(20);
-        assert!(first.recv_timeout(wait).expect("ended").is_none());
+        let first = first.recv_timeout(wait).expect("ended");
         let second = second.recv_timeout(wait).expect("told").expect("made by the one that waited");
+        // The refused ask has no window of its own making: none at all, or,
+        // where it tried once more after the waiter had made the window, that
+        // very window.
+        assert!(first.is_none_or(|window| Arc::ptr_eq(&window, &second)));
         assert_eq!((second.start, second.len), (base, WINDOW));
         assert_eq!(hooked.keys(), BTreeSet::from([(0, WINDOW)]));
     }
