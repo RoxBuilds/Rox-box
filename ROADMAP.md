@@ -28,20 +28,30 @@ Three audiences, three promises:
 "Playable" is meant literally: a steady 30 frames per second on a mid-range
 card, without device losses, with the picture the title intends.
 
-## Where we are (0.1)
+## Where we are
 
 Honest numbers, in relative terms:
 
 - It starts some titles and reaches gameplay. Frame rates are in the low
   double digits on a high-end 64-lane desktop card with plenty of memory, and
   in the low single digits on 8 GB / 32-lane cards in PCs with little RAM.
-- The published build has not been run end to end on a title since history was
-  rewritten for release; the test suite, the hermetic package and the preflight
-  check are verified, a full run is not.
-- First-time setup asked a player to edit a TOML file and use a terminal.
-- Nothing about a run could be shared: logs, screenshots and dumps contain
-  title material and are banned from issues. The project could not learn from
-  any PC but its maintainer's.
+- The published build has been run end to end on a title on a 32-lane card:
+  it reaches the world, slowly and with a picture that is wrong in places. Its
+  report says where the frame goes: the card busy most of the time, the
+  submitting side waiting for it for one main cause, and a PC out of physical
+  memory ([docs/findings.md](docs/findings.md)). A report from a 64-lane card
+  is still wanted.
+- The path every player takes is tested without a title: a self-test of five
+  stages and a demo title of our own source, run by `victory run` in the
+  tests and in CI on the software adapter.
+- A run can be shared: every run and every self-test writes a report of
+  numbers and our own words, and two reports compare with one command.
+- Setup needs no terminal and no file editing; shaders and pipelines are
+  prepared by the launcher.
+- Changes made from that first report (small-card texture policy, the wait
+  for unwatched memory, a title's own command line and exits) are tested on
+  synthetic data and on the demo title; **runs of a title have not confirmed
+  them yet**.
 
 ## Strategy
 
