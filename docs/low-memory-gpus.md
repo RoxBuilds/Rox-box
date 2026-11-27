@@ -72,6 +72,55 @@ against the shared-memory budget:
 - **Whole-buffer SHA digesting:** `VICTORY_WHOLE_DIGEST` skips redundant uploads
   for unwatched ranges whose 64 KiB chunks have not changed.
 
+## Textures picked by index on a card smaller than the title's textures
+
+When the copies the title's streamed textures want come to more than the card
+(an 8 GB card at 1080p), a texture shown with fewer levels is a small defect
+and one not shown at all a large one. The defaults below are on for cards
+whose budget is 8 GiB or less and off on larger ones; each `=0` restores the
+behaviour before it.
+
+- **Fewer levels as the card fills** (`VICTORY_TEXTURE_DETAIL`; `0` off, `card`
+  the card's band only, anything else also the PC's commit). In the band of
+  10 % of the budget below the texture queue's line, new host copies leave out
+  their largest levels step by step (at most 2048, 1024, 512, 256, then 128
+  texels a side); past the line, as before, only the smallest levels
+  (`VICTORY_TEXTURE_TAIL`). While the commit guard is critical new copies have
+  at most 1024 texels a side. Slots so shown are held and looked at again when
+  the band allows more levels, and then given a copy with them. Views count
+  from the copy's first level as other reduced copies do
+  (`VICTORY_BASE_VIEWS`, `descriptor/host.rs` `from_base`).
+- **Headroom under the budget** (`VICTORY_CARD_HEADROOM_PCT`, 4 on small cards;
+  0 to 20). The queue also stops while the system's own count of our card use
+  (with what is kept for targets and buffer copies) is past the budget less
+  this share: the queue's measure counts the free bytes inside our blocks of
+  textures as free, and those were up to about 1 GB.
+- **Idle copies cut down** (`VICTORY_TEXTURE_CUT`; unset: as
+  `VICTORY_TEXTURE_DETAIL`). When the sweep is to free card memory and the
+  copies nothing holds are not enough, whole copies that only slots hold and
+  nothing asked for during the sweep's idle time are replaced by copies of
+  their levels of at most the band's side (256 texels at the least), up to 64
+  a look; the slots show the old copy until the new one is uploaded.
+- **Small textures while the card is full** (`VICTORY_SMALL_WHEN_FULL_KB`, 64 on
+  small cards). A texture of which no smallest-levels copy can be made (one
+  level, 64 texels a side or less, texture objects) gets a whole copy past the
+  line if it is this small, instead of waiting for room.
+- **Buffers of copies of views' own bytes used again**
+  (`VICTORY_VIEW_BYTES_REUSE`, on everywhere). Copies of buffer views off their
+  copy's elements come and go with ring positions (tens to hundreds a frame);
+  each was a buffer of its own, made resident and waited for until mapped.
+  Their buffers are whole 64 KiB (what a committed buffer took anyway), and a
+  buffer let go of is handed to another copy only once every submission begun
+  or queued then has finished and the bury lag after it (`VICTORY_BURY_LAG`),
+  as `retire` would have dropped it; at most 16 MiB of them, 2 s after that.
+- The lines `new memory waited for` and `new card memory waited for until it
+  is mapped` now say what the memory was (blocks of textures, textures of their
+  own, depth twins, upload buffers, copies of views' own bytes, other buffers
+  of shared memory, card buffers),
+  and the texture queue's count of slots "waiting for their memory" no longer
+  includes slots uploaded and waiting for a look by fingerprint (the line
+  `textures picked by index on a filling card` gives those).
+
 ## Submission & CPU overhead controls
 
 - **Background shader optimization control:** On `<= 24 GiB` RAM or `<= 8 GB`

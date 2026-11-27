@@ -238,6 +238,105 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
 /// (after upstream 9bc5f30, "reject the device-removal fence sentinel").
 const REMOVED_FENCE: u64 = u64::MAX;
 
+/// What new memory waited for by [`resident`] and [`mapped`] is, for their
+/// lines: the counts said how many waits there were, not for what, and on a
+/// PC of 16 GB over a hundred seconds of a run went to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewMemory {
+    /// A block textures are cut from (`crate::pool`).
+    TextureBlock,
+    /// A texture of its own (not in a block).
+    Texture,
+    /// A depth texture's colour twin (`crate::resource`).
+    Twin,
+    /// An upload buffer ([`Host::upload_buffer`]).
+    Upload,
+    /// A buffer of the PC's memory the card shares ([`Host::shared_buffer`]):
+    /// host copies of title buffers, windows.
+    Shared,
+    /// The same for a copy of a buffer view's own bytes
+    /// (`crate::shadow::exact`, [`SharedAs`]).
+    ViewBytes,
+    /// A buffer of the card's memory the CPU maps.
+    CardMapped,
+    /// A buffer of the card's own memory ([`Host::uav_buffer`]).
+    CardBuffer,
+}
+
+impl NewMemory {
+    const ALL: [NewMemory; 8] = [
+        NewMemory::TextureBlock,
+        NewMemory::Texture,
+        NewMemory::Twin,
+        NewMemory::Upload,
+        NewMemory::Shared,
+        NewMemory::ViewBytes,
+        NewMemory::CardMapped,
+        NewMemory::CardBuffer,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            NewMemory::TextureBlock => "blocks of textures",
+            NewMemory::Texture => "textures of their own",
+            NewMemory::Twin => "depth twins",
+            NewMemory::Upload => "upload buffers",
+            NewMemory::Shared => "other buffers of shared memory",
+            NewMemory::ViewBytes => "copies of views' own bytes",
+            NewMemory::CardMapped => "card buffers the CPU maps",
+            NewMemory::CardBuffer => "card buffers",
+        }
+    }
+}
+
+thread_local! {
+    /// What a buffer of shared memory made on this thread is, for the lines
+    /// of [`resident`] and [`mapped`] ([`SharedAs`]).
+    static SHARED_AS: std::cell::Cell<NewMemory> = const { std::cell::Cell::new(NewMemory::Shared) };
+}
+
+/// Sets what buffers of shared memory made on this thread are while it
+/// lives ([`SHARED_AS`]), and gives back what it was then.
+pub(crate) struct SharedAs(NewMemory);
+
+impl SharedAs {
+    pub(crate) fn new(kind: NewMemory) -> SharedAs {
+        SharedAs(SHARED_AS.replace(kind))
+    }
+}
+
+impl Drop for SharedAs {
+    fn drop(&mut self) {
+        SHARED_AS.set(self.0);
+    }
+}
+
+/// Per [`NewMemory`] kind: the waits of [`resident`] and of [`mapped`], each
+/// as times and microseconds.
+static WAITS_BY: [[std::sync::atomic::AtomicU64; 4]; 8] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 8];
+
+/// Notes a wait for `kind` of `us` microseconds: of [`resident`] (`which`
+/// 0) or of [`mapped`] (1).
+fn note_wait(kind: NewMemory, which: usize, us: u64) {
+    WAITS_BY[kind as usize][which * 2].fetch_add(1, Ordering::Relaxed);
+    WAITS_BY[kind as usize][which * 2 + 1].fetch_add(us, Ordering::Relaxed);
+}
+
+/// The waits of `which` ([`note_wait`]) by kind, for a line: those there
+/// were, as "kind times in ms".
+fn waits_by(which: usize) -> String {
+    let parts: Vec<String> = NewMemory::ALL
+        .iter()
+        .filter_map(|&kind| {
+            let times = WAITS_BY[kind as usize][which * 2].load(Ordering::Relaxed);
+            let ms = WAITS_BY[kind as usize][which * 2 + 1].load(Ordering::Relaxed) as f64 / 1000.0;
+            (times > 0).then(|| format!("{} {times} in {ms:.0} ms", kind.name()))
+        })
+        .collect();
+    parts.join(", ")
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
@@ -256,8 +355,8 @@ unsafe impl Send for Aside {}
 /// memory was made, which the system starts only when all mappings asked
 /// for so far are done, and waited for. (`MakeResident` came back before
 /// that: a device was lost with it alone.) Best done off a hot
-/// path: a tenth of a millisecond to some.
-pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+/// path: a tenth of a millisecond to some. `kind` is for the line.
+pub(crate) fn mapped(device: &ID3D12Device, kind: NewMemory) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
@@ -327,12 +426,14 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
+    note_wait(kind, 1, us);
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; by what it was: {}",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
+            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            waits_by(1)
         );
     }
     Ok(())
@@ -342,7 +443,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 pub(crate) static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
-pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+/// `kind` is for the line.
+pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface, kind: NewMemory) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
@@ -354,14 +456,16 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
+    note_wait(kind, 0, us);
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = RESIDENT[0].load(Ordering::Relaxed);
     if n >= 1000 * (SAID.load(Ordering::Relaxed) + 1) {
         SAID.store(n / 1000, Ordering::Relaxed);
         tracing::info!(
-            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; by what it was: {}",
             RESIDENT[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0
+            RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            waits_by(0)
         );
     }
     made
@@ -1005,6 +1109,25 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
+}
+
+/// The number [`retire`] would give something let go now: the newest
+/// submission begun, with those the title made that the host has not begun.
+/// What may still name it is past once [`landed_by`] says so.
+pub(crate) fn retire_mark() -> u64 {
+    STARTED.load(Ordering::Acquire) + crate::queue::queued()
+}
+
+/// Whether something let go at `mark` ([`retire_mark`]) would have been
+/// dropped by [`retire`] once submissions up to `finished` have finished:
+/// the same rule as [`bury`]'s, with the same lag ([`bury_lag`]).
+pub(crate) fn landed_by(mark: u64, finished: u64) -> bool {
+    mark <= finished.saturating_sub(bury_lag())
+}
+
+/// [`landed_by`] for the submissions finished now.
+pub(crate) fn landed(mark: u64) -> bool {
+    landed_by(mark, FINISHED.load(Ordering::Acquire))
 }
 
 /// [`retire`] for a resource.
@@ -10727,7 +10850,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident(&self.device, b, NewMemory::Upload)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11618,8 +11741,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    let kind = SHARED_AS.get();
+                    resident(&self.device, b, kind)?;
+                    mapped(&self.device, kind)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11740,8 +11864,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident(&self.device, b, NewMemory::CardMapped)?;
+                    mapped(&self.device, NewMemory::CardMapped)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11793,7 +11917,8 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b, NewMemory::CardBuffer)))
+            .and_then(|()| mapped(&self.device, NewMemory::CardBuffer));
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -13360,5 +13485,27 @@ mod movie_plane_tests {
         assert!(!trim_due(1149, 900));
         assert!(trim_due(1150, 900));
         assert!(trim_due(5000, 900));
+    }
+}
+
+#[cfg(test)]
+mod new_memory_tests {
+    use super::{NewMemory, SharedAs, note_wait, waits_by, SHARED_AS};
+
+    /// The waits for new memory are told by what it was; a buffer of shared
+    /// memory is what the thread making it says while it says so.
+    #[test]
+    fn waits_for_new_memory_are_told_by_kind() {
+        note_wait(NewMemory::ViewBytes, 1, 2500);
+        note_wait(NewMemory::TextureBlock, 0, 1000);
+        assert!(waits_by(1).contains("copies of views' own bytes"));
+        assert!(waits_by(0).contains("blocks of textures"));
+        assert_eq!(SHARED_AS.get(), NewMemory::Shared);
+        {
+            let _as = SharedAs::new(NewMemory::ViewBytes);
+            assert_eq!(SHARED_AS.get(), NewMemory::ViewBytes);
+            std::thread::spawn(|| assert_eq!(SHARED_AS.get(), NewMemory::Shared)).join().unwrap();
+        }
+        assert_eq!(SHARED_AS.get(), NewMemory::Shared);
     }
 }

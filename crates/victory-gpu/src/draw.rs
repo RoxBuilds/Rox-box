@@ -743,6 +743,23 @@ fn full_card_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the texture `view` shows takes `most` bytes of title memory or
+/// fewer (0: none does): from the first level a placed texture's view shows,
+/// or all of a texture object (`resource::small_when_full`).
+fn small_texture(view: &View, most: u64) -> bool {
+    if most == 0 {
+        return false;
+    }
+    let bytes = match view {
+        View::Placed(false, resource, desc) => {
+            crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc))
+        }
+        View::Shader(object, _) => crate::resource::texture_bytes(*object as This),
+        _ => None,
+    };
+    bytes.is_some_and(|b| b > 0 && b <= most)
+}
+
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
 /// no).
@@ -2444,6 +2461,10 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // With room: the most texels a side of a new copy's first level, the
+        // fewer the closer the card is to its line (`resource::detail`;
+        // `u64::MAX`: every level).
+        let mut side = if room { crate::resource::detail_side(memory) } else { u64::MAX };
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run hundreds
@@ -2455,8 +2476,9 @@ impl State {
         }
         let mut refused = 0;
         // Room again: the slots held back while the card was full are due
-        // now (`full_card_pass`).
-        if room {
+        // now (`full_card_pass`); in the band, once copies may have more
+        // levels than when they were held (`resource::release_held`).
+        if room && crate::resource::release_held(side) {
             host.texture_slots_room(frame);
         }
         // Slots whose texture's memory the runtime mapped, unmapped or
@@ -2498,6 +2520,7 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        crate::resource::detail_line(side, room, census[5]);
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2582,6 +2605,11 @@ impl State {
             // for the rest of them when the card has room.
             let tail = !room && crate::resource::tail_only();
             let _tail = crate::resource::TailOnly::new(tail);
+            // With room in the band below the line: a new host copy holds the
+            // levels of at most `side` texels a side, and the slot is held as
+            // one of the smallest levels is, for the rest of them.
+            let fewer = room && side != u64::MAX;
+            let _fewer = crate::resource::DetailCap::new(if fewer { side } else { u64::MAX });
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2718,13 +2746,27 @@ impl State {
                         }
                         _ => false,
                     });
-                if !has_its_texture && !tails {
+                // One of which no copy of the smallest levels can be made
+                // (of one level, of 64 texels a side or less, a texture
+                // object) gets a whole one if it is small
+                // (`resource::small_when_full`).
+                let small = !has_its_texture
+                    && !tails
+                    && heap
+                        .handle(index)
+                        .and_then(crate::descriptor::view)
+                        .is_some_and(|view| small_texture(&view, crate::resource::small_when_full()));
+                if small {
+                    crate::resource::DETAILED[4].fetch_add(1, Ordering::Relaxed);
+                }
+                if !has_its_texture && !tails && !small {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
+                        crate::resource::held_at(0);
                         if refused > 1024 {
                             break;
                         }
@@ -2803,7 +2845,10 @@ impl State {
             // has no room: the slot is held for the rest of them (in about
             // four seconds, `most`, or when the card has room), and is not
             // looked at by fingerprint meanwhile.
-            let tailed = tail && crate::resource::tail_copy(resource);
+            let tailed = (tail || fewer) && crate::resource::tail_copy(resource);
+            if tailed {
+                crate::resource::held_at(if tail { 0 } else { side });
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -2963,7 +3008,9 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                let memory = crate::host::host().and_then(|h| h.video_memory());
+                room = crate::resource::room(memory);
+                side = if room { crate::resource::detail_side(memory) } else { u64::MAX };
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

@@ -6833,23 +6833,61 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return Some(shadow.clone());
     }
     let most = view_bytes_most();
+    let reuse = view_bytes_reuse();
+    let clock = crate::host::now_ms();
     if map.len() >= MANY || !view_bytes_fit(exact_bytes(map), len, most) {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let mut gone = Vec::new();
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            let keep =
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+            if !keep && reuse {
+                gone.push(shadow.clone());
+            }
+            keep
         });
+        if reuse {
+            // As `crate::host::retire` would number it: its buffer goes to
+            // another copy only once every submission begun or queued now
+            // has finished, and the lag after that.
+            let mark = spare_mark();
+            let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            for shadow in gone {
+                // Ours alone now (the map's reference went above).
+                let Ok(shadow) = Arc::try_unwrap(shadow) else { continue };
+                let (size, buffer, data, gpu) = (shadow.width(), shadow.buffer.clone(), shadow.data, shadow.gpu);
+                drop(shadow);
+                spare.put(SpareBuffer { size, buffer, data, gpu, mark, ready: None }, crate::host::retire_resource);
+            }
+        }
         if !view_bytes_fit(exact_bytes(map), len, most) {
             EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
             return None;
         }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let size = exact_size(len, reuse);
+    let again = if reuse {
+        EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size, clock, spare_landed, crate::host::retire_resource)
+    } else {
+        None
+    };
+    let (buffer, data, gpu) = match again {
+        Some(spare) => {
+            EXACT_REUSED.fetch_add(1, Ordering::Relaxed);
+            (spare.buffer, spare.data, spare.gpu)
+        }
+        None => {
+            let _as = crate::host::SharedAs::new(crate::host::NewMemory::ViewBytes);
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu)
+        }
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     #[cfg(feature = "diagnostics")]
     crate::book::tag(&buffer, "copies of views' own bytes");
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -6859,6 +6897,294 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// Of [`OWN_MADE`], those made on the buffer of one let go of before
+/// ([`view_bytes_reuse`]), since the start.
+pub(crate) static EXACT_REUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the buffer of a copy of a view's own bytes ([`exact`]) that is let
+/// go of is kept for the next such copy (`VICTORY_VIEW_BYTES_REUSE`, on unless
+/// `0`: every copy is a buffer of its own, made and given back, as before).
+///
+/// Ring positions move every frame, so such copies come and go: tens to
+/// hundreds were made a frame, each a buffer of the PC's memory the card shares,
+/// which is made resident and then waited for until the card has it mapped
+/// (`crate::host::resident`, `crate::host::mapped`). Those two waits grew in
+/// step with these copies, to over a millisecond for each one on a PC short
+/// of memory: a hundred milliseconds and more of a frame. A buffer kept here
+/// is resident and mapped already. The copy on it is a new one, which takes
+/// the title's bytes whole before anything reads it, as on a new buffer.
+fn view_bytes_reuse() -> bool {
+    crate::toggled!("VICTORY_VIEW_BYTES_REUSE")
+}
+
+/// The bytes of the buffer a copy of a view's `len` bytes is made on: with
+/// [`view_bytes_reuse`] whole 64 KiB, which is what a committed buffer takes
+/// of memory whatever its size (each copy of a few hundred bytes took 64 KiB
+/// before as well), so that a buffer let go of fits the next copy of that
+/// many; else `len` in whole 256 bytes, as before.
+fn exact_size(len: u64, reuse: bool) -> u64 {
+    if reuse { len.max(1).next_multiple_of(64 << 10) } else { len.next_multiple_of(256) }
+}
+
+/// The bytes of the buffer a new copy of a view's `len` bytes has
+/// ([`exact_size`] as the switch is now), for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn exact_width(len: u64) -> u64 {
+    exact_size(len, view_bytes_reuse())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the submissions begun and finished as [`spare_mark`] and
+    /// [`spare_landed`] take them on this thread, in the place of the
+    /// host's.
+    static TEST_SUBMISSIONS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The number a spare buffer let go of now waits for ([`SpareBuffer`]'s
+/// `mark`): `crate::host::retire_mark`.
+fn spare_mark() -> u64 {
+    #[cfg(test)]
+    if let Some((started, _)) = TEST_SUBMISSIONS.get() {
+        return started;
+    }
+    crate::host::retire_mark()
+}
+
+/// Whether what was let go at `mark` can be named by no submission that
+/// still runs: `crate::host::landed`, the rule by which `crate::host::retire`
+/// drops what was let go.
+fn spare_landed(mark: u64) -> bool {
+    #[cfg(test)]
+    if let Some((_, finished)) = TEST_SUBMISSIONS.get() {
+        return crate::host::landed_by(mark, finished);
+    }
+    crate::host::landed(mark)
+}
+
+/// A buffer of a copy of a view's own bytes that was let go of
+/// ([`view_bytes_reuse`]): its bytes, the buffer, its mapping and card
+/// address; the submission number it waits for (`crate::host::retire_mark`
+/// when it was let go); and when it was first found past that
+/// (`crate::host::now_ms`; `None`: not yet).
+struct SpareBuffer<B = ID3D12Resource> {
+    size: u64,
+    buffer: B,
+    data: *mut u8,
+    gpu: u64,
+    mark: u64,
+    ready: Option<u64>,
+}
+
+// SAFETY: the mapping is of the buffer, which nothing else holds while it is
+// here; the next copy made on it is its one user.
+unsafe impl<B: Send> Send for SpareBuffer<B> {}
+
+/// Spare buffers ([`SpareBuffer`]), the oldest first, at most
+/// [`SpareBuffers::MOST`] bytes; one past its submissions goes after
+/// [`SpareBuffers::KEPT_MS`]. They are the PC's memory the card shares, which
+/// runs out first; what goes is handed to the caller's `let_go`
+/// (`crate::host::retire_resource`: dropped once nothing running names it).
+///
+/// A copy's buffer comes here only when nothing of ours holds the copy or
+/// its buffer (`exact`): no list, recorded or in the air (a list keeps the
+/// copies it refreshes until it is reset, `HostList::defer_refresh`), no
+/// slot, and no slot's old resource (`HostHeap::keep` retires it). That is
+/// the rule by which the copy was destroyed at once before. On top of it a
+/// buffer is handed out only once every submission begun or queued when it
+/// came here has finished, and the lag `crate::host::retire` keeps after
+/// that: what would have destroyed it is what makes it another copy's.
+struct SpareBuffers<B = ID3D12Resource>(Vec<SpareBuffer<B>>);
+
+impl<B> SpareBuffers<B> {
+    const MOST: u64 = 16 << 20;
+    const KEPT_MS: u64 = 2000;
+
+    /// Keeps `spare`, letting the oldest go past [`Self::MOST`] bytes.
+    fn put(&mut self, spare: SpareBuffer<B>, mut let_go: impl FnMut(B)) {
+        self.0.push(spare);
+        let mut bytes: u64 = self.0.iter().map(|s| s.size).sum();
+        while bytes > Self::MOST && !self.0.is_empty() {
+            let gone = self.0.remove(0);
+            bytes -= gone.size;
+            let_go(gone.buffer);
+        }
+    }
+
+    /// A spare buffer of exactly `size` bytes past its submissions
+    /// (`landed`), if one is kept; those past them for longer than
+    /// [`Self::KEPT_MS`] at `now` are let go first.
+    fn take(
+        &mut self,
+        size: u64,
+        now: u64,
+        landed: impl Fn(u64) -> bool,
+        mut let_go: impl FnMut(B),
+    ) -> Option<SpareBuffer<B>> {
+        let mut i = 0;
+        while i < self.0.len() {
+            let s = &mut self.0[i];
+            if s.ready.is_none() && landed(s.mark) {
+                s.ready = Some(now);
+            }
+            if s.ready.is_some_and(|at| at + Self::KEPT_MS <= now) {
+                let_go(self.0.remove(i).buffer);
+            } else {
+                i += 1;
+            }
+        }
+        let i = self.0.iter().rposition(|s| s.size == size && s.ready.is_some())?;
+        Some(self.0.remove(i))
+    }
+}
+
+static EXACT_SPARE: Mutex<SpareBuffers> = Mutex::new(SpareBuffers(Vec::new()));
+
+#[cfg(test)]
+mod spare_view_buffers {
+    use super::{SpareBuffer, SpareBuffers, TEST_SUBMISSIONS, exact_size};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn spare(size: u64, mark: u64, id: u32) -> SpareBuffer<u32> {
+        SpareBuffer { size, buffer: id, data: std::ptr::null_mut(), gpu: 0, mark, ready: None }
+    }
+
+    /// One at a time: they share the process's copies and spare buffers.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Copies of views' own bytes take buffers of whole 64 KiB, as a
+    /// committed buffer takes of memory anyway; off, as before.
+    #[test]
+    fn view_copies_are_made_in_size_classes() {
+        assert_eq!(exact_size(16, true), 64 << 10);
+        assert_eq!(exact_size(64 << 10, true), 64 << 10);
+        assert_eq!(exact_size((64 << 10) + 1, true), 128 << 10);
+        assert_eq!(exact_size(3 << 20, true), 3 << 20);
+        assert_eq!(exact_size((3 << 20) + 5, true), (3 << 20) + (64 << 10));
+        assert_eq!(exact_size(16, false), 256);
+        assert_eq!(exact_size(300, false), 512);
+    }
+
+    /// A spare is handed out only once the submissions it waits for have
+    /// landed, by its size, the newest first; once past them it goes after
+    /// its time; the oldest go past the most bytes kept; whatever goes is let
+    /// go through the caller.
+    #[test]
+    fn spare_view_buffers_wait_for_their_submissions_and_are_bounded() {
+        const K64: u64 = 64 << 10;
+        let mut gone = Vec::new();
+        let mut s = SpareBuffers::<u32>(Vec::new());
+        s.put(spare(K64, 10, 1), |b| gone.push(b));
+        s.put(spare(2 * K64, 10, 2), |b| gone.push(b));
+        s.put(spare(K64, 20, 3), |b| gone.push(b));
+        // Nothing has finished: nothing is handed out, however long.
+        assert!(s.take(K64, 100, |_| false, |b| gone.push(b)).is_none());
+        assert!(s.take(K64, 1_000_000, |_| false, |b| gone.push(b)).is_none());
+        assert!(gone.is_empty());
+        // Up to 10 landed: 1, not 3; then 20, and 3.
+        let to = |n: u64| move |mark: u64| mark <= n;
+        assert_eq!(s.take(K64, 1000, to(10), |b| gone.push(b)).map(|b| b.buffer), Some(1));
+        assert!(s.take(K64, 1000, to(19), |b| gone.push(b)).is_none());
+        assert_eq!(s.take(K64, 1500, to(20), |b| gone.push(b)).map(|b| b.buffer), Some(3));
+        assert!(gone.is_empty());
+        // 2 was found landed at 1000: gone at its time, through the caller.
+        assert!(s.take(4 * K64, 1000 + SpareBuffers::<u32>::KEPT_MS, to(20), |b| gone.push(b)).is_none());
+        assert_eq!(gone, [2]);
+        assert!(s.0.is_empty());
+        // Past the most bytes: the oldest go, through the caller.
+        let many = SpareBuffers::<u32>::MOST / K64;
+        for i in 0..many + 3 {
+            s.put(spare(K64, 30, i as u32), |b| gone.push(b));
+        }
+        assert_eq!(s.0.len() as u64, many);
+        assert_eq!(s.0[0].buffer, 3);
+        assert_eq!(gone, [2, 0, 1, 2]);
+    }
+
+    /// Copies of views' own bytes that come and go (ring positions moving
+    /// on) are made on the buffers of those let go of once their
+    /// submissions have landed: no new memory for most of them, and each
+    /// one's card address is its buffer's.
+    #[test]
+    fn copies_of_views_come_on_buffers_let_go_of() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else { return };
+        if !super::view_bytes_reuse() {
+            return;
+        }
+        // Everything has landed.
+        TEST_SUBMISSIONS.set(Some((0, u64::MAX)));
+        let before = super::EXACT_REUSED.load(Relaxed);
+        // Addresses no title memory is at: nothing reads them here.
+        let base = 0x7e00_0000_0000u64;
+        for i in 0..1000u64 {
+            let copy = super::exact(base + i * 0x100, 0x80).expect("a copy");
+            assert_eq!(copy.width(), 64 << 10);
+            // SAFETY: a live buffer.
+            assert_eq!(copy.gpu(base + i * 0x100), unsafe { copy.buffer.GetGPUVirtualAddress() });
+        }
+        TEST_SUBMISSIONS.set(None);
+        assert!(super::EXACT_REUSED.load(Relaxed) > before + 200, "buffers let go of are used again");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A copy a list still holds (recorded, or in the air) is never let go,
+    /// and one let go while a submission that may name it has not landed
+    /// gives its buffer to no other copy until that one and the lag after it
+    /// have.
+    #[test]
+    fn a_buffer_a_flight_may_read_is_not_handed_out() {
+        use windows::core::Interface;
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::host::host().is_none() || !super::view_bytes_reuse() {
+            return;
+        }
+        let base = 0x7d00_0000_0000u64;
+        let lag = (0..).find(|&n| crate::host::landed_by(1, 1 + n)).unwrap();
+        // Submission 100 begun, 50 finished.
+        TEST_SUBMISSIONS.set(Some((100, 50)));
+        // Held as a list holds the copies it refreshes.
+        let held = super::exact(base, 0x80).unwrap();
+        let held_buffer = held.buffer.as_raw() as usize;
+        // Let go while 100 may still read it.
+        let flown = super::exact(base + 0x100, 0x80).unwrap().buffer.as_raw() as usize;
+        let before = super::EXACT_REUSED.load(Relaxed);
+        let mut i = 2;
+        let mut next = || {
+            let copy = super::exact(base + i * 0x100, 0x80).unwrap();
+            i += 1;
+            copy.buffer.as_raw() as usize
+        };
+        let spare_of = |raw: usize| {
+            let spare = super::EXACT_SPARE.lock().unwrap();
+            spare.0.iter().find(|s| s.buffer.as_raw() as usize == raw).map(|s| s.ready)
+        };
+        // Enough asks to let the first copies go from the pool (more than
+        // the 256 kept and the 512 asks a copy stays for), fewer than fill
+        // the spares.
+        for _ in 0..600 {
+            let raw = next();
+            assert_ne!(raw, held_buffer, "a buffer a list holds is another copy's");
+            assert_ne!(raw, flown, "a buffer a flight may read is another copy's");
+        }
+        assert_eq!(spare_of(flown), Some(None), "let go of, and waiting for its submissions");
+        assert_eq!(spare_of(held_buffer), None, "a copy a list holds is not let go of");
+        // 100 is past the lag (`crate::host::bury_lag`) only at 100 + lag.
+        TEST_SUBMISSIONS.set(Some((200, 100 + lag - 1)));
+        let _ = next();
+        assert!(spare_of(flown).is_none_or(|ready| ready.is_none()), "not before the lag");
+        TEST_SUBMISSIONS.set(Some((200, 100 + lag)));
+        for _ in 0..100 {
+            assert_ne!(next(), held_buffer, "a buffer a list holds is another copy's");
+        }
+        TEST_SUBMISSIONS.set(None);
+        assert!(spare_of(flown).is_none_or(|ready| ready.is_some()), "free once its submissions landed");
+        assert!(super::EXACT_REUSED.load(Relaxed) > before, "once landed, buffers are used again");
+        drop(held);
+    }
+}
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
@@ -6875,11 +7201,14 @@ pub(crate) fn exact_line(frames: f64) {
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept ({:.1} MB), {:.1} \
-         refused per frame for the limit (VICTORY_VIEW_BYTES_MB)",
+         refused per frame for the limit (VICTORY_VIEW_BYTES_MB); since the start {} of {} copies made on a buffer let go \
+         of before, no new memory (VICTORY_VIEW_BYTES_REUSE=0: none)",
         asked as f64 / frames,
         made as f64 / frames,
         bytes as f64 / 1e6,
-        refused as f64 / frames
+        refused as f64 / frames,
+        EXACT_REUSED.load(Ordering::Relaxed),
+        OWN_MADE.load(Ordering::Relaxed)
     );
 }
 

@@ -509,7 +509,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::host::resident(&host.device, &texture, crate::host::NewMemory::Twin);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -572,7 +572,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::host::resident(&host.device, &texture, crate::host::NewMemory::Twin);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1307,6 +1307,10 @@ struct Hosted {
     /// written under `made`'s lock: [`NOT_OWN`] for one without memory of
     /// its own (a piece of a block, or tiles), or none.
     residency: std::sync::atomic::AtomicU8,
+    /// The level the next host copy begins at at the earliest, as the sweep
+    /// cut the last one down to it ([`cut_idle`]; 0: none). Taken by that
+    /// copy's making.
+    cut: std::sync::atomic::AtomicU32,
 }
 
 /// [`Hosted::residency`] of a host copy whose memory is a heap's (its
@@ -1410,11 +1414,414 @@ const TAIL_SIDE: u64 = 64;
 /// none has).
 #[cfg(any(windows, test))]
 fn tail_level(width: u64, height: u64, mips: u32) -> u32 {
+    side_level(width, height, mips, TAIL_SIDE)
+}
+
+/// The first level of a texture `width` by `height` texels with `mips`
+/// levels that has at most `side` texels a side (its last level if none
+/// has): [`tail_level`] for another side ([`detail`]).
+#[cfg(any(windows, test))]
+fn side_level(width: u64, height: u64, mips: u32, side: u64) -> u32 {
     let mut level = 0;
-    while level + 1 < mips && (width >> level > TAIL_SIDE || height >> level > TAIL_SIDE) {
+    while level + 1 < mips && (width >> level > side || height >> level > side) {
         level += 1;
     }
     level
+}
+
+/// [`tail_base`] for a host copy whose first level has at most `side`
+/// texels a side ([`detail`]): the level such a copy begins at for views
+/// that start at `first`, or 0 if none can begin later than the views do.
+#[cfg(windows)]
+fn side_base(desc: &ResourceDesc, first: u32, side: u64) -> u32 {
+    let level = side_level(desc.width, u64::from(desc.height), u32::from(desc.mip_levels), side);
+    base_level(desc, first.max(level))
+}
+
+/// How new host copies of textures picked by index are made while the card
+/// fills ([`detail_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Detail {
+    /// At every level the views show until the card has no room, then of
+    /// their smallest levels only ([`tail_only`]), as before.
+    Off,
+    /// Of fewer levels the closer the card comes to the line of [`room`]
+    /// ([`detail_side_in`]).
+    Card,
+    /// The same, and while the PC's commit is critical
+    /// (`crate::host::commit::critical`) at most [`PC_SHORT_SIDE`] texels a
+    /// side.
+    CardAndPc,
+}
+
+/// [`Detail`] from `VICTORY_TEXTURE_DETAIL` as set and the card's budget:
+/// `0` off (as before), `card` the card's band only, any other value the
+/// band and the PC's commit; unset, the latter on a card whose budget is 8
+/// GiB or less, off on larger ones.
+///
+/// On a card of 8 GB the copies the title's textures want came to more than
+/// the card: every host copy was made whole until the card reached its line,
+/// and from then on new ones were refused or made of their 64-texel tails
+/// alone ([`tail_only`]), so a scene showed some textures sharp and most
+/// blurred to nothing or missing. Leaving out a texture's largest level takes
+/// three quarters of its bytes; two, fifteen sixteenths. Made with fewer of
+/// them as the card fills, many more textures have a copy before it is full,
+/// and what reaches the line later has more than its tail. The PC's side: on
+/// a PC of 16 GB the commit guard holds a pass to 16 MiB while commit is
+/// critical, the same textures then take a sixteenth of the bytes to stage.
+#[cfg(any(windows, test))]
+fn detail_for(set: Option<&str>, budget: Option<u64>) -> Detail {
+    match set.map(str::trim) {
+        Some("0") => Detail::Off,
+        Some("card") => Detail::Card,
+        Some(_) => Detail::CardAndPc,
+        None if budget.is_some_and(|b| b > 0 && b <= 8 << 30) => Detail::CardAndPc,
+        None => Detail::Off,
+    }
+}
+
+/// [`detail_for`] for this card, read once.
+#[cfg(windows)]
+pub(crate) fn detail() -> Detail {
+    static DETAIL: std::sync::OnceLock<Detail> = std::sync::OnceLock::new();
+    *DETAIL.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_DETAIL").ok();
+        let budget = crate::host::host().and_then(|h| h.video_memory()).map(|m| m[0]);
+        let detail = detail_for(set.as_deref(), budget);
+        tracing::info!(
+            ?detail,
+            budget_mb = budget.unwrap_or(0) >> 20,
+            headroom_pct = card_headroom(),
+            cut = cut_on(),
+            small_when_full_kb = small_when_full() >> 10,
+            "textures picked by index on a full card (VICTORY_TEXTURE_DETAIL, VICTORY_CARD_HEADROOM_PCT, VICTORY_TEXTURE_CUT, \
+             VICTORY_SMALL_WHEN_FULL_KB; each 0: as before)"
+        );
+        detail
+    })
+}
+
+/// The band below the lines of [`room`] in which new copies are made with
+/// fewer levels ([`detail_side_in`]), in hundredths of the budget.
+#[cfg(any(windows, test))]
+const DETAIL_BAND_PCT: u64 = 10;
+
+/// The most texels a side of a new copy's first level, from the bottom of
+/// that band to its top: each step halves the side (a quarter of the bytes).
+#[cfg(any(windows, test))]
+const DETAIL_SIDES: [u64; 5] = [2048, 1024, 512, 256, 128];
+
+/// The most texels a side of a new copy's first level while the PC's commit
+/// is critical ([`Detail::CardAndPc`]).
+#[cfg(any(windows, test))]
+const PC_SHORT_SIDE: u64 = 1024;
+
+/// Where the card stands for the texture queue: its budget and the system's
+/// count of our use of it, what our blocks of textures have free, and the
+/// room kept for what is not made yet (`crate::shadow::card_room_kept`,
+/// [`targets_room_kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CardFill {
+    pub(crate) budget: u64,
+    pub(crate) used: u64,
+    pub(crate) free_blocks: u64,
+    pub(crate) kept: u64,
+}
+
+impl CardFill {
+    /// The queue's own measure (the blocks' free bytes count as free: new
+    /// copies take them first) and its line, `percent` of the budget.
+    #[cfg(any(windows, test))]
+    fn queue(&self, percent: u64) -> (u64, u64) {
+        (self.used.saturating_sub(self.free_blocks) + self.kept, self.budget / 100 * percent)
+    }
+
+    /// The system's own count with what is kept, and its line: the budget
+    /// less `headroom` hundredths of it (`None` without a headroom,
+    /// [`card_headroom`]).
+    #[cfg(any(windows, test))]
+    fn whole(&self, headroom: u64) -> Option<(u64, u64)> {
+        (headroom > 0).then(|| (self.used + self.kept, self.budget / 100 * (100 - headroom.min(100))))
+    }
+
+    /// Whether the queue may make more host copies: under its line, and
+    /// with a headroom under that line too.
+    #[cfg(any(windows, test))]
+    pub(crate) fn room(&self, percent: u64, headroom: u64) -> bool {
+        let (queue, line) = self.queue(percent);
+        queue < line && self.whole(headroom).is_none_or(|(whole, line)| whole < line)
+    }
+
+    /// How far into the band of `band` bytes below the lines its use is: 0
+    /// under the band, `band` at or past a line.
+    #[cfg(any(windows, test))]
+    fn depth(&self, percent: u64, headroom: u64, band: u64) -> u64 {
+        let into = |(used, line): (u64, u64)| used.saturating_add(band).saturating_sub(line).min(band);
+        into(self.queue(percent)).max(self.whole(headroom).map_or(0, into))
+    }
+}
+
+/// The most texels a side of the first level of a new host copy the texture
+/// queue makes ([`detail`]): `u64::MAX` (no bound) under the band of
+/// [`DETAIL_BAND_PCT`] below the lines of [`room`], then [`DETAIL_SIDES`]
+/// step by step to the line, and [`PC_SHORT_SIDE`] at most while `pc_short`
+/// ([`Detail::CardAndPc`]). Past the line no copy is made but the smallest
+/// levels' ([`tail_only`]); what is there then is the pass's.
+#[cfg(any(windows, test))]
+fn detail_side_in(detail: Detail, fill: Option<CardFill>, percent: u64, headroom: u64, pc_short: bool) -> u64 {
+    if detail == Detail::Off {
+        return u64::MAX;
+    }
+    let pc = if detail == Detail::CardAndPc && pc_short { PC_SHORT_SIDE } else { u64::MAX };
+    let Some(fill) = fill.filter(|f| f.budget > 0) else {
+        return pc;
+    };
+    let band = fill.budget / 100 * DETAIL_BAND_PCT;
+    let depth = fill.depth(percent, headroom, band);
+    if depth == 0 || band == 0 {
+        return pc;
+    }
+    let steps = DETAIL_SIDES.len() as u64;
+    let step = (u128::from(depth) * u128::from(steps) / u128::from(band)).min(u128::from(steps - 1)) as usize;
+    DETAIL_SIDES[step].min(pc)
+}
+
+/// Where the card stands now ([`CardFill`]), from `memory`.
+#[cfg(windows)]
+fn card_fill(memory: Option<[u64; 4]>) -> Option<CardFill> {
+    let [budget, used, ..] = memory?;
+    Some(CardFill {
+        budget,
+        used,
+        free_blocks: crate::pool::texture_room(),
+        kept: crate::shadow::card_room_kept() + targets_room_kept(),
+    })
+}
+
+/// [`detail_side_in`] for the card and the PC now.
+#[cfg(windows)]
+pub(crate) fn detail_side(memory: Option<[u64; 4]>) -> u64 {
+    let detail = detail();
+    if detail == Detail::Off {
+        return u64::MAX;
+    }
+    let pc_short = detail == Detail::CardAndPc && crate::host::commit::critical();
+    detail_side_in(detail, card_fill(memory), room_percent(), card_headroom(), pc_short)
+}
+
+/// The share of the card's budget, in hundredths, kept free under what
+/// [`room`] lets the texture queue fill by the system's own count of our use
+/// (`VICTORY_CARD_HEADROOM_PCT`, 0 to 20; unset: 4 on a card whose budget is
+/// 8 GiB or less, else 0; 0: none, as before).
+///
+/// The queue's own measure counts what our blocks of textures have free as
+/// free, and that was hundreds of MB, up to about a gigabyte, of a card of
+/// 8 GB (pieces given back rest before they are used again; a large texture
+/// fits no hole left): with the queue at its line of nine tenths, the system counted our
+/// use at or past the whole budget, by a few hundred MB. Past it the system
+/// moves our memory out of the card, and making new memory resident waited
+/// for that (over a second at times). With the headroom the queue stops before
+/// that whichever count says so first.
+#[cfg(any(windows, test))]
+fn card_headroom_for(set: Option<&str>, budget: Option<u64>) -> u64 {
+    match set.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(pct) => pct.min(20),
+        None if budget.is_some_and(|b| b > 0 && b <= 8 << 30) => 4,
+        None => 0,
+    }
+}
+
+/// [`card_headroom_for`] for this card, read once.
+#[cfg(windows)]
+fn card_headroom() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        let set = std::env::var("VICTORY_CARD_HEADROOM_PCT").ok();
+        card_headroom_for(set.as_deref(), crate::host::host().and_then(|h| h.video_memory()).map(|m| m[0]))
+    })
+}
+
+/// The most bytes of a texture whose new host copy the texture queue makes
+/// while the card has no room, whole, when no copy of its smallest levels
+/// can be (`VICTORY_SMALL_WHEN_FULL_KB`; unset: 64 on a card whose budget is
+/// 8 GiB or less, else 0; 0: none, they wait, as before). A copy of
+/// [`tail_only`]'s needs a texture of more than 64 texels a side and of
+/// more than one level: the small ones, and those of one level, waited for
+/// room however few bytes they were, and read zeros meanwhile. Such copies
+/// are as small as those of [`tail_only`]: of 64 KiB, a 128x128 texture of 4
+/// bytes a texel.
+#[cfg(any(windows, test))]
+fn small_when_full_for(set: Option<&str>, budget: Option<u64>) -> u64 {
+    match set.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(kb) => kb.min(1024) << 10,
+        None if budget.is_some_and(|b| b > 0 && b <= 8 << 30) => 64 << 10,
+        None => 0,
+    }
+}
+
+/// [`small_when_full_for`] for this card, read once.
+#[cfg(windows)]
+pub(crate) fn small_when_full() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let set = std::env::var("VICTORY_SMALL_WHEN_FULL_KB").ok();
+        small_when_full_for(set.as_deref(), crate::host::host().and_then(|h| h.video_memory()).map(|m| m[0]))
+    })
+}
+
+/// The bytes of title memory texture object `this` takes (its console
+/// layout's); `None` for a buffer.
+#[cfg(windows)]
+pub(crate) fn texture_bytes(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    footprint(&r.desc).map(|f| f.size)
+}
+
+/// Whether the sweep cuts host copies that slots hold and nothing used for
+/// a while down to the levels the card can afford ([`cut_idle`],
+/// `VICTORY_TEXTURE_CUT`; unset: as [`detail`] is on; `0`: never, as
+/// before).
+///
+/// A copy a slot shows is never let go (a shader may read it by index at any
+/// time, and the slot keeps it), so on a full card the copies made whole
+/// while there was room stayed whole, and the new ones waited. Cut down, a
+/// copy of 4096 texels a side to 512 takes a sixty-fourth of its bytes, and
+/// the slot shows it blurred instead of another texture missing.
+#[cfg(windows)]
+fn cut_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_TEXTURE_CUT").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some(_) => true,
+        None => detail_for(
+            std::env::var("VICTORY_TEXTURE_DETAIL").ok().as_deref(),
+            crate::host::host().and_then(|h| h.video_memory()).map(|m| m[0]),
+        ) != Detail::Off,
+    })
+}
+
+/// The fewest texels a side the sweep cuts a copy down to ([`cut_idle`]):
+/// the band's last step is for new copies; one shown already keeps more.
+#[cfg(any(windows, test))]
+const CUT_SIDE_LEAST: u64 = 256;
+
+/// The most copies one look of the sweep cuts down: each is uploaded again.
+#[cfg(windows)]
+const CUTS_A_LOOK: usize = 64;
+
+/// The side the sweep cuts copies down to now (`u64::MAX`: none):
+/// [`detail_side`], at least [`CUT_SIDE_LEAST`].
+#[cfg(windows)]
+fn cut_side(memory: Option<[u64; 4]>) -> u64 {
+    if !cut_on() {
+        return u64::MAX;
+    }
+    match detail_side(memory) {
+        u64::MAX => u64::MAX,
+        side => side.max(CUT_SIDE_LEAST),
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// While the pass over textures picked by index works on a slot with
+    /// the card in the band below its line ([`detail_side`], [`DetailCap`]):
+    /// the most texels a side the first level of a host copy of a placed
+    /// texture made on this thread has (`u64::MAX`: no bound).
+    static CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// Sets [`CAP`] on this thread while it lives, and gives it back what it was
+/// then.
+#[cfg(windows)]
+pub(crate) struct DetailCap(u64);
+
+#[cfg(windows)]
+impl DetailCap {
+    pub(crate) fn new(side: u64) -> DetailCap {
+        DetailCap(CAP.replace(side))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DetailCap {
+    fn drop(&mut self) {
+        CAP.set(self.0);
+    }
+}
+
+/// The least [`CAP`] slots were held at since they were last let out
+/// ([`held_at`], [`release_held`]): 0 for slots held without a copy.
+#[cfg(windows)]
+static HELD_UNDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A slot is held by the texture pass while new copies have at most `side`
+/// texels a side (0: it has no copy).
+#[cfg(windows)]
+pub(crate) fn held_at(side: u64) {
+    HELD_UNDER.fetch_min(side, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a pass with room lets the held slots out now (as it did at every
+/// pass with room with [`detail`] off): when copies may have more levels
+/// now than when some slot was held. Each such slot is looked at, which
+/// costs a look at its memory: in the band the same few thousand were
+/// otherwise looked at again at every pass.
+#[cfg(windows)]
+pub(crate) fn release_held(side: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if detail() == Detail::Off {
+        return true;
+    }
+    let under = HELD_UNDER.load(Relaxed);
+    if side > under {
+        HELD_UNDER.store(u64::MAX, Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Since the start: host copies made with fewer levels for the band
+/// ([`CAP`]) and their bytes; host copies cut down by the sweep
+/// ([`cut_idle`]) and the bytes those had; new copies of small textures made
+/// while the card had no room ([`small_when_full`]).
+#[cfg(windows)]
+pub(crate) static DETAILED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Says, at most every five seconds, how textures picked by index are made
+/// on a card that fills ([`detail`]): the side new copies have at most now
+/// (`side`, `room`: the pass's), and since the start what [`DETAILED`]
+/// counts; `rechecks`: slots of the queue uploaded whole and waiting for a
+/// look by fingerprint (`descriptor/host.rs` `TextureQueue::census`).
+#[cfg(windows)]
+pub(crate) fn detail_line(side: u64, room: bool, rechecks: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::coarse_ms();
+    let last = SAID.load(Relaxed);
+    if now < last.saturating_add(5000) || SAID.compare_exchange(last, now.max(1), Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let [made, bytes, cut, cut_bytes, small] = [0, 1, 2, 3, 4].map(|i| DETAILED[i].load(Relaxed));
+    let now_side = match (room, side) {
+        (false, _) => format!("their smallest levels only ({TAIL_SIDE} texels a side)"),
+        (true, u64::MAX) => "every level".to_owned(),
+        (true, side) => format!("{side} texels a side at most"),
+    };
+    tracing::info!(
+        "textures picked by index on a filling card (VICTORY_TEXTURE_DETAIL): new host copies now of {now_side}; since \
+         the start {made} made with fewer levels ({} MB), {cut} cut down while idle ({} MB before; VICTORY_TEXTURE_CUT), \
+         {small} small ones made while the card had no room (VICTORY_SMALL_WHEN_FULL_KB); {rechecks} slots of the queue \
+         uploaded and waiting for a look at their memory",
+        bytes >> 20,
+        cut_bytes >> 20
+    );
 }
 
 /// The level a host copy of only the smallest levels of a texture of `desc`
@@ -1548,6 +1955,13 @@ pub(crate) fn want_level(this: This, first: u32) {
     // Of only the smallest levels, for a card without room ([`tail_only`]):
     // so while the pass that made it finds none.
     if host.tail && TAIL.get() {
+        return;
+    }
+    // Of fewer levels for a card in the band below its line ([`detail`]),
+    // or cut down by the sweep: replaced only by one with more levels than
+    // it has, as the band allows now (the one made next is of those).
+    let side = CAP.get();
+    if host.tail && side != u64::MAX && side_base(&r.desc, first, side) >= host.base {
         return;
     }
     if host.tail {
@@ -1936,6 +2350,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         let mut tail = false;
+        let (mut detailed, mut smallest) = (false, false);
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
@@ -1949,8 +2364,24 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if TAIL.get() && !r.host.grown.load(Relaxed) {
                 let small = tail_base(&r.desc, if first == u32::MAX { 0 } else { first });
                 if small > base {
-                    (base, tail) = (small, true);
+                    (base, tail, smallest) = (small, true, true);
                 }
+            }
+            // Fewer levels while the card is in the band below its line
+            // ([`detail`]), in the place of a copy with fewer still too:
+            // `want_level` replaced that one only because this side gives
+            // more than it had.
+            let side = CAP.get();
+            if side != u64::MAX {
+                let fewer = side_base(&r.desc, if first == u32::MAX { 0 } else { first }, side);
+                if fewer > base {
+                    (base, tail, detailed, smallest) = (fewer, true, true, false);
+                }
+            }
+            // As the sweep cut the last one down ([`cut_idle`]).
+            let cut = r.host.cut.swap(0, Relaxed);
+            if cut > base && cut < u32::from(r.desc.mip_levels) {
+                (base, tail, detailed, smallest) = (cut, true, false, false);
             }
         }
         let texture = match texture {
@@ -2010,7 +2441,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
         }
-        if tail {
+        if detailed {
+            DETAILED[0].fetch_add(1, Relaxed);
+            DETAILED[1].fetch_add(host.bytes, Relaxed);
+        }
+        if smallest {
             let n = TAILS[0].fetch_add(1, Relaxed) + 1;
             let bytes = TAILS[1].fetch_add(host.bytes, Relaxed) + host.bytes;
             if n == 1 || n.is_multiple_of(2000) {
@@ -2097,15 +2532,13 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if filled < floor {
         return true;
     }
-    match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // scene makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
+    // What is kept for card copies of title buffers not made yet
+    // (`crate::shadow::card_room_kept`) and for the render targets a scene
+    // makes in its first frame ([`targets_room_kept`]) counts as used; with
+    // a headroom ([`card_headroom`]) the system's own count of our use is
+    // held under its line too.
+    match card_fill(memory) {
+        Some(fill) => fill.room(room_percent(), card_headroom()),
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -2507,8 +2940,69 @@ pub(crate) fn let_go_idle() {
     };
     match let_go_slice_ms() {
         0 => let_go_whole(idle_ms, most),
-        ms => let_go_sliced(idle_ms, most, ms),
+        // (Copies slots hold are cut down by this way only.)
+        ms => let_go_sliced(idle_ms, most, ms, if most == u64::MAX { u64::MAX } else { cut_side(memory) }),
     }
+}
+
+/// Of title texture `r` (at `at`), cuts the host copy down to its levels of
+/// at most `side` texels a side if it may be: the title places and fills it,
+/// nothing used it for `idle_ms` and four frames, no list holds it, a slot
+/// does (one nothing holds goes whole, [`take_idle`]), and it has larger
+/// levels than that. The copy goes as one replaced by `want_level` goes: the
+/// slots that show it go on showing it, its texture's slots are due in the
+/// texture pass (`crate::descriptor::host::remapped`), which makes the next
+/// copy from the level cut to ([`Hosted::cut`]) and uploads it, and the
+/// slots are made from that one once the upload has run (`grown`). Returns
+/// the bytes the copy had.
+/// shortcut: a slot's texture that shaders read by index is "used" when the
+/// pass or a draw asks for it, not when a shader reads it: one on screen
+/// may be cut too. Those idle longest go first.
+#[cfg(windows)]
+fn cut_idle(r: &Resource, at: usize, idle_ms: u64, side: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_FRAMES: u64 = 4;
+    const TEXTURE_2D: u32 = 3;
+    let desc = &r.desc;
+    if side == u64::MAX
+        || !held_only()
+        || !r.host.placed.load(Relaxed)
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.mip_levels <= 1
+        || desc.sample_count > 1
+    {
+        return None;
+    }
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let (host, _) = made.as_ref()?;
+    if host.tiled.is_some()
+        || !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+        || std::sync::Arc::strong_count(host) != 1
+        || crate::host::references(&host.texture) <= 1
+        || alias_of(at as This).is_some()
+    {
+        return None;
+    }
+    let first = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(0);
+    let cut = side_base(desc, first, side);
+    if cut <= host.base {
+        return None;
+    }
+    let bytes = host.bytes;
+    crate::texture::unstage(at as This);
+    r.host.cut.store(cut, Relaxed);
+    r.host.grown.store(true, Relaxed);
+    let old = made.take()?;
+    drop(made);
+    REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+    // Its slots are looked at again by the next pass, which makes the copy.
+    let span = footprint(desc).map_or(0, |f| f.size);
+    crate::descriptor::host::remapped(r.data() as usize, span as usize);
+    DETAILED[2].fetch_add(1, Relaxed);
+    DETAILED[3].fetch_add(bytes, Relaxed);
+    Some(bytes)
 }
 
 /// Whether [`let_go_idle`] counts the room the texture queue keeps for card
@@ -2577,9 +3071,11 @@ fn walk_from(
 /// those it found idle lets the longest idle go first up to `most` bytes
 /// (the whole look sorted them all). It gives host copies of their own
 /// memory that the title fills their residency hints on the way
-/// (`crate::host::residency`).
+/// (`crate::host::residency`). Short of `most` then, it cuts idle copies
+/// that slots hold down to `cut_side` texels a side ([`cut_idle`];
+/// `u64::MAX`: none), the longest idle first.
 #[cfg(windows)]
-fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64) {
+fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2623,6 +3119,7 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64) {
         if most != u64::MAX {
             idle.sort_unstable();
         }
+        let mut held = Vec::new();
         for (_, at) in idle {
             if bytes >= most {
                 break;
@@ -2634,6 +3131,25 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64) {
                 bytes += host.bytes;
                 first.get_or_insert(at);
                 crate::host::retire(host);
+            } else {
+                held.push(at);
+            }
+        }
+        // Still short: what slots hold is cut down (`VICTORY_TEXTURE_CUT`),
+        // a few at a time (each is made and uploaded again).
+        if cut_side != u64::MAX {
+            let (mut cuts, mut cut_bytes) = (0, 0);
+            for at in held {
+                if bytes + cut_bytes >= most || cuts >= CUTS_A_LOOK {
+                    break;
+                }
+                // SAFETY: as above.
+                let r = unsafe { &*(at as *const Resource) };
+                if let Some(had) = cut_idle(r, at, idle_ms, cut_side) {
+                    cuts += 1;
+                    // (What is left of it is a few hundredths of that.)
+                    cut_bytes += had;
+                }
             }
         }
         // The hints of those that stay (after the letting go: a texture held
@@ -3225,7 +3741,8 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident(&host.device, t, crate::host::NewMemory::Texture)
+            .and_then(|()| crate::host::mapped(&host.device, crate::host::NewMemory::Texture))
     {
         // No room to make it resident is no memory for it too, for the
         // commit guard as for [`texture_retry`] (upstream 4e95a78).
@@ -3390,6 +3907,7 @@ fn hand_out_resource(
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
             residency: std::sync::atomic::AtomicU8::new(NOT_OWN),
+            cut: std::sync::atomic::AtomicU32::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -4238,6 +4756,227 @@ mod tests {
         assert_eq!((more.tail, more.base, d.Width, d.MipLevels), (false, 0, 256, 9));
         assert!(more.serial != small.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!tail_copy(texture));
+    }
+
+    /// The switches of the policy for a full card: on by default on a card
+    /// of 8 GiB or less only, and `0` is the old behaviour everywhere.
+    #[test]
+    fn the_full_card_policy_is_on_by_default_on_small_cards_only() {
+        const GIB: u64 = 1 << 30;
+        let small = Some(7 * GIB);
+        let large = Some(16 * GIB);
+        assert_eq!(detail_for(None, small), Detail::CardAndPc);
+        assert_eq!(detail_for(None, Some(8 * GIB)), Detail::CardAndPc);
+        assert_eq!(detail_for(None, large), Detail::Off);
+        assert_eq!(detail_for(None, None), Detail::Off);
+        assert_eq!(detail_for(Some("0"), small), Detail::Off);
+        assert_eq!(detail_for(Some("card"), large), Detail::Card);
+        assert_eq!(detail_for(Some("1"), large), Detail::CardAndPc);
+        assert_eq!(card_headroom_for(None, small), 4);
+        assert_eq!(card_headroom_for(None, large), 0);
+        assert_eq!(card_headroom_for(Some("0"), small), 0);
+        assert_eq!(card_headroom_for(Some("50"), large), 20);
+        assert_eq!(small_when_full_for(None, small), 64 << 10);
+        assert_eq!(small_when_full_for(None, large), 0);
+        assert_eq!(small_when_full_for(Some("0"), small), 0);
+        assert_eq!(small_when_full_for(Some("128"), large), 128 << 10);
+    }
+
+    /// The queue's room: its own measure (our blocks' free bytes count as
+    /// free) under its line as before, and with a headroom the system's own
+    /// count under the budget less it too.
+    #[test]
+    fn the_queue_stops_short_of_the_budget_by_either_count() {
+        const MIB: u64 = 1 << 20;
+        let fill = |used: u64, free_blocks: u64, kept: u64| CardFill { budget: 7000 * MIB, used, free_blocks, kept };
+        // Under 90 % by the queue's measure: room without a headroom...
+        let blocky = fill(6900 * MIB, 700 * MIB, 0);
+        assert!(blocky.room(90, 0));
+        // ...but by the system's own count 98.6 %: none with 4 % kept.
+        assert!(!blocky.room(90, 4));
+        assert!(fill(6000 * MIB, 700 * MIB, 0).room(90, 4));
+        // What is kept for later counts by both.
+        assert!(!fill(6000 * MIB, 0, 400 * MIB).room(90, 4));
+        assert!(!fill(6400 * MIB, 0, 0).room(90, 0));
+    }
+
+    /// New copies lose a level a step across the band below the line, and
+    /// none under it; the PC's shortage bounds them too.
+    #[test]
+    fn new_copies_have_fewer_levels_the_closer_the_card_is_to_its_line() {
+        const MIB: u64 = 1 << 20;
+        let budget = 10_000 * MIB;
+        let at = |used: u64| Some(CardFill { budget, used: used * MIB, free_blocks: 0, kept: 0 });
+        let side = |used: u64, pc: bool| detail_side_in(Detail::CardAndPc, at(used), 90, 0, pc);
+        // The line is 9,000 MB, the band 1,000 MB below it.
+        assert_eq!(side(7999, false), u64::MAX);
+        assert_eq!(side(8000, false), u64::MAX);
+        assert_eq!(side(8001, false), 2048);
+        assert_eq!(side(8250, false), 1024);
+        assert_eq!(side(8500, false), 512);
+        assert_eq!(side(8700, false), 256);
+        assert_eq!(side(8850, false), 128);
+        assert_eq!(side(9500, false), 128);
+        assert_eq!(side(1000, true), PC_SHORT_SIDE);
+        assert_eq!(side(8700, true), 256);
+        assert_eq!(detail_side_in(Detail::Card, at(1000), 90, 0, true), u64::MAX);
+        assert_eq!(detail_side_in(Detail::Off, at(8700), 90, 0, true), u64::MAX);
+        // With a headroom, the system's count of 9,300 MB (the queue's 8,000)
+        // is near its line of 9,600.
+        let blocks = Some(CardFill { budget, used: 9300 * MIB, free_blocks: 1300 * MIB, kept: 0 });
+        assert_eq!(detail_side_in(Detail::Card, blocks, 90, 0, false), u64::MAX);
+        assert_eq!(detail_side_in(Detail::Card, blocks, 90, 4, false), 256);
+        // A side's first level: of a 4096 texture, at 512, level 3.
+        assert_eq!(side_level(4096, 4096, 13, 512), 3);
+        assert_eq!(side_level(4096, 1024, 13, 2048), 1);
+        assert_eq!(side_level(256, 256, 9, 2048), 0);
+        assert_eq!(side_level(4096, 4096, 13, TAIL_SIDE), tail_level(4096, 4096, 13));
+    }
+
+    /// More textures than fit a made-up budget, as the pass over textures
+    /// picked by index makes them: every one gets a host copy, of fewer
+    /// levels the fuller the card, of its smallest levels once the queue
+    /// has no room; each copy holds the levels it says from its first on;
+    /// the card's use stays under the budget; and with room again each is
+    /// replaced by one of every level, and the slot shows those.
+    #[cfg(windows)]
+    #[test]
+    fn more_textures_than_fit_all_get_copies_and_more_levels_later() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        const MIB: u64 = 1 << 20;
+        const TEXTURES: usize = 48;
+        // 1024x1024 BC7, eleven levels, 4 KiB blocks: 1.4 MB each whole.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // The made-up card: whole copies of all would be three times its
+        // budget, of which the rest of the run holds a tenth.
+        let budget = whole * TEXTURES as u64 / 3;
+        let others = budget / 10;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize * TEXTURES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        let mut copies = Vec::new();
+        let mut used = others;
+        for i in 0..TEXTURES {
+            let texture = texture_at(at as u64 + i as u64 * whole, &desc).unwrap();
+            let fill = CardFill { budget, used, free_blocks: 0, kept: 0 };
+            let room = fill.room(90, 4);
+            let side = if room { detail_side_in(Detail::Card, Some(fill), 90, 4, false) } else { u64::MAX };
+            let _tail = TailOnly::new(!room);
+            let _fewer = DetailCap::new(side);
+            want_level(texture, 0);
+            let copy = host_copy(texture).expect("every texture gets a host copy");
+            // SAFETY: a live texture.
+            let d = unsafe { copy.texture.GetDesc() };
+            let expected = match (room, side) {
+                (false, _) => tail_level(1024, 1024, 11),
+                (true, u64::MAX) => 0,
+                (true, side) => side_level(1024, 1024, 11, side),
+            };
+            assert_eq!(copy.base, expected, "texture {i}: room {room}, side {side}");
+            assert_eq!((d.Width, u32::from(d.MipLevels)), (1024 >> expected, 11 - expected), "texture {i}");
+            assert_eq!(copy.tail, expected > 0);
+            used += copy.bytes;
+            copies.push((texture, copy));
+        }
+        let bases: Vec<u32> = copies.iter().map(|(_, c)| c.base).collect();
+        assert!(bases.windows(2).all(|b| b[0] <= b[1]), "fewer levels as the card fills: {bases:?}");
+        assert!(bases[0] == 0 && *bases.last().unwrap() == tail_level(1024, 1024, 11), "{bases:?}");
+        assert!(bases.iter().any(|&b| b > 0 && b < tail_level(1024, 1024, 11)), "levels between: {bases:?}");
+        assert!(used < budget, "{} MB of a budget of {} MB", used / MIB, budget / MIB);
+        // Room again: each reduced one gives way to one of every level.
+        let grown_before = HELD[2].load(Relaxed);
+        for (texture, old) in &copies {
+            if old.base == 0 {
+                continue;
+            }
+            let _tail = TailOnly::new(false);
+            let _fewer = DetailCap::new(u64::MAX);
+            want_level(*texture, 0);
+            let more = host_copy(*texture).unwrap();
+            // SAFETY: a live texture.
+            let d = unsafe { more.texture.GetDesc() };
+            assert_eq!((more.base, more.tail, d.Width, d.MipLevels), (0, false, 1024, 11));
+            assert!(more.serial != old.serial && more.grown.load(Relaxed));
+        }
+        assert!(HELD[2].load(Relaxed) > grown_before);
+        // A copy of 512 texels a side asked for more while the band allows
+        // only that much: kept; once it allows 1024, replaced by one of those.
+        let (texture, _) = copies[0];
+        let cut = side_level(1024, 1024, 11, 512);
+        // As the sweep cuts it (`cut_idle`), without a slot here.
+        resource(texture).host.cut.store(cut, Relaxed);
+        {
+            let made = resource(texture).host.made.lock().unwrap().take();
+            REPLACED.lock().unwrap().push((crate::host::moment(), made.unwrap()));
+        }
+        let small = host_copy(texture).unwrap();
+        assert_eq!((small.base, small.tail), (cut, true));
+        {
+            let _fewer = DetailCap::new(512);
+            want_level(texture, 0);
+            assert_eq!(host_copy(texture).unwrap().serial, small.serial);
+        }
+        {
+            let _fewer = DetailCap::new(1024);
+            want_level(texture, 0);
+            let more = host_copy(texture).unwrap();
+            assert_eq!((more.base, more.tail), (0, false), "1024 a side is all of it");
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The sweep cuts a whole copy a slot holds down to the levels the card
+    /// affords once nothing used it for a while: the slot keeps the old one
+    /// until it is made again, and the next copy holds those levels only. A
+    /// copy no slot holds, or one used lately, it leaves alone.
+    #[cfg(windows)]
+    #[test]
+    fn an_idle_copy_a_slot_holds_is_cut_down() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        // 1024x1024 BC7, eleven levels, 4 KiB blocks.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let held = texture_at(at as u64, &desc).unwrap();
+        let free = texture_at(at as u64 + whole, &desc).unwrap();
+        let (held_copy, free_copy) = (host_copy(held).unwrap(), host_copy(free).unwrap());
+        assert_eq!((held_copy.base, free_copy.base), (0, 0));
+        // A slot shows the first: it holds its texture.
+        let slot = held_copy.texture.clone();
+        let serial = held_copy.serial;
+        drop((held_copy, free_copy));
+        let side = 256;
+        for _ in 0..4 {
+            crate::frame::test_advance();
+        }
+        // No slot holds it: the sweep lets that one go whole, not here.
+        assert!(cut_idle(resource(free), free as usize, 0, side).is_none());
+        let cuts = DETAILED[2].load(Relaxed);
+        assert!(cut_idle(resource(held), held as usize, 0, side).is_some_and(|had| had > 0));
+        assert!(DETAILED[2].load(Relaxed) > cuts);
+        assert!(made_copy(held).is_none(), "the old copy is out; the slot holds its texture");
+        assert!(crate::host::references(&slot) >= 1);
+        let level = side_level(1024, 1024, 11, side);
+        let cut = host_copy(held).unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { cut.texture.GetDesc() };
+        assert_eq!((cut.base, cut.tail, d.Width, u32::from(d.MipLevels)), (level, true, 1024 >> level, 11 - level));
+        assert!(cut.serial != serial && cut.grown.load(Relaxed), "its slots are made from it after its upload");
+        // Down already: not again.
+        drop(cut);
+        assert!(cut_idle(resource(held), held as usize, 0, side).is_none());
+        drop(slot);
     }
 
     /// `texture_at` from eight threads, four of them through what readers

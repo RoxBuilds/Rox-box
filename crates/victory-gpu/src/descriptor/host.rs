@@ -1117,12 +1117,20 @@ impl TextureQueue {
 
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+    /// part; the frames the oldest due one has waited since its write; and
+    /// uploaded whole, waiting for a look by fingerprint
+    /// ([`TextureQueue::recheck`]).
+    /// (Those last ones were counted as waiting for their memory: a look by
+    /// fingerprint is noted as one look. On a full card they were most of
+    /// the ten thousand "waiting", every slot whose pages the title shows at
+    /// other addresses too among them for good.)
+    fn census(&self, frame: u64) -> [u64; 6] {
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
+            } else if w.checked.2 != 0 {
+                c[5] += 1;
             } else if w.looks > 0 {
                 c[2] += 1;
             }
@@ -2008,7 +2016,7 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
@@ -5746,7 +5754,7 @@ mod tests {
         };
         for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
             let v = view(start + off, raw);
-            assert_eq!(width(&v), len.next_multiple_of(256));
+            assert_eq!(width(&v), crate::shadow::exact_width(len));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
         }
@@ -5758,7 +5766,7 @@ mod tests {
         assert_eq!((address, bytes), (start + 456, 4 * 456));
         if victory_shader::emit::raw_views() == 0 {
             assert_eq!(copy.span(), (address, bytes));
-            assert_eq!(width(&v), bytes.next_multiple_of(256));
+            assert_eq!(width(&v), crate::shadow::exact_width(bytes));
             eprintln!("a structured view off 16 bytes without raw twins: made on a copy of its own bytes");
         } else {
             assert_ne!(copy.span().0, address, "its buffer's copy");
@@ -5789,7 +5797,7 @@ mod tests {
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8, 0]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
@@ -5877,6 +5885,9 @@ mod tests {
         // Slot 30 was uploaded whole once and is looked at by fingerprint.
         q.recheck(30, write(30), 2, (0x1000, 0x4000), 77, 0, 1);
         assert!(q.checked(30).is_some());
+        // Uploaded and waiting for its look: not a slot waiting for its
+        // memory.
+        assert_eq!((q.census(1)[2], q.census(1)[5]), (0, 1));
         // The card has no room: its new host copy holds the smallest levels.
         q.tail(30, write(30), 250);
         q.tail(31, write(31), 250);
