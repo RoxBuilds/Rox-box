@@ -1807,6 +1807,60 @@ mod tests {
         }
     }
 
+    /// Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`) are
+    /// placeholders to the host: their bytes are read from their pages,
+    /// beside memory read as before and memory that is not there (zeros),
+    /// and they count as committed.
+    #[test]
+    fn views_in_the_books_alone_are_read_from_their_pages() {
+        use crate::watch::test_books::{IN_BOOKS, books};
+        use windows_sys::Win32::System::Memory::*;
+        const K: usize = 64 << 10;
+        let _views = crate::test_views_lock();
+        books();
+        let (pages, more) = (vec![0x22u8; K], vec![0x33u8; K]);
+        // SAFETY: a reservation of ours, of which the first block is
+        // committed and written; the second and the fourth are views in the
+        // books, the third is not there.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4 * K, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!at.is_null());
+            assert!(!VirtualAlloc(at.cast(), K, MEM_COMMIT, PAGE_READWRITE).is_null());
+            at.write_bytes(0x11, K);
+            let views = [(at as usize + K, K, pages.as_ptr() as usize), (at as usize + 3 * K, K, more.as_ptr() as usize)];
+            IN_BOOKS.lock().unwrap().extend(views);
+            let expected = |from: usize| match from / K {
+                0 => 0x11,
+                1 => 0x22,
+                3 => 0x33,
+                _ => 0,
+            };
+            // All there, from inside a page into the view in the books.
+            let mut out = vec![0xeeu8; 2 * K - 0x300];
+            assert!(super::read_into(at.add(0x300), &mut out));
+            assert!(out.iter().enumerate().all(|(i, &b)| b == expected(i + 0x300)));
+            // Over the block that is not there: no whole read; the copy has
+            // zeros there and the bytes around it, the views' from the pages.
+            let mut out = vec![0xeeu8; 4 * K];
+            assert!(!super::read_into(at, &mut out));
+            let mut out = vec![0xeeu8; 4 * K - 54];
+            super::copy_mapped(out.as_mut_ptr(), at.add(27), 4 * K - 54, false);
+            for (i, &b) in out.iter().enumerate() {
+                assert_eq!(b, expected(i + 27), "byte {:#x}", i + 27);
+            }
+            let mut out = vec![0xeeu8; 4 * K];
+            assert_eq!(super::read_there(at, &mut out), 3 * K);
+            assert!(out.iter().enumerate().all(|(i, &b)| b == expected(i)));
+            // Committed, as far as the title goes; the hole is not.
+            assert!(crate::texture::committed(at, 2 * K));
+            assert!(crate::texture::committed(at.add(K + 5), K - 5));
+            assert!(!crate::texture::committed(at, 3 * K));
+            assert!(crate::texture::committed(at.add(3 * K), K));
+            IN_BOOKS.lock().unwrap().retain(|view| !views.contains(view));
+            assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -3357,6 +3411,12 @@ pub(crate) fn scratch_census() -> ScratchCensus {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn send_spare() -> u64 {
     send::spare_bytes()
+}
+
+/// For the run report: the bytes of sends' memory kept (`None` while it is
+/// in use).
+pub(crate) fn report_send_spare() -> Option<u64> {
+    send::report_spare()
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -5449,6 +5509,46 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// Whether a submission sent ahead begins the round of the heaps' records
+/// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the submission
+/// lock, before the steps done on the card are planned and flights are
+/// looked at (`VICTORY_HEAP_SYNC_FIRST=1`; off by default: after them, as
+/// before). Ported from trustno1-coder/VIctory-NVIDIA 66f7e54.
+///
+/// The submitting thread waits for that round at the end of its preparing,
+/// while the planning ahead of the round's start can take milliseconds a
+/// frame: begun first, the round runs beside it. What changes is when the
+/// round reads the heaps' pages: earlier, by the planning's time. A record
+/// the title writes for this submission after submitting it (which the
+/// console's card could miss as well) is left to the next round. A
+/// submission that waited for flights to land begins another round after
+/// the wait, as the round begun first may not have seen what they landed.
+/// Off by default: it changes when records are read; only a run says what it
+/// saves (the heaps' records line's "ms waited for").
+fn heap_sync_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_FIRST"))
+}
+
+/// With [`heap_sync_first`], since the last frame line: submissions whose
+/// round of the heaps' records was begun first, and those that began another
+/// after a wait for flights.
+static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The frame line's of [`HEAP_SYNC_FIRST`] (and the run report's
+/// `heap_rounds_begun_first`).
+fn heap_sync_first_line(frames: f64) {
+    let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed));
+    crate::runreport::spared(victory_pipeline::report::Figure::SparedRoundsFirst, first);
+    let [first, again] = [first as f64 / frames, again as f64 / frames];
+    if first + again > 0.0 {
+        tracing::info!(
+            "the heaps' records begun as a submission took the lock, per frame (VICTORY_HEAP_SYNC_FIRST=1): {first:.1}, and \
+             {again:.1} begun again after a wait for flights"
+        );
+    }
+}
+
 /// See [`HostList::defer_gpu_write`].
 fn declare_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -7450,6 +7550,12 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // The round of the heaps' records asked for when the title submitted
+        // these lists, if that is known (`crate::heap_marks`; 0: not).
+        let heaps_mark = if late { crate::heap_marks::needed() } else { 0 };
+        // Else with [`heap_sync_first`]: the heaps' records begun now, beside
+        // the planning of steps done on the card and the look at flights.
+        let first_heaps = (late && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -7463,11 +7569,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -7481,8 +7589,29 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        // command lists that index those slots are submitted. (Begun first,
+        // [`heap_sync_first`]: begun again after a wait for flights, whose
+        // landings wrote title memory after the first began; the first is
+        // then not waited for. With a mark, `crate::heap_marks`: that round,
+        // unless the submission waited for flights, as before.)
+        let heaps_synced = match first_heaps {
+            Some(first) if !waited_for_flights => {
+                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                first
+            }
+            first => {
+                if let Some(first) = first {
+                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                    // (Its round still runs; nothing waits for it.)
+                    first.forget();
+                }
+                if heaps_mark != 0 && !waited_for_flights {
+                    crate::descriptor::begin_sync_heaps_after(heaps_mark)
+                } else {
+                    crate::descriptor::begin_sync_heaps()
+                }
+            }
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -7662,7 +7791,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        if crate::heap_marks::on() {
+            crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -9080,6 +9213,17 @@ impl HostList {
         }
     }
 
+    /// Shaders of the list write `[address, address + len)` of a host copy
+    /// whose shader writes stay on the card (`VICTORY_WC_NO_BACK`): nothing
+    /// is declared. Whether the range is new to the list, as a declaration of
+    /// it would be, so that it is counted once.
+    pub(crate) fn left_on_card(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) -> bool {
+        // (A copy's address is aligned: with its low bit set the key is no
+        // declaration's.)
+        let key = (std::sync::Arc::as_ptr(shadow) as usize | 1, address, len);
+        self.deferred().gpu_written.insert(key)
+    }
+
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
@@ -9530,6 +9674,11 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    // Into a heap's records: the rounds asked for earlier did
+                    // not see it (`crate::heap_marks`).
+                    if crate::heap_marks::on() && crate::descriptor::in_shader_heap(dst, len) {
+                        crate::heap_marks::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -9556,6 +9705,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::heap_marks::on() && crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::heap_marks::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -9581,6 +9733,10 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // (It may write anywhere, a heap's records too.)
+                        if crate::heap_marks::on() {
+                            crate::heap_marks::prep_wrote();
+                        }
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -10488,7 +10644,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
+        // The kernel writes the destination: it must not be guarded, and it
+        // must be a mapping of the host's (not a view the runtime keeps in
+        // its books alone).
+        crate::watch::materialize(dst as usize, len);
         crate::watch::writing(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
@@ -10533,11 +10692,26 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
+        // A view in the runtime's books alone (`VICTORY_SOFT_VIEWS`) is a
+        // placeholder to the host, which would have it read as zeros: its
+        // bytes come from the pages, and the host is asked only about what
+        // lies before the next such view.
+        let mut plain = remaining;
+        if let Some(soft) = crate::watch::soft() {
+            let (from_pages, n) = (soft.read)(at as usize, to, remaining);
+            if from_pages && n != 0 {
+                offset += n;
+                continue;
+            }
+            if n != 0 {
+                plain = n;
+            }
+        }
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
-            .saturating_sub(at as usize).min(remaining);
+            .saturating_sub(at as usize).min(plain);
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
@@ -10639,6 +10813,37 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`) are
+    // read from their pages, and stay as they are: no view of the host's is
+    // made for our reading. What lies between them is read as before.
+    if let Some(soft) = crate::watch::soft() {
+        let mut done = 0;
+        while done < len {
+            let (at, to) = (src.wrapping_add(done), dst.wrapping_add(done));
+            let (mut from_pages, mut n) = (soft.read)(at as usize, to, len - done);
+            if !from_pages && n != 0 && !read_plain(at, to, n) {
+                // (Made such a view between the question and the read: once
+                // more.)
+                (from_pages, n) = (soft.read)(at as usize, to, len - done);
+                if !from_pages {
+                    return false;
+                }
+            }
+            if n == 0 {
+                return false;
+            }
+            done += n;
+        }
+        return true;
+    }
+    // (The kernel's read does not fault into the handler that maps views the
+    // runtime keeps in its books alone: `VICTORY_LAZY_VIEWS`.)
+    crate::watch::materialize(src as usize, len);
+    read_plain(src, dst, len)
+}
+
+/// [`read`] of memory the host has mapped, or has not.
+fn read_plain(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {
@@ -10683,6 +10888,9 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The kernel's write does not fault into the handler that maps views the
+    // runtime keeps in its books alone.
+    crate::watch::materialize(dst as usize, len);
     let direct = direct_writes();
     let since = crate::watch::changes();
     let write = |at: usize, n: usize| {
@@ -11027,6 +11235,9 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        crate::shadow::wc_line(frames);
+        heap_sync_first_line(frames);
+        crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {

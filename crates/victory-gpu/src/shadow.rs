@@ -25,6 +25,10 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 mod sparse;
+mod wc;
+pub use wc::asked as title_memory_write_combined;
+pub(crate) use wc::freed as write_combined_freed;
+pub(crate) use wc::line as wc_line;
 // (The tiles sparse windows take: `host/tilepool.rs`, named from here so
 // that nothing of `host.rs` changes for it.)
 #[path = "host/tilepool.rs"]
@@ -129,6 +133,9 @@ pub(crate) struct Shadow {
     /// With [`sparse::on`], of a window that is one 4 MiB cell of title
     /// addresses: which of its 64 KiB tiles have memory ([`sparse::Cell`]).
     sparse: Option<sparse::Cell>,
+    /// Whether its title memory is write-combined, as last found
+    /// ([`wc::cached`]; 0: not asked yet).
+    wc: AtomicU64,
 }
 
 /// The pieces memory that is not watched is copied in: 64 KiB, cut at
@@ -3328,6 +3335,43 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// For the run report, in bytes: host copies of title buffers (the bytes
+/// alive less the windows' lengths: an estimate), windows outside buffers
+/// that are not sparse, snapshot buffers kept (their capacity), card sides of
+/// copies, and tiles given to sparse windows. The tables are looked at
+/// without waiting for their locks; a look that finds one held gives what it
+/// found last.
+pub(crate) fn report_memory() -> [u64; 5] {
+    // Windows not sparse, windows in all (their lengths), snapshot buffers.
+    static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    if let Ok(loose) = LOOSE.try_read() {
+        // Each copy once: a window may stand under several keys; those in
+        // place are not counted with the copies (`Shadow::placed`).
+        let mut seen = std::collections::HashSet::new();
+        let (mut plain, mut all) = (0u64, 0u64);
+        for s in loose.values().filter(|s| s.place.is_none() && seen.insert(Arc::as_ptr(s) as usize)) {
+            all += s.len;
+            if s.sparse.is_none() {
+                plain += s.len;
+            }
+        }
+        LAST[0].store(plain, Ordering::Relaxed);
+        LAST[1].store(all, Ordering::Relaxed);
+    }
+    if let Ok(pool) = POOL.try_lock() {
+        LAST[2].store(pool.iter().map(|v| v.capacity() as u64).sum(), Ordering::Relaxed);
+    }
+    [
+        LIVE[1].load(Ordering::Relaxed).saturating_sub(LAST[1].load(Ordering::Relaxed)),
+        LAST[0].load(Ordering::Relaxed),
+        LAST[2].load(Ordering::Relaxed),
+        CARD_BYTES[0].load(Ordering::Relaxed)
+            + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+            + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        sparse::given_now(),
+    ]
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and a title's streaming keeps asking for
 /// new ones: hundreds of windows and gigabytes, growing by half within
@@ -3671,6 +3715,7 @@ impl Shadow {
             place: None,
             plain: 0,
             sparse: None,
+            wc: AtomicU64::new(0),
         }
     }
 
@@ -3704,7 +3749,24 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        // Of write-combined memory, with `VICTORY_WC_NO_BACK=1`: what shaders
+        // write stays on the card, nothing is declared ([`wc`]). (Still
+        // `written`: copies in the lists read it from the card.)
+        if self.leaves_on_card() {
+            if list.left_on_card(self, address as usize, len as usize) {
+                wc::left(len);
+            }
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether what shaders write into this copy stays on the card
+    /// ([`wc::no_back`]).
+    pub(crate) fn leaves_on_card(&self) -> bool {
+        wc::leaves(wc::no_back(), wc::min_bytes(), self.card.is_some(), self.window, self.len, || {
+            wc::cached(&self.wc, self.start, self.len)
+        })
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

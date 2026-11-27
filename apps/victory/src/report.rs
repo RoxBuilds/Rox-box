@@ -94,11 +94,16 @@ const SECTIONS: &[&str] = &[
     "frame_time.steady",
     "frame_time.waits",
     "frame_time.waits.steady",
+    "frame_time.spared",
+    "frame_time.spared.steady",
     "pipelines",
     "shaders",
     "shaders.failures",
     "memory",
     "memory.pressure",
+    "memory.views",
+    "memory.map",
+    "memory.map.peak",
     "textures",
     "unimplemented",
     "selftest",
@@ -771,6 +776,8 @@ pub fn start(cfg: &victory_core::Config) {
     gather_host_facts();
     report::set_platform_dll(platform_dll);
     report::add_sampler(victory_gpu::report_sample);
+    // The runtime's views of title pages (`[memory.views]`).
+    report::add_sampler(victory_hle::modules::xmem::report_sample);
     let _ = report::begin(dir);
 }
 

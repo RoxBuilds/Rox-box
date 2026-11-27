@@ -120,6 +120,8 @@ pub(crate) struct HostHeap {
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
+    /// The bytes of the shader-visible heap ([`HEAP_BYTES`]).
+    heap_bytes: u64,
     sampler: bool,
     /// Where the raw twins of the title's slots start
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
@@ -223,9 +225,35 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed`: a slot is put here, under its own
+    /// lock, before it is noted there, and taken out after it is forgotten
+    /// there (a slot another's view made stale stays, so this says only
+    /// "may"). A write of any other view needs nothing of `placed`
+    /// ([`spans_quick`]).
+    spanned: Slots,
     /// This heap's number ([`NEXT_HEAP`]): dynamic slots go back only to the
     /// heap that took them ([`HostHeap::release_taken`]).
     id: u64,
+}
+
+/// Since the last frame line: writes of slots that left `placed` alone
+/// ([`spans_quick`]), writes that took its lock.
+pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a slot written with no placed texture view leaves the heap's spans
+/// of placed views, and their lock, alone when the slot is not in them
+/// ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=1`; off by default: the lock
+/// is taken for every write, as before).
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 96dfd9b (from
+/// Belobug/VIctory-Belobug-AMD a284ca7, where it is on). Every record the
+/// round of the heaps' records mirrors went by that one lock of the heap,
+/// from all of its threads, with the title's own threads and the texture
+/// passes. What is done is the same: forgetting a slot that is not in the
+/// spans does nothing (`writes_of_other_views_leave_the_spans_as_under_their_lock`).
+fn spans_quick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SPANS_QUICK"))
 }
 
 /// The number of the next host heap made, from 1: a heap made later at the
@@ -1425,6 +1453,16 @@ pub(crate) fn slot_story(slot: u32) -> String {
     .unwrap_or_default()
 }
 
+/// The bytes of the shader-visible heaps the host holds now, for the run
+/// report.
+pub(crate) static HEAP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        HEAP_BYTES.fetch_sub(self.heap_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1741,6 +1779,7 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        HEAP_BYTES.fetch_add(u64::from(size) * u64::from(step), std::sync::atomic::Ordering::Relaxed);
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
             u64::from(size) * u64::from(step),
@@ -1766,6 +1805,7 @@ impl HostHeap {
             step,
             count,
             dynamic: extra,
+            heap_bytes: u64::from(size) * u64::from(step),
             sampler,
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
@@ -1803,6 +1843,7 @@ impl HostHeap {
                 }
                 spans
             },
+            spanned: Slots::new((count + extra) as usize),
             id: NEXT_HEAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -2835,6 +2876,11 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_as(index, view, seen, spans_quick())
+    }
+
+    /// [`HostHeap::note_buffer`], with [`spans_quick`] as `quick` says.
+    fn note_buffer_as(&self, index: u32, view: Option<&View>, seen: bool, quick: bool) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -2871,8 +2917,18 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // (Under the slot's lock, as every write of it: whether it is in
+        // `spanned` changes only here.)
+        let in_spans = |index: u32| {
+            let bit = 1u64 << (index % 64);
+            self.spanned.0.get(index as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        let stale = if quick && placed_view.is_none() && !in_spans(index) {
+            SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            SPANS_QUICK[1].fetch_add(1, Relaxed);
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
@@ -2882,6 +2938,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.spanned.put(index);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -2890,6 +2947,7 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    self.spanned.remove(index);
                     Vec::new()
                 }
             }
@@ -4915,6 +4973,63 @@ impl Copied<'_> {
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
         changed_records(last, &records[..end - at], self.step, first, out);
     }
+
+    /// As [`Copied::changes`] of the `count` records of title memory at
+    /// `title` (slot `first` on), 32 bytes each, read where they are, each
+    /// once ([`crate::safecopy::changed`]; `VICTORY_SYNC_IN_PLACE`); `bits`
+    /// is room for it. False when a page of them could not be read: those
+    /// before it are done, the others stay as last seen. Ported from
+    /// trustno1-coder/VIctory-NVIDIA 769fe52 (from Belobug/VIctory-Belobug-AMD
+    /// 15ab94e).
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]; `title` is title memory, read by a copy that
+    /// fails where a page is not there ([`crate::safecopy::on`] asked).
+    pub(crate) unsafe fn changes_in_place(
+        &self,
+        first: u32,
+        title: *const u8,
+        count: usize,
+        bits: &mut Vec<u64>,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        let at = first as usize * self.step;
+        let count = count.min(self.len.saturating_sub(at) / 32);
+        if self.step != 32 || count == 0 {
+            return true;
+        }
+        bits.clear();
+        bits.resize(count.div_ceil(64), 0);
+        // SAFETY: within the records held; the caller's slots alone.
+        let whole = unsafe { crate::safecopy::changed(title, self.at.add(at), count, bits) };
+        bits_into(first, bits, out);
+        whole
+    }
+
+    /// The `count` records last seen from slot `first` on (fewer where the
+    /// heap ends): after [`Copied::changes_in_place`], the records as read.
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]: no other call beside this one has any of
+    /// these slots.
+    pub(crate) unsafe fn seen(&self, first: u32, count: usize) -> &[u8] {
+        let at = (first as usize * self.step).min(self.len);
+        let len = (count * self.step).min(self.len - at);
+        // SAFETY: within the records held; the caller's slots alone.
+        unsafe { std::slice::from_raw_parts(self.at.add(at), len) }
+    }
+}
+
+/// The slots whose bits are set in `bits` (bit `n` is slot `first + n`), in
+/// order, into `out`.
+fn bits_into(first: u32, bits: &[u64], out: &mut Vec<u32>) {
+    for (n, &word) in bits.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            out.push(first + (n * 64) as u32 + word.trailing_zeros());
+            word &= word - 1;
+        }
+    }
 }
 
 /// The records (`step` bytes each, the first is slot `first`) that differ
@@ -4965,6 +5080,48 @@ mod changed_records_tests {
             out.clear();
             changed_records(&mut last, &now, step, 1000, &mut out);
             assert!(out.is_empty());
+        }
+    }
+
+    /// Records read in place (`VICTORY_SYNC_IN_PLACE`) are found changed
+    /// exactly as by a copy and its compare, and leave the same records last
+    /// seen: for any first slot and count, over rounds of random changes.
+    #[test]
+    fn changes_in_place_finds_what_the_copy_finds() {
+        use super::Copied;
+        assert!(crate::safecopy::on());
+        const SLOTS: usize = 700;
+        let mut seed = 11u64;
+        let mut random = move || {
+            seed = seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F);
+            (seed >> 33) as usize
+        };
+        let mut title: Vec<u8> = (0..SLOTS * 32).map(|_| random() as u8).collect();
+        let (by_copy, in_place) = (std::sync::Mutex::new(title.clone()), std::sync::Mutex::new(title.clone()));
+        fn held(m: &std::sync::Mutex<Vec<u8>>) -> Copied<'_> {
+            let mut guard = m.lock().unwrap();
+            let (at, len) = (guard.as_mut_ptr(), guard.len());
+            Copied { at, len, step: 32, _held: guard }
+        }
+        for round in 0..200 {
+            for _ in 0..random() % 40 {
+                title[random() % (SLOTS * 32)] ^= 1 + (random() % 255) as u8;
+            }
+            let first = (random() % SLOTS) as u32;
+            let count = random() % (SLOTS + 80);
+            let (a, b) = (held(&by_copy), held(&in_place));
+            let at = first as usize * 32;
+            let end = (at + count * 32).min(title.len());
+            let (mut one, mut other, mut bits) = (Vec::new(), Vec::new(), Vec::new());
+            // SAFETY: each copy's records are this thread's alone.
+            unsafe {
+                a.changes(first, &title[at..end], &mut one);
+                assert!(b.changes_in_place(first, title.as_ptr().add(at), (end - at) / 32, &mut bits, &mut other));
+                assert_eq!(b.seen(first, (end - at) / 32), &title[at..end], "round {round}");
+            }
+            assert_eq!(one, other, "round {round}: first {first}, {count} records");
+            drop((a, b));
+            assert_eq!(*by_copy.lock().unwrap(), *in_place.lock().unwrap(), "round {round}");
         }
     }
 }
@@ -6193,6 +6350,49 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A write of no placed texture view forgets the slot in the spans
+    /// whether it goes by their lock or not (`spans_quick`, both ways, on two
+    /// heaps given the same writes): the spans come out the same, and slots
+    /// that are in them stay marked, also one another's view made stale.
+    #[test]
+    fn writes_of_other_views_leave_the_spans_as_under_their_lock() {
+        let (Some(slow), Some(quick)) = (HostHeap::new(false, 8), HostHeap::new(false, 8)) else {
+            return; // no host GPU
+        };
+        // At an address no test and no title uses.
+        let at = 0x7fef_0000_0000u64;
+        let view = |address: u64, width: u32| {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let spans_of = |heap: &HostHeap| {
+            let spans = heap.placed.lock().unwrap();
+            (spans.slots_in(0, u64::MAX), spans.by_slot.len(), spans.by_start.len(), spans.first.len())
+        };
+        for (heap, fast) in [(&slow, false), (&quick, true)] {
+            let marked = |slot: u32| heap.spanned.all(|_| true).contains(&slot);
+            assert!(heap.note_buffer_as(1, Some(&view(at, 64)), false, fast).is_empty());
+            assert!(marked(1) && !marked(2));
+            // Slot 1 made stale by slot 2: still marked.
+            assert_eq!(heap.note_buffer_as(2, Some(&view(at, 128)), false, fast), [(1, 0)]);
+            assert!(marked(1) && marked(2));
+            // Written with no view: forgotten, under the lock, and unmarked.
+            assert!(heap.note_buffer_as(1, None, false, fast).is_empty());
+            assert!(!marked(1));
+            // A slot never in the spans: nothing there to change.
+            assert!(heap.note_buffer_as(3, None, false, fast).is_empty());
+            assert!(!marked(3));
+        }
+        assert_eq!(spans_of(&slow), spans_of(&quick));
+        for (heap, fast) in [(&slow, false), (&quick, true)] {
+            assert!(heap.note_buffer_as(2, None, false, fast).is_empty());
+        }
+        assert_eq!(spans_of(&slow), spans_of(&quick));
+        assert_eq!(spans_of(&quick), (Vec::new(), 0, 0, 0));
+        assert!(quick.spanned.all(|_| true).is_empty());
     }
 
     #[test]

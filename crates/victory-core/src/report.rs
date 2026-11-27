@@ -47,8 +47,10 @@ use std::time::{Duration, Instant};
 /// index and pipelines the title went without. 3: `kind` (`run`, or
 /// `selftest` for the self-test's report); `[frame_time]` holds the frames
 /// of the last part of a second too; a short run's `[frame_time.steady]` is
-/// by whole seconds, or left without figures when there is none.
-pub const FORMAT: u32 = 3;
+/// by whole seconds, or left without figures when there is none. 4 added
+/// `[memory.map]` and `[memory.map.peak]`: the process's memory by our own
+/// categories.
+pub const FORMAT: u32 = 4;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -359,9 +361,27 @@ pub enum Stat {
     PickedReuploadedFull,
     TailCopies,
     TailBytes,
+    // `[memory.views]`: the runtime's views of title pages and the
+    // descriptor table's entries of views without a resource.
+    /// Views of the host's mapped at title addresses since the start, the
+    /// pages they showed, and views unmapped there.
+    TitleViewsMapped,
+    TitleViewPages,
+    TitleViewsUnmapped,
+    /// Views kept in the runtime's books alone (`VICTORY_LAZY_VIEWS`,
+    /// `VICTORY_SOFT_VIEWS`): noted, let go before anything touched them,
+    /// made views of the host's, and such views now.
+    BookViewsNoted,
+    BookViewsLetGo,
+    BookViewsMadeReal,
+    BookViewsNow,
+    /// Descriptor table entries of views no resource releases: kept now, and
+    /// freed for their cap since the start (`VICTORY_OWNERLESS_VIEWS`).
+    OwnerlessViewsKept,
+    OwnerlessViewsDropped,
 }
 
-const STATS: usize = Stat::TailBytes as usize + 1;
+const STATS: usize = Stat::OwnerlessViewsDropped as usize + 1;
 static STAT: [AtomicU64; STATS] = [const { AtomicU64::new(0) }; STATS];
 
 /// One more of `stat`.
@@ -819,6 +839,19 @@ pub enum Figure {
     SettledMost,
     SettledWrites,
     SettledFence,
+    /// Work switches of the unified-memory synchronisation spare: bytes of
+    /// shader writes left on the card in copies of write-combined memory
+    /// (`VICTORY_WC_NO_BACK`); heap pages whose records were read in place
+    /// (`VICTORY_SYNC_IN_PLACE`); writes of view slots that left the placed
+    /// views' spans alone (`VICTORY_SPANS_QUICK`); rounds of the heaps'
+    /// records begun as a submission took the lock (`VICTORY_HEAP_SYNC_FIRST`);
+    /// preparings that found their round asked for at the title's submit
+    /// (`VICTORY_HEAP_SYNC_AT_SUBMIT`).
+    SparedLeftOnCardBytes,
+    SparedPagesInPlace,
+    SparedSpans,
+    SparedRoundsFirst,
+    SparedRoundsAtSubmit,
     /// Fed by [`present`]: frames between two presents, and the draws and
     /// dispatches left out in them.
     Intervals,
@@ -829,6 +862,15 @@ const FIGS: usize = Figure::LeftOut as usize + 1;
 /// Per window of the timeline, every [`Figure`]. (Zeroed memory that is only
 /// touched as the run reaches each window.)
 static FIGURES: [[AtomicU64; FIGS]; WINDOWS] = [const { [const { AtomicU64::new(0) }; FIGS] }; WINDOWS];
+
+/// The work spared by switches, under our keys, with the scale of each.
+const SPARED: [(Figure, &str, f64); 5] = [
+    (Figure::SparedLeftOnCardBytes, "shader_writes_left_on_card_mb", 1e6),
+    (Figure::SparedPagesInPlace, "heap_pages_read_in_place", 1.0),
+    (Figure::SparedSpans, "slot_writes_sparing_spans", 1.0),
+    (Figure::SparedRoundsFirst, "heap_rounds_begun_first", 1.0),
+    (Figure::SparedRoundsAtSubmit, "heap_rounds_asked_at_submit", 1.0),
+];
 
 /// The settles' causes as the frame line words them, under our keys.
 const SETTLED: [(Figure, &str); 9] = [
@@ -1771,6 +1813,287 @@ fn prune(dir: &Path, kind: Kind, keep: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// The memory map: the process's memory by our own categories (`[memory.map]`).
+//
+// The GPU side and the HLE side give each category's bytes as they sample
+// their counters (`map_set`, before each report is written); nothing is fed
+// from a frame's path for it. A category nobody has given is not known, and
+// is left out of the section (a category known to be empty is 0). The ones
+// of kind `Private` are what the process holds in its own private memory:
+// their sum is `accounted_total`, and the process's private commit less that
+// sum is `unaccounted` (the driver, the title's own heaps, what we do not
+// count). The others are memory the card or a mapped section holds, and
+// counts: listed beside, never summed.
+
+/// What a [`Part`] is, for the sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartKind {
+    /// Bytes held in the process's private memory: added to the total.
+    Private,
+    /// Bytes held beside it (the card's memory, mapped sections, the
+    /// driver's heaps): listed, not added.
+    Beside,
+    /// A count, not bytes.
+    Count,
+}
+
+/// A category of the memory map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Part {
+    /// Memory the title committed (the host pages of its `VirtualAlloc`s,
+    /// each counted once, less what it freed).
+    TitleCommitted,
+    /// Blocks the title took from the default heap.
+    TitleDefaultBlocks,
+    /// Host copies of the title's buffers (less the windows below): an
+    /// estimate, the bytes alive less the windows' lengths.
+    TitleBufferCopies,
+    /// Host copies of windows of title memory outside buffers (their
+    /// lengths; sparse windows hold tiles on the card, counted there).
+    Windows,
+    /// Snapshot buffers kept for reuse (their capacity).
+    SnapshotBuffers,
+    /// Scratch chunks of host lists (alive: held, spare and reserve).
+    ListScratch,
+    /// The other upload buffers of host lists.
+    ListUploads,
+    /// Staging buffers of textures.
+    TextureStaging,
+    /// Memory kept spare for sends.
+    SendSpare,
+    /// The tables of distinct views: an estimate (entries, index nodes).
+    ViewTable,
+    /// Shader containers the pipeline table keeps.
+    ShaderContainers,
+    /// Translated shaders' host code the pipeline table keeps.
+    ShaderTranslations,
+    /// The pipeline library's file, kept whole in memory.
+    PipelineLibrary,
+    /// The title's page pool (pages it was given): sections, not private
+    /// commit.
+    TitlePagePool,
+    /// Host copies of textures the title fills, on the card.
+    CardTextures,
+    /// Host textures the host renders to or writes (the rest of the card's
+    /// textures), on the card.
+    CardTargets,
+    /// Tiles given to textures, on the card.
+    CardTextureTiles,
+    /// Card sides of host copies of title buffers.
+    CardBufferCopies,
+    /// Tiles given to sparse windows, on the card.
+    CardSparseTiles,
+    /// Shader-visible descriptor heaps the host made.
+    DescriptorHeaps,
+    /// Host lists alive (a count; their allocators are not measured).
+    HostListsAlive,
+}
+
+impl Part {
+    pub const ALL: [Part; 21] = [
+        Part::TitleCommitted,
+        Part::TitleDefaultBlocks,
+        Part::TitleBufferCopies,
+        Part::Windows,
+        Part::SnapshotBuffers,
+        Part::ListScratch,
+        Part::ListUploads,
+        Part::TextureStaging,
+        Part::SendSpare,
+        Part::ViewTable,
+        Part::ShaderContainers,
+        Part::ShaderTranslations,
+        Part::PipelineLibrary,
+        Part::TitlePagePool,
+        Part::CardTextures,
+        Part::CardTargets,
+        Part::CardTextureTiles,
+        Part::CardBufferCopies,
+        Part::CardSparseTiles,
+        Part::DescriptorHeaps,
+        Part::HostListsAlive,
+    ];
+
+    /// The key the report writes it under (MiB for bytes, else a count).
+    pub const fn key(self) -> &'static str {
+        match self {
+            Part::TitleCommitted => "title_committed_mib",
+            Part::TitleDefaultBlocks => "title_default_blocks_mib",
+            Part::TitleBufferCopies => "title_buffer_copies_mib",
+            Part::Windows => "windows_of_title_memory_mib",
+            Part::SnapshotBuffers => "snapshot_buffers_mib",
+            Part::ListScratch => "list_scratch_mib",
+            Part::ListUploads => "list_upload_buffers_mib",
+            Part::TextureStaging => "texture_staging_mib",
+            Part::SendSpare => "send_spare_mib",
+            Part::ViewTable => "view_table_mib",
+            Part::ShaderContainers => "shader_containers_mib",
+            Part::ShaderTranslations => "shader_translations_mib",
+            Part::PipelineLibrary => "pipeline_library_mib",
+            Part::TitlePagePool => "title_page_pool_mib",
+            Part::CardTextures => "card_textures_filled_mib",
+            Part::CardTargets => "card_textures_rendered_mib",
+            Part::CardTextureTiles => "card_texture_tiles_mib",
+            Part::CardBufferCopies => "card_buffer_copies_mib",
+            Part::CardSparseTiles => "card_sparse_tiles_mib",
+            Part::DescriptorHeaps => "descriptor_heaps_mib",
+            Part::HostListsAlive => "host_lists_alive",
+        }
+    }
+
+    pub const fn kind(self) -> PartKind {
+        match self {
+            Part::TitleCommitted
+            | Part::TitleDefaultBlocks
+            | Part::TitleBufferCopies
+            | Part::Windows
+            | Part::SnapshotBuffers
+            | Part::ListScratch
+            | Part::ListUploads
+            | Part::TextureStaging
+            | Part::SendSpare
+            | Part::ViewTable
+            | Part::ShaderContainers
+            | Part::ShaderTranslations
+            | Part::PipelineLibrary => PartKind::Private,
+            Part::HostListsAlive => PartKind::Count,
+            _ => PartKind::Beside,
+        }
+    }
+}
+
+/// A part nobody has given, or the process commit not yet asked.
+const NOT_KNOWN: u64 = u64::MAX;
+
+static MAP_NOW: [AtomicU64; Part::ALL.len()] = [const { AtomicU64::new(NOT_KNOWN) }; Part::ALL.len()];
+static MAP_PEAK: [AtomicU64; Part::ALL.len()] = [const { AtomicU64::new(0) }; Part::ALL.len()];
+/// The process's private commit now, and the largest `accounted_total` and
+/// `unaccounted` any report found.
+static MAP_COMMIT: AtomicU64 = AtomicU64::new(NOT_KNOWN);
+static MAP_PEAK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MAP_PEAK_UNACCOUNTED: AtomicU64 = AtomicU64::new(0);
+
+/// `part` holds `value` now (bytes; a count for [`Part::HostListsAlive`]): a
+/// counter kept elsewhere, sampled. Keeps the largest value given.
+pub fn map_set(part: Part, value: u64) {
+    let value = value.min(NOT_KNOWN - 1);
+    MAP_NOW[part as usize].store(value, Relaxed);
+    MAP_PEAK[part as usize].fetch_max(value, Relaxed);
+}
+
+/// What `part` held when it was last given (`None`: never given).
+pub fn map_get(part: Part) -> Option<u64> {
+    Some(MAP_NOW[part as usize].load(Relaxed)).filter(|&n| n != NOT_KNOWN)
+}
+
+/// The process's private commit now, in bytes.
+pub fn map_commit(bytes: u64) {
+    MAP_COMMIT.store(bytes.min(NOT_KNOWN - 1), Relaxed);
+}
+
+/// The memory map as one report holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MapSnapshot {
+    now: [u64; Part::ALL.len()],
+    peak: [u64; Part::ALL.len()],
+    commit: u64,
+    peak_total: u64,
+    peak_unaccounted: u64,
+}
+
+impl Default for MapSnapshot {
+    fn default() -> Self {
+        MapSnapshot {
+            now: [NOT_KNOWN; Part::ALL.len()],
+            peak: [0; Part::ALL.len()],
+            commit: NOT_KNOWN,
+            peak_total: 0,
+            peak_unaccounted: 0,
+        }
+    }
+}
+
+impl MapSnapshot {
+    /// The bytes of the parts that are private and known, added.
+    fn accounted(&self) -> u64 {
+        Part::ALL
+            .iter()
+            .filter(|p| p.kind() == PartKind::Private && self.now[**p as usize] != NOT_KNOWN)
+            .map(|p| self.now[*p as usize])
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The private commit less [`MapSnapshot::accounted`] (0 if the parts
+    /// add up to more); `None` if the commit is not known.
+    fn unaccounted(&self) -> Option<u64> {
+        (self.commit != NOT_KNOWN).then(|| self.commit.saturating_sub(self.accounted()))
+    }
+}
+
+/// The map as it stands, with the largest totals updated by this look.
+fn map_take() -> MapSnapshot {
+    let mut m = MapSnapshot {
+        now: std::array::from_fn(|i| MAP_NOW[i].load(Relaxed)),
+        peak: std::array::from_fn(|i| MAP_PEAK[i].load(Relaxed)),
+        commit: MAP_COMMIT.load(Relaxed),
+        ..MapSnapshot::default()
+    };
+    m.peak_total = MAP_PEAK_TOTAL.fetch_max(m.accounted(), Relaxed).max(m.accounted());
+    if let Some(u) = m.unaccounted() {
+        m.peak_unaccounted = MAP_PEAK_UNACCOUNTED.fetch_max(u, Relaxed).max(u);
+    } else {
+        m.peak_unaccounted = MAP_PEAK_UNACCOUNTED.load(Relaxed);
+    }
+    m
+}
+
+/// `[memory.map]` and `[memory.map.peak]`: MiB, every part known, and the
+/// totals.
+fn memory_map(d: &mut Doc, m: &MapSnapshot) {
+    let mib = |b: u64| (b + (1 << 19)) >> 20;
+    let value = |part: Part, n: u64| match part.kind() {
+        PartKind::Count => n,
+        _ => mib(n),
+    };
+    d.table("memory.map");
+    d.comment("MiB, sampled when the report is written; a category left out is one nothing counted (not known)");
+    d.comment("private: what the process holds in its own private memory; accounted_total is their sum,");
+    d.comment("unaccounted the process's private commit less it (the driver, the title's own heaps, what is not counted)");
+    if m.commit != NOT_KNOWN {
+        d.int("process_private_commit_mib", mib(m.commit));
+    }
+    d.int("accounted_total_mib", mib(m.accounted()));
+    if let Some(u) = m.unaccounted() {
+        d.int("unaccounted_mib", mib(u));
+    }
+    for kind in [PartKind::Private, PartKind::Beside, PartKind::Count] {
+        d.comment(match kind {
+            PartKind::Private => "private memory, in the total",
+            PartKind::Beside => "beside it (card memory, mapped sections, descriptor heaps): not in the total",
+            PartKind::Count => "counts",
+        });
+        for part in Part::ALL.into_iter().filter(|p| p.kind() == kind) {
+            let n = m.now[part as usize];
+            if n != NOT_KNOWN {
+                d.int(part.key(), value(part, n));
+            }
+        }
+    }
+    d.table("memory.map.peak");
+    d.comment("the most each category held when a report was written (a report is written every 30 s and at the end)");
+    d.int("accounted_total_mib", mib(m.peak_total));
+    if m.commit != NOT_KNOWN {
+        d.int("unaccounted_mib", mib(m.peak_unaccounted));
+    }
+    for part in Part::ALL {
+        if m.now[part as usize] != NOT_KNOWN {
+            d.int(part.key(), value(part, m.peak[part as usize]));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rendering.
 
 /// Everything a report says, taken at once.
@@ -1813,6 +2136,8 @@ struct Snapshot {
     /// others, how many were called and how often.
     imports: Vec<(String, u64)>,
     other_imports: (u64, u64),
+    /// The memory map ([`Part`]).
+    map: MapSnapshot,
 }
 
 impl Snapshot {
@@ -1875,6 +2200,7 @@ impl Snapshot {
             shader_failures_lost: load(&SHADER_FAILURES.lost),
             imports,
             other_imports,
+            map: map_take(),
         }
     }
 
@@ -2326,6 +2652,14 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
         Some(steady) => settle_waits(d, &steady.figures),
         None => d.comment("none (see [frame_time.steady])"),
     }
+    d.table("frame_time.spared");
+    d.comment("per frame, work the unified-memory switches spared (0 with them off), whole run");
+    spared(d, &s.figures);
+    d.table("frame_time.spared.steady");
+    match &s.steady {
+        Some(steady) => spared(d, &steady.figures),
+        None => d.comment("none (see [frame_time.steady])"),
+    }
 
     d.table("pipelines");
     d.int("created_by_title", s.stat(Stat::PipelinesCreated));
@@ -2410,6 +2744,9 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     d.float("mapped_wait_ms", ms(Stat::MappedUs));
     d.float("mapped_wait_longest_ms", ms(Stat::MappedLongestUs));
 
+    memory_views(d, s);
+    memory_map(d, &s.map);
+
     d.table("textures");
     d.comment("textures picked by index (from the view heap by shaders), since the start");
     d.int("picked_uploaded", s.stat(Stat::PickedUploaded));
@@ -2453,6 +2790,26 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     }
 }
 
+/// `[memory.views]`: the runtime's views of title pages and the descriptor
+/// table's entries of views without a resource, since the start (kept in a
+/// function of its own, apart from the sections beside it).
+fn memory_views(d: &mut Doc, s: &Snapshot) {
+    d.table("memory.views");
+    d.comment("views of the host's at title addresses since the start, and the pages one showed on average");
+    let mapped = s.stat(Stat::TitleViewsMapped);
+    d.int("title_views_mapped", mapped);
+    d.int("title_views_unmapped", s.stat(Stat::TitleViewsUnmapped));
+    d.float("title_view_pages_avg", s.stat(Stat::TitleViewPages) as f64 / mapped.max(1) as f64);
+    d.comment("views kept in the books alone until touched (VICTORY_LAZY_VIEWS, VICTORY_SOFT_VIEWS)");
+    d.int("book_views_noted", s.stat(Stat::BookViewsNoted));
+    d.int("book_views_let_go_untouched", s.stat(Stat::BookViewsLetGo));
+    d.int("book_views_made_real", s.stat(Stat::BookViewsMadeReal));
+    d.int("book_views_now", s.stat(Stat::BookViewsNow));
+    d.comment("descriptor table entries of views no resource releases: kept now, freed for the cap (VICTORY_OWNERLESS_VIEWS)");
+    d.int("ownerless_entries_kept", s.stat(Stat::OwnerlessViewsKept));
+    d.int("ownerless_entries_dropped", s.stat(Stat::OwnerlessViewsDropped));
+}
+
 /// The frame line's figures `f` per frame of the frame meter.
 fn frame_time(d: &mut Doc, f: &[u64; FIGS]) {
     let get = |figure: Figure| f[figure as usize] as f64;
@@ -2484,6 +2841,14 @@ fn frame_time(d: &mut Doc, f: &[u64; FIGS]) {
     d.float("submitting_thread_stood_ms", per(Figure::StoodUs, 1e3));
     d.float("heap_buffer_passes", per(Figure::HeapBufferPasses, 1.0));
     d.float("heap_buffer_ms", per(Figure::HeapBufferUs, 1e3));
+}
+
+/// The work spared of `f`, per frame.
+fn spared(d: &mut Doc, f: &[u64; FIGS]) {
+    let frames = f[Figure::Frames as usize].max(1) as f64;
+    for (figure, key, scale) in SPARED {
+        d.float(key, f[figure as usize] as f64 / scale / frames);
+    }
 }
 
 /// The waiting in settles of `f`, ms per frame, by cause.
@@ -2537,6 +2902,114 @@ mod tests {
         }
     }
 
+    // The memory map.
+
+    const MIB: u64 = 1 << 20;
+
+    /// A map with some private parts, one known to be empty, one beside, a
+    /// count, and the rest not known.
+    fn synthetic_map() -> MapSnapshot {
+        let mut m = MapSnapshot::default();
+        for (part, mib) in [
+            (Part::TitleCommitted, 4_000),
+            (Part::Windows, 1_500),
+            (Part::ListScratch, 700),
+            (Part::SendSpare, 0),
+            (Part::CardTextures, 3_000),
+        ] {
+            m.now[part as usize] = mib * MIB;
+            m.peak[part as usize] = (mib + 100) * MIB;
+        }
+        m.now[Part::HostListsAlive as usize] = 640;
+        m.peak[Part::HostListsAlive as usize] = 700;
+        m.commit = 9_000 * MIB;
+        m.peak_total = 6_400 * MIB;
+        m.peak_unaccounted = 3_000 * MIB;
+        m
+    }
+
+    fn rendered_map(m: &MapSnapshot) -> toml::Table {
+        let mut d = Doc { out: String::new(), host: false };
+        memory_map(&mut d, m);
+        let table: toml::Table = toml::from_str(&d.out).unwrap_or_else(|e| panic!("{e}
+{}", d.out));
+        table["memory"].as_table().expect("a table").clone()
+    }
+
+    #[test]
+    fn the_memory_map_renders_what_is_known_and_leaves_out_the_rest() {
+        let map = rendered_map(&synthetic_map());
+        let now = map["map"].as_table().expect("a table");
+        assert_eq!(now["process_private_commit_mib"].as_integer(), Some(9_000));
+        assert_eq!(now["title_committed_mib"].as_integer(), Some(4_000));
+        assert_eq!(now["card_textures_filled_mib"].as_integer(), Some(3_000));
+        assert_eq!(now["host_lists_alive"].as_integer(), Some(640));
+        // Known and empty is 0; never given is not there.
+        assert_eq!(now["send_spare_mib"].as_integer(), Some(0));
+        assert!(!now.contains_key("shader_containers_mib"));
+        assert!(!now.contains_key("card_sparse_tiles_mib"));
+        let peak = now["peak"].as_table().expect("a table");
+        assert_eq!(peak["title_committed_mib"].as_integer(), Some(4_100));
+        assert_eq!(peak["host_lists_alive"].as_integer(), Some(700));
+        assert_eq!(peak["accounted_total_mib"].as_integer(), Some(6_400));
+        assert_eq!(peak["unaccounted_mib"].as_integer(), Some(3_000));
+        assert!(!peak.contains_key("shader_containers_mib"));
+    }
+
+    /// Only the private parts that are known are added; the commit less that
+    /// sum is what the map does not explain, and never below 0.
+    #[test]
+    fn the_memory_maps_totals_add_up() {
+        let m = synthetic_map();
+        assert_eq!(m.accounted(), 6_200 * MIB);
+        assert_eq!(m.unaccounted(), Some(2_800 * MIB));
+        let table = rendered_map(&m);
+        let now = table["map"].as_table().expect("a table");
+        let parts: i64 = Part::ALL
+            .iter()
+            .filter(|p| p.kind() == PartKind::Private)
+            .filter_map(|p| now.get(p.key()).and_then(toml::Value::as_integer))
+            .sum();
+        assert_eq!(now["accounted_total_mib"].as_integer(), Some(parts));
+        assert_eq!(
+            now["accounted_total_mib"].as_integer().unwrap() + now["unaccounted_mib"].as_integer().unwrap(),
+            now["process_private_commit_mib"].as_integer().unwrap()
+        );
+        // Parts that add up to more than the commit leave nothing over.
+        let mut over = m.clone();
+        over.commit = 1_000 * MIB;
+        assert_eq!(over.unaccounted(), Some(0));
+        // No commit asked: no `unaccounted` to say.
+        let mut none = m;
+        none.commit = NOT_KNOWN;
+        assert_eq!(none.unaccounted(), None);
+        let table = rendered_map(&none);
+        assert!(!table["map"].as_table().expect("a table").contains_key("unaccounted_mib"));
+        assert!(!table["map"].as_table().expect("a table").contains_key("process_private_commit_mib"));
+    }
+
+    #[test]
+    fn the_memory_map_keeps_its_peaks_and_its_keys_are_ours() {
+        // A part nobody gave is not known; one given keeps its largest.
+        let before = MAP_PEAK[Part::TitlePagePool as usize].load(Relaxed);
+        map_set(Part::TitlePagePool, before + 5 * MIB);
+        map_set(Part::TitlePagePool, 1);
+        assert_eq!(MAP_NOW[Part::TitlePagePool as usize].load(Relaxed), 1);
+        assert!(MAP_PEAK[Part::TitlePagePool as usize].load(Relaxed) >= before + 5 * MIB);
+        // The sampled values are numbers whatever they hold, in decimal.
+        map_set(Part::Windows, 0x7ff6_a1b2_c3d4);
+        let text = render(&Snapshot::take());
+        assert!(!text.contains("7ff6"), "{text}");
+        let table: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}
+{text}"));
+        assert!(table["memory"]["map"].is_table() && table["memory"]["map"]["peak"].is_table());
+        let mut keys = std::collections::HashSet::new();
+        for part in Part::ALL {
+            assert!(keys.insert(part.key()), "{} twice", part.key());
+            assert_eq!(part.key().ends_with("_mib"), part.kind() != PartKind::Count);
+        }
+    }
+
     fn synthetic() -> Snapshot {
         let mut fine = vec![0u32; FINE];
         fine[fine_bucket(16_600)] = 900;
@@ -2582,6 +3055,15 @@ mod tests {
             (Stat::PickedChangedUnseen, 7),
             (Stat::TailCopies, 330),
             (Stat::TailBytes, 21 << 20),
+            (Stat::TitleViewsMapped, 40_000),
+            (Stat::TitleViewPages, 100_000),
+            (Stat::TitleViewsUnmapped, 39_000),
+            (Stat::BookViewsNoted, 0),
+            (Stat::BookViewsLetGo, 0),
+            (Stat::BookViewsMadeReal, 0),
+            (Stat::BookViewsNow, 0),
+            (Stat::OwnerlessViewsKept, 1_048_576),
+            (Stat::OwnerlessViewsDropped, 52_000),
         ] {
             stats[stat as usize] = v;
         }
@@ -2617,6 +3099,8 @@ mod tests {
             (F::SettledStep, 300_000),
             (F::SettledWrites, 800_000),
             (F::SettledFence, 200_000),
+            (F::SparedLeftOnCardBytes, 50_000_000_000),
+            (F::SparedPagesInPlace, 9_000),
             (F::Intervals, 1_000),
             (F::LeftOut, 1_880),
         ]);
@@ -2643,6 +3127,8 @@ mod tests {
             (F::SettledRead, 500_000),
             (F::SettledWrites, 300_000),
             (F::SettledFence, 100_000),
+            (F::SparedLeftOnCardBytes, 18_500_000_000),
+            (F::SparedPagesInPlace, 3_330),
             (F::Intervals, 370),
             (F::LeftOut, 30),
         ]);
@@ -2712,6 +3198,7 @@ mod tests {
             shader_failures_lost: 0,
             imports: vec![("kernel32.dll!SomeFunction".into(), 1)],
             other_imports: (2, 5),
+            map: synthetic_map(),
         }
     }
 
@@ -2761,6 +3248,11 @@ mod tests {
             assert!(frame_time["waits"].get(key).is_some(), "no frame_time.waits.{key}");
             assert!(frame_time["waits"]["steady"].get(key).is_some(), "no steady {key}");
         }
+        for (_, key, _) in SPARED {
+            assert!(frame_time["spared"].get(key).is_some(), "no frame_time.spared.{key}");
+            assert!(frame_time["spared"]["steady"].get(key).is_some(), "no steady {key}");
+        }
+        assert_eq!(frame_time["spared"]["shader_writes_left_on_card_mb"].as_float(), Some(50.0));
         assert_eq!(frame_time["preparing_ms"].as_float(), Some(6.2));
         assert_eq!(frame_time["card_busy_pct"].as_float(), Some(70.1));
         assert_eq!(frame_time["steady"]["from_s"].as_float(), Some(40.0));
@@ -2773,6 +3265,11 @@ mod tests {
         assert_eq!(pressure["governor_red_s"].as_float(), Some(2.9));
         assert_eq!(pressure["vram_over_budget"].as_bool(), Some(true));
         assert_eq!(pressure["resident_wait_ms"].as_float(), Some(3_400.0));
+        let views = &parsed["memory"]["views"];
+        assert_eq!(views["title_views_mapped"].as_integer(), Some(40_000));
+        assert_eq!(views["title_view_pages_avg"].as_float(), Some(2.5));
+        assert_eq!(views["book_views_made_real"].as_integer(), Some(0));
+        assert_eq!(views["ownerless_entries_dropped"].as_integer(), Some(52_000));
         assert_eq!(parsed["textures"]["waiting_for_memory_most"].as_integer(), Some(950));
         assert_eq!(parsed["textures"]["picked_uploaded_mib"].as_integer(), Some(5_200));
         assert_eq!(parsed["textures"]["refresh_ms"].as_float(), Some(4.5));
@@ -3052,7 +3549,13 @@ mod tests {
                 _ => false,
             }
         }
-        for section in [&parsed["frame_time"], &parsed["memory"]["pressure"], &parsed["textures"]] {
+        for section in [
+            &parsed["frame_time"],
+            &parsed["memory"]["pressure"],
+            &parsed["memory"]["views"],
+            &parsed["memory"]["map"],
+            &parsed["textures"],
+        ] {
             assert!(numbers_only(section), "{section}");
         }
         assert!(parsed["unimplemented"]["pipelines_gone_without"].is_integer());

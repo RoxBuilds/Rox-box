@@ -238,6 +238,14 @@ pub(crate) fn heap_buffers(frames: f64, passes: f64, ms: f64) {
     ]);
 }
 
+/// Work a unified-memory switch spared since the frame line's last second:
+/// `total` of `figure` (one of the `Spared` figures), not per frame.
+pub(crate) fn spared(figure: Figure, total: u64) {
+    if total > 0 {
+        report::figures(&[(figure, total)]);
+    }
+}
+
 /// Texture refreshes on all threads per frame, ms.
 pub(crate) fn texture_refreshes(frames: f64, ms: f64) {
     report::figures(&[(Figure::RefreshAllUs, us(ms, frames))]);
@@ -410,6 +418,11 @@ pub fn sample() {
     );
     report::set(Stat::TailCopies, crate::resource::TAILS[0].load(Relaxed));
     report::set(Stat::TailBytes, crate::resource::TAILS[1].load(Relaxed));
+    // `[memory.views]`: the descriptor table's entries of views without a
+    // resource (`VICTORY_OWNERLESS_VIEWS`).
+    let [kept, dropped] = crate::descriptor::ownerless_counts();
+    report::set(Stat::OwnerlessViewsKept, kept);
+    report::set(Stat::OwnerlessViewsDropped, dropped);
     // One more look at video memory (at most every 32 ms, and it feeds the
     // peaks), in case nothing else asked lately.
     let _ = crate::host::budget::sample();
@@ -425,6 +438,66 @@ pub fn sample() {
     if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
         report::max(Stat::CommitPeak, c.PeakPagefileUsage as u64);
         report::max(Stat::WorkingSetPeak, c.PeakWorkingSetSize as u64);
+    }
+    memory_map();
+}
+
+// The memory map (`[memory.map]`): this crate's share of it, from counters
+// it keeps for its own lines, sampled with the rest just before a report is
+// written. Each is a relaxed load; the few that are behind a lock are taken
+// without waiting for it (the last figure stands if it is held).
+
+/// Gives the report the bytes this crate holds, by category, and the
+/// process's private commit.
+fn memory_map() {
+    use report::Part;
+    let set = report::map_set;
+    let [copies, windows, snapshots, card_copies, sparse] = crate::shadow::report_memory();
+    set(Part::TitleBufferCopies, copies);
+    set(Part::Windows, windows);
+    set(Part::SnapshotBuffers, snapshots);
+    set(Part::CardBufferCopies, card_copies);
+    set(Part::CardSparseTiles, sparse);
+    set(Part::ListScratch, crate::host::ALIVE[2].load(Relaxed));
+    set(Part::ListUploads, crate::host::ALIVE[7].load(Relaxed));
+    set(Part::HostListsAlive, crate::host::ALIVE[0].load(Relaxed));
+    // The pool's blocks hold the staging made from them (and what is free
+    // in them); without the pool each staging buffer is its own.
+    let staging = if crate::pool::on() {
+        crate::pool::report_staging_bytes()
+    } else {
+        Some(crate::texture::report_staged())
+    };
+    if let Some(bytes) = staging {
+        set(Part::TextureStaging, bytes);
+    }
+    if let Some(bytes) = crate::host::report_send_spare() {
+        set(Part::SendSpare, bytes);
+    }
+    set(Part::ViewTable, crate::descriptor::report_views());
+    let kept = crate::pipeline::kept();
+    set(Part::ShaderContainers, kept[1]);
+    set(Part::ShaderTranslations, kept[3]);
+    set(Part::PipelineLibrary, kept[4]);
+    let filled = crate::resource::KINDS[1].load(Relaxed);
+    set(Part::CardTextures, filled);
+    set(
+        Part::CardTargets,
+        crate::resource::HOST_TEXTURES[1].load(Relaxed).saturating_sub(filled),
+    );
+    set(Part::CardTextureTiles, crate::tiles::given_total());
+    set(Part::DescriptorHeaps, crate::descriptor::host::HEAP_BYTES.load(Relaxed));
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
+        report::map_commit(c.PagefileUsage as u64);
     }
 }
 
@@ -452,6 +525,29 @@ mod tests {
             reason: "a reason",
         });
         shader_failed(&victory_shader::ShaderError::Malformed("a part"));
+    }
+
+    /// The memory map is given by the sampler without a host device too: the
+    /// counters it reads are zero then, and known to be.
+    #[test]
+    fn the_sampler_gives_the_memory_map() {
+        use report::Part;
+        sample();
+        for part in [
+            Part::TitleBufferCopies,
+            Part::Windows,
+            Part::SnapshotBuffers,
+            Part::ListScratch,
+            Part::ListUploads,
+            Part::ViewTable,
+            Part::ShaderContainers,
+            Part::CardTextures,
+            Part::DescriptorHeaps,
+        ] {
+            assert!(report::map_get(part).is_some(), "{} not given", part.key());
+        }
+        // (The title's own parts come from victory-hle's sampler.)
+        assert_eq!(report::map_get(Part::TitleCommitted), None);
     }
 
     /// The sampler reads only counters and the system: it runs with or

@@ -270,6 +270,88 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
 }
 
 #[cfg(windows)]
+impl SyncedHeaps {
+    /// Nothing waits for this round: it runs all the same.
+    pub(crate) fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// [`begin_sync_heaps`] for a submission that needs round `mark` (one that
+/// began after what it reads was written, `crate::heap_marks`): asked for if
+/// it has not been. 0: as [`begin_sync_heaps`]. Ported from
+/// trustno1-coder/VIctory-NVIDIA d2e24b3 (from Belobug/VIctory-Belobug-AMD
+/// 673be0e and a609a2f).
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    use crate::heap_marks::{EARLY_ROUNDS, LATE_ROUNDS, STATS};
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        STATS[LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        STATS[EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// The number of a round of the heaps' records that begins after this call,
+/// asked for if none is waiting to begin (at the title's submit: the round
+/// runs while the submission waits in the line). 0 if the records are not
+/// synced by a thread of their own (or it has not started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::heap_marks::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::heap_marks::STATS[crate::heap_marks::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// The number of the first round that begins after this call, not asked for
+/// ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
+}
+
+#[cfg(windows)]
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
         let Some(mine) = self.0 else {
@@ -306,8 +388,10 @@ pub(crate) fn sync_heaps() {
     let mut spent = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
+    let (mut in_place_pages, mut short) = (0u64, 0u64);
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
+    let (pages_a_job, records_a_job) = sync_jobs();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -325,8 +409,8 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
+            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
@@ -357,37 +441,65 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        // (Records of 32 bytes, read by the copy that fails, not faults.)
+        let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    continue;
-                }
-                out.pages += 1;
-                out.views += u64::from(crate::watch::guarded(from, to));
-                out.bytes += (to - from) as u64;
+            let mut bits: Vec<u64> = Vec::new();
+            for &(from, to) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
-                let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                    continue;
-                };
-                let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
-                out.looked += count;
-                // Only the records that are not the ones last seen
-                // there (`host::Copied::changes`).
+                let lead = (start + first * step) as usize;
                 changed.clear();
-                // SAFETY: the parts are ranges of the heap apart from one
-                // another, and only records that lie whole in one are its.
-                unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                let records: &[u8] = if in_place {
+                    // Read where they are, each record once, and compared
+                    // as it is read (`host::Copied::changes_in_place`): the
+                    // same records found changed as by the copy below.
+                    let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
+                    // SAFETY: as below; title memory is read by a copy that
+                    // fails where a page is not there (unmapped meanwhile).
+                    let whole = unsafe {
+                        copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed)
+                    };
+                    out.pages += 1;
+                    out.in_place += 1;
+                    out.short += u64::from(!whole);
+                    out.views += u64::from(crate::watch::guarded(from, to));
+                    out.bytes += (to - from) as u64;
+                    out.looked += count;
+                    // What was read of the changed records is in the records
+                    // last seen now.
+                    // SAFETY: this part's records alone, which nothing else
+                    // writes meanwhile.
+                    unsafe { copied.seen(first as u32, count as usize) }
+                } else {
+                    // The page's records are read through the kernel, into a
+                    // copy: a page the title unmaps meanwhile fails the read
+                    // where 2,048 reads in place would fault.
+                    page_bytes.resize(to - from, 0);
+                    if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                        continue;
+                    }
+                    out.pages += 1;
+                    out.views += u64::from(crate::watch::guarded(from, to));
+                    out.bytes += (to - from) as u64;
+                    let Some(records) = page_bytes.get(lead.wrapping_sub(from)..) else {
+                        continue;
+                    };
+                    let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                    out.looked += count;
+                    // Only the records that are not the ones last seen
+                    // there (`host::Copied::changes`).
+                    // SAFETY: the parts are ranges of the heap apart from one
+                    // another, and only records that lie whole in one are its.
+                    unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                    records
+                };
                 for &index in &changed {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
@@ -439,6 +551,8 @@ pub(crate) fn sync_heaps() {
             views += part.views;
             bytes += part.bytes;
             looked += part.looked;
+            in_place_pages += part.in_place;
+            short += part.short;
             tabled += part.tabled;
             kinds[0] += part.nothing;
             later += part.wait.len() as u64;
@@ -451,8 +565,8 @@ pub(crate) fn sync_heaps() {
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
@@ -473,6 +587,38 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    for (count, n) in SYNC_IN_PLACE.iter().zip([in_place_pages, short]) {
+        count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Of [`sync_heaps`] with [`sync_in_place`], since the last frame line: pages
+/// whose records were read in place, and those of them of which a part could
+/// not be read.
+#[cfg(windows)]
+static SYNC_IN_PLACE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether [`sync_heaps`] reads a changed page's records of 32 bytes where
+/// they are, each once, comparing each with the one last seen as it reads it
+/// (`VICTORY_SYNC_IN_PLACE=1`; off by default: the page is first copied
+/// through the kernel, then the copy compared, two passes over every page,
+/// as before).
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 769fe52 (from
+/// Belobug/VIctory-Belobug-AMD 15ab94e, where the copy and the compare were
+/// measured as a pass each over every page). The records found changed, and
+/// what is mirrored of them, are the same
+/// (`changes_in_place_finds_what_the_copy_finds` in `descriptor/host.rs`);
+/// title memory is read by our fault-safe copy code instead of the kernel. A
+/// page the title unmaps meanwhile fails the read as the kernel's did, the
+/// records before the place taken as they were read (the kernel's read took
+/// none of the page; the rest is read again when the page is next written).
+/// Off by default: it reads title memory another way, and only a run says
+/// what it saves.
+#[cfg(windows)]
+fn sync_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_IN_PLACE"))
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
@@ -493,6 +639,9 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    /// Pages read in place ([`sync_in_place`]), and those not all there.
+    in_place: u64,
+    short: u64,
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -502,6 +651,35 @@ const SYNC_PAGES: usize = 8;
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
 const SYNC_AT_A_TIME: usize = 256;
+
+/// With [`sync_jobs`] fine: pages and records [`sync_heaps`] gives a thread at
+/// a time.
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+#[cfg(windows)]
+const SYNC_AT_A_TIME_FINE: usize = 64;
+
+/// Pages and records [`sync_heaps`] gives a thread at a time
+/// (`VICTORY_SYNC_FINE=1`: [`SYNC_PAGES_FINE`] and [`SYNC_AT_A_TIME_FINE`];
+/// off by default: [`SYNC_PAGES`] and [`SYNC_AT_A_TIME`], as before).
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 96dfd9b (from
+/// Belobug/VIctory-Belobug-AMD a284ca7). A round for a submission finds a
+/// dozen pages or so: by eight a job, that is two jobs on two threads while
+/// the submission waits for the round. The same records are read, compared
+/// and mirrored either way, only in jobs of another size (every page and
+/// every record in exactly one job: `jobs_cover_every_page_once`).
+#[cfg(windows)]
+fn sync_jobs() -> (usize, usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    jobs_of(*ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_FINE")))
+}
+
+/// [`sync_jobs`] with the switch `fine` or not.
+#[cfg(windows)]
+fn jobs_of(fine: bool) -> (usize, usize) {
+    if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
+}
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -534,6 +712,28 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let [in_place, short] = [0, 1].map(|i| SYNC_IN_PLACE[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    // (The run report's `heap_pages_read_in_place`, `slot_writes_sparing_spans`.)
+    crate::runreport::spared(victory_pipeline::report::Figure::SparedPagesInPlace, in_place);
+    crate::runreport::spared(victory_pipeline::report::Figure::SparedSpans, quick[0]);
+    let quick = quick.map(|n| n as f64 / frames);
+    if quick[0] > 0.0 || sync_jobs().0 == SYNC_PAGES_FINE {
+        tracing::info!(
+            "writes of view slots per frame (VICTORY_SPANS_QUICK=1): {:.0} left the placed views' spans alone, {:.0} took their \
+             lock; the heaps' records in jobs of {} pages (VICTORY_SYNC_FINE)",
+            quick[0],
+            quick[1],
+            sync_jobs().0
+        );
+    }
+    if in_place > 0 {
+        tracing::info!(
+            "the heaps' records read where they are (VICTORY_SYNC_IN_PLACE=1): {:.1} pages per frame, {short} of them not all \
+             there since the last line",
+            in_place as f64 / frames
+        );
+    }
     if pages == 0 {
         return;
     }
@@ -852,20 +1052,79 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Entries of views that no resource releases (constant buffer views and
+    /// views of placed memory that did not fit a record), oldest first, with
+    /// the generation each was made at: past [`ownerless_cap`] the oldest is
+    /// freed ([`Views::entry_kept`]).
+    ownerless: std::collections::VecDeque<(u32, u32)>,
+}
+
+impl Views {
+    const fn new() -> Views {
+        Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+            ownerless: std::collections::VecDeque::new(),
+        }
+    }
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
-});
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views::new());
+
+/// How many table entries of views without a resource are kept
+/// ([`Views::ownerless`]); 0: all of them, for the run.
+///
+/// Such entries have nothing that frees them: a title copies descriptors as
+/// bytes, so nothing says when the last one naming an entry is gone. Most
+/// constant buffer views and views of placed memory are named whole in their
+/// records and are no entries, but once the shapes of placed views are all
+/// given out every new placed view the title writes becomes an entry, and
+/// they then grow for as long as the run lasts (gigabytes over an hour of
+/// play). With a cap the oldest entry past it is freed under a new
+/// generation, so a descriptor that still names it reads as stale (no view),
+/// as one naming a released resource's view does. A descriptor names the view
+/// it was written with for a frame or a few, so the oldest of a million are
+/// long out of use; but a descriptor written once and read for good after a
+/// million others would read as no view, which is why the cap is not on by
+/// default.
+///
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps at most `n` (1048576 is the value the
+/// cap was measured with); unset or `0`: all, as before.
+/// Ported from trustno1-coder/VIctory-NVIDIA 89fd936.
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| ownerless_cap_of(std::env::var("VICTORY_OWNERLESS_VIEWS").ok().as_deref()))
+}
+
+/// [`ownerless_cap`] for what `VICTORY_OWNERLESS_VIEWS` is set to.
+fn ownerless_cap_of(set: Option<&str>) -> usize {
+    set.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Entries of views without a resource freed for the cap since the start
+/// ([`ownerless_cap`]).
+static OWNERLESS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Entries of views without a resource the table keeps now, as last made:
+/// those queued for the cap, or with no cap all such entries made.
+static OWNERLESS_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the run report: entries of views without a resource the table keeps
+/// now, and those freed for the cap since the start. (Read with no lock: the
+/// report may be written while a thread holds the table.)
+#[cfg(windows)]
+pub(crate) fn ownerless_counts() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [OWNERLESS_KEPT.load(Relaxed), OWNERLESS_DROPPED.load(Relaxed)]
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -994,6 +1253,55 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
+        self.entry_kept(view, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries of views
+    /// without a resource (0: all): a new one goes to the back of
+    /// [`Views::ownerless`], and the oldest past the cap are freed.
+    fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
+        let ownerless = view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
+        let fresh = ownerless && !self.index.contains_key(&view);
+        let words = self.entry_made(view);
+        if !fresh {
+            return words;
+        }
+        if cap == 0 {
+            OWNERLESS_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return words;
+        }
+        self.ownerless.push_back((words[0], words[1]));
+        while self.ownerless.len() > cap {
+            let Some((i, generation)) = self.ownerless.pop_front() else {
+                break;
+            };
+            if self.free_ownerless(i, generation) {
+                OWNERLESS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        OWNERLESS_KEPT.store(self.ownerless.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation` (it
+    /// may have been freed and made again for another view since); whether
+    /// it did.
+    fn free_ownerless(&mut self, i: u32, generation: u32) -> bool {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return false;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return false;
+        }
+        self.index.remove(&view);
+        // (Below the bits that say a record is no table entry, as `forget`.)
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+        true
+    }
+
+    /// [`entry`](Self::entry) with no cap.
+    fn entry_made(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
@@ -1095,6 +1403,26 @@ pub(crate) fn views_kept() -> [u64; 8] {
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
+}
+
+/// For the run report: what the tables of distinct views hold, an estimate
+/// (as [`views_kept`] figures it); the last figure if the tables are being
+/// written. Nothing is waited for.
+pub(crate) fn report_views() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Ok(views) = VIEWS.try_read() {
+        let each = size_of::<(View, u32)>() as u64;
+        let shape = size_of::<Shape>() as u64;
+        LAST.store(
+            views.list.capacity() as u64 * each
+                + views.index.len() as u64 * each * 3 / 2
+                + views.shapes.capacity() as u64 * shape
+                + views.shape_index.len() as u64 * shape * 3 / 2,
+            Relaxed,
+        );
+    }
+    LAST.load(Relaxed)
 }
 
 impl View {
@@ -1562,6 +1890,25 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// Fine or not (`VICTORY_SYNC_FINE`), the round's jobs take every page and
+    /// every record once, in order: only how many go to one job differs.
+    #[cfg(windows)]
+    #[test]
+    fn jobs_cover_every_page_once() {
+        assert_eq!(jobs_of(false), (SYNC_PAGES, SYNC_AT_A_TIME));
+        assert_eq!(jobs_of(true), (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE));
+        let items: Vec<usize> = (0..1000).collect();
+        let by = |n: usize| -> Vec<usize> {
+            let jobs = items.len().div_ceil(n);
+            (0..jobs).flat_map(|job| items.chunks(n).nth(job).unwrap_or_default().to_vec()).collect()
+        };
+        for fine in [false, true] {
+            let (pages, records) = jobs_of(fine);
+            assert_eq!(by(pages), items);
+            assert_eq!(by(records), items);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn raw_heap_sync_stops_before_dynamic_host_slots() {
@@ -1729,6 +2076,61 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// Entries of views no resource releases stay under their cap
+    /// (`VICTORY_OWNERLESS_VIEWS`): the oldest go stale, the newest still
+    /// name their views, entries are reused rather than added, a view written
+    /// again keeps its words, and views of resources are never dropped. With
+    /// no cap (the default) every entry is kept, as before.
+    #[test]
+    fn ownerless_entries_are_capped() {
+        // (A table of the test's own: nothing of the process's is touched.)
+        let mut views = Views::new();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let named = |views: &Views, words: [u32; 2], view: &View| {
+            views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
+        };
+        let dropped = OWNERLESS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let words: Vec<[u32; 2]> = (0..10).map(|n| views.entry_kept(placed(n), 4)).collect();
+        assert_eq!(views.index.len(), 4, "four kept");
+        assert_eq!(views.ownerless.len(), 4);
+        assert!(views.list.len() <= 5, "entries reused, not added: {}", views.list.len());
+        assert!(OWNERLESS_DROPPED.load(std::sync::atomic::Ordering::Relaxed) >= dropped + 6);
+        for (n, &w) in words.iter().enumerate().take(6) {
+            assert!(!named(&views, w, &placed(n as u32)), "entry {n} stale");
+        }
+        for (n, &w) in words.iter().enumerate().skip(6) {
+            assert!(named(&views, w, &placed(n as u32)), "entry {n} kept");
+        }
+        // The same view written again keeps its words.
+        assert_eq!(views.entry_kept(placed(9), 4), words[9]);
+        // A constant buffer view too goes with the cap.
+        let constant = View::Constant(1 << 60, 3);
+        let first = views.entry_kept(constant.clone(), 4);
+        assert!(named(&views, first, &constant));
+        // A view of a resource is freed with the resource only.
+        let shader = View::Shader(0x1234, None);
+        let kept = views.entry_kept(shader.clone(), 4);
+        for n in 10..40 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert!(named(&views, kept, &shader));
+        assert!(!named(&views, first, &constant));
+        assert!(views.list.len() <= 6, "{}", views.list.len());
+        // No cap: they are all kept, and none is queued for it.
+        let mut all = Views::new();
+        let words: Vec<[u32; 2]> = (0..20).map(|n| all.entry_kept(placed(n), 0)).collect();
+        assert_eq!(all.index.len(), 20);
+        assert!(all.ownerless.is_empty());
+        for (n, &w) in words.iter().enumerate() {
+            assert!(named(&all, w, &placed(n as u32)), "entry {n} kept");
+        }
+        // The switch: unset or 0 keeps all; a number is the cap.
+        assert_eq!(ownerless_cap_of(None), 0);
+        assert_eq!(ownerless_cap_of(Some("0")), 0);
+        assert_eq!(ownerless_cap_of(Some(" 1048576 ")), 1 << 20);
+        assert_eq!(ownerless_cap_of(Some("many")), 0);
     }
 
     /// The leak fixed here: a title that writes constant buffer views and

@@ -542,6 +542,13 @@ pub(crate) fn relieve_textures(need: u64) -> u64 {
     try_lock(&TEXTURES).map_or(0, |mut pool| pool.relieve(now(), need))
 }
 
+/// For the run report: the bytes of the blocks of staging buffers (made
+/// whole, so what they hold whether or not pieces of them are in use); `None`
+/// while the pool's lock is held (nothing is waited for).
+pub(crate) fn report_staging_bytes() -> Option<u64> {
+    try_lock(&STAGING).map(|pool| pool.blocks() as u64 * pool.block)
+}
+
 /// A mapped upload buffer's memory.
 #[derive(Clone)]
 struct Upload(ID3D12Resource, *mut u8);

@@ -167,7 +167,8 @@ By the types of `victory_core::report`, not by care at each call:
   and check that the rendered report holds none of them, and that it parses
   as TOML. The entry points that take numbers alone (`figures`,
   `memory_seen`, `memory_look`, the counters) are fed an address, and the
-  sections they fill (`[frame_time]`, `[memory.pressure]`, `[textures]`) must
+  sections they fill (`[frame_time]`, `[memory.pressure]`, `[memory.views]`,
+  `[memory.map]`, `[textures]`) must
   hold numbers and booleans only.
 
 ## The format
@@ -177,7 +178,7 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (3; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (4; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
 | `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
@@ -209,11 +210,14 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[frame_time]`** | What a frame cost, per frame over the whole run, from the meters of the log's once-a-second frame line (["Reading the frame figures"](#reading-the-frame-figures)) |
 | **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
+| **`[frame_time.spared]`**, **`.steady`** | Per frame, work the unified-memory synchronisation switches spared (all 0 with them off; [below](#reading-the-spared-work)) |
 | **`[pipelines]`** | `created_by_title`; host pipelines `host_made_now` (compiled during the run) and `host_from_library`; `host_failed` |
 | **`[shaders]`** | Translations `translated_now`, `from_cache`, `failed` |
 | **`[shaders.failures]`** | Failed translations by the translator's own kind (`not_a_container`, `malformed`, `native_code`, `unsupported`) and wording |
 | **`[memory]`** | In MiB: `process_commit_peak`, `working_set_peak`; `vram_peak` and `shared_peak` with the budget when each was reached (`QueryVideoMemoryInfo`, as the budget governor samples it); `out_of_memory_retried_ok` / `_failed`; `governor_level_changes`, `governor_worst_level` |
 | **`[memory.pressure]`** | How short memory ran: the lowest free memory and commit headroom, time at each governor level, the card past its budget, the commit guard, the waits for new memory ([below](#reading-memory-pressure-and-textures)) |
+| **`[memory.views]`** | The runtime's views of title pages and the descriptor table's entries of views without a resource, since the start ([below](#reading-memoryviews)) |
+| **`[memory.map]`**, **`[memory.map.peak]`** | Where the process's memory is, by our own categories, in MiB, as of the report (sampled each time it is written) and the most each held ([below](#reading-the-memory-map)) |
 | **`[textures]`** | Textures shaders pick from the view heap by index: uploads, slots waiting for their memory, a full card; texture refreshes per frame ([below](#reading-memory-pressure-and-textures)) |
 | **`[unimplemented]`** | `methods_called` (distinct), `methods_lost` (calls that found the table full), `pipelines_gone_without` (calls of the device's pipeline creation methods that are not implemented, `DeserializeGraphicsPipelineStateX` and `DeserializeComputePipelineStateX` at 0x1c8 and 0x218: each a pipeline the title did not get that way), `imports_named`, `imports_other` and `imports_other_calls`; then one `[[unimplemented.method]]` per D3D12.X method not written yet that was called, those two included (`interface`, `offset` in its function table, `calls`) and one `[[unimplemented.import]]` per named import (`name`, `calls`) |
 
@@ -279,6 +283,61 @@ than `VICTORY_LATE_WAIT_LISTS` lets fly), `bottom_of_pipe_writes`
 (`VICTORY_LATE_WAIT_WRITES`), `blocking_fence_wait` (the title blocks on a
 fence).
 
+### Reading the memory map
+
+`[memory.map]` says where the process's memory went by our own categories,
+each in MiB, as of the moment the report was written (it is rewritten every
+30 s and at the end; the last one is the run's end). `[memory.map.peak]` has
+the most each category held at any of those moments, so a peak between two
+writes is missed. A category nothing counted is left out (not known); one
+counted and empty is `0`. Nothing here is a name, an address or a path.
+
+| Key | From | Exact? |
+|---|---|---|
+| `process_private_commit_mib` | The process's private commit now (`PagefileUsage`) | Exact |
+| `accounted_total_mib` | The sum of the private categories below that are known | Sum of the figures; each shown rounded to a MiB, so the shown parts may differ from it by a MiB or two |
+| `unaccounted_mib` | `process_private_commit_mib` less `accounted_total_mib` (0 if the categories add up to more): what the map does not explain, such as the driver's memory, the title's own heaps (its `HeapAlloc`s and stacks, apart from the pages it committed) and allocations we do not count | The difference |
+| `title_committed_mib` | Host pages the title committed through its `VirtualAlloc`s, each counted once, less what it freed (the figure the title is told it uses). Left out with `VICTORY_TITLE_USED=counter` or `=process` | Exact |
+| `title_default_blocks_mib` | Blocks the title took from the default heap | Exact |
+| `title_buffer_copies_mib` | Host copies of title buffers: bytes of copies alive less the windows' lengths | Estimate (a copy only a list still holds, whose window is gone from the table, counts here) |
+| `windows_of_title_memory_mib` | Host copies of windows of title memory outside buffers (not sparse: those hold tiles on the card) | Exact lengths; the table is read without waiting, the last figure stands if it is being written |
+| `snapshot_buffers_mib` | Snapshot buffers kept for reuse (capacity) | Exact, as above |
+| `list_scratch_mib` | Scratch chunks of host lists alive (held, spare and reserve) | Exact |
+| `list_upload_buffers_mib` | The other upload buffers of host lists | Exact |
+| `texture_staging_mib` | Blocks of staging buffers (with the texture pool, `VICTORY_TEXTURE_POOL`, on by default), else the staging buffers alive | Exact for the blocks; a staging buffer made outside the pool is not in it |
+| `send_spare_mib` | Memory kept spare for sends to the card-side copies | Exact (in the card's memory with `VICTORY_SEND_BAR=1`) |
+| `view_table_mib` | The tables of distinct views (entries, index nodes, shapes) | Estimate |
+| `shader_containers_mib`, `shader_translations_mib` | Shader containers kept by the pipeline table, and the host code of their translations | Exact bytes of the containers and code; not the objects around them |
+| `pipeline_library_mib` | The pipeline library's file, kept whole in memory | Exact |
+| `title_page_pool_mib` | Pages the title was given from its page pool (sections: not in private commit, so not in the total) | Exact |
+| `card_textures_filled_mib`, `card_textures_rendered_mib` | The card's memory for host copies of textures the title fills, and for the rest of the host textures (targets, depth, textures shaders write) | Exact as the host sizes them |
+| `card_texture_tiles_mib`, `card_sparse_tiles_mib` | Tiles given to textures, and to sparse windows of title memory | Exact |
+| `card_buffer_copies_mib` | Card sides of host copies of title buffers | Exact |
+| `descriptor_heaps_mib` | Shader-visible descriptor heaps the host holds (driver memory; not in the total) | Exact heap sizes |
+| `host_lists_alive` | A count: host lists alive. Their allocators are not measured (no byte figure exists) and land in `unaccounted_mib` | Exact count |
+
+The card's own use is also in `[memory]` (`vram_peak`, from the system's own
+counters); the `card_*` keys say what of it is ours, by kind. Not counted, so
+in `unaccounted_mib`: the driver's command memory and objects, command list
+allocators, the title's non-committed heaps, the pipeline and shader objects
+the host made (only the bytes above are counted) and the tables of descriptors
+on the CPU side.
+
+### Reading the spared work
+
+`[frame_time.spared]` (and its `.steady`) counts work that a switch of the
+unified-memory synchronisation leaves out or does another way, per frame,
+from the frame line's own lines for each switch. Every key is 0 while its
+switch is off.
+
+| Key | Switch | What it is, and which figure it should move |
+|---|---|---|
+| `shader_writes_left_on_card_mb` | `VICTORY_WC_NO_BACK` | MB a frame shaders were declared to write into big copies of write-combined title memory and that stayed on the card: no compare, fetch or merge. `copying_back_ms`/`_mb` and `title_memory_changed_under_shader_writes` should fall |
+| `heap_pages_read_in_place` | `VICTORY_SYNC_IN_PLACE` | Changed heap pages whose descriptor records were read where they are and compared as read, not copied through the kernel first. The heaps' records line's "reading and comparing" and the submitting thread's wait for them (in `preparing_ms`) should fall |
+| `slot_writes_sparing_spans` | `VICTORY_SPANS_QUICK` | Writes of view slots that left the placed views' spans and their lock alone. Less waiting on that lock, in the heaps' records' round and the texture passes |
+| `heap_rounds_begun_first` | `VICTORY_HEAP_SYNC_FIRST` | Submissions whose round of the heaps' records began as they took the submission lock, beside the planning before it |
+| `heap_rounds_asked_at_submit` | `VICTORY_HEAP_SYNC_AT_SUBMIT` | Preparings that found the round they need asked for at the title's submit call, while the submission waited in the line (with `VICTORY_ASYNC_SUBMIT`) |
+
 ### Reading memory pressure and textures
 
 | Key | From | A high value means |
@@ -298,6 +357,20 @@ fence).
 | `uploaded_again_while_full` | Uploads of textures already on the card made while it had no room | Bytes spent while the card was full |
 | `smallest_levels_only`, `_mib` | "host copies of only the smallest levels" made while the card had no room (`VICTORY_TEXTURE_TAIL`) | Textures shown blurry for want of card memory |
 | `refresh_ms`, `refresh_ms_steady` | "texture refreshes per frame, all threads: N ms" | Texture work on every thread, the submitting one included |
+
+### Reading `[memory.views]`
+
+Counted since the start by the runtime (`xmem`, which the launcher registers
+as a sampler of its own beside the GPU side's) and by the descriptor table
+(`descriptor`). Plain counts, a handful of relaxed atomic adds where views
+are mapped and unmapped.
+
+| Key | From | A high value means |
+|---|---|---|
+| `title_views_mapped`, `title_views_unmapped` | Views of the host's mapped and unmapped at title addresses: the title's mapping calls, the GPU's page-mapping copies, views kept in the books made real | Each is a system call (an unmap flushes every core's address cache) and an entry of the process's address space while it is there; tens of thousands a minute is the title streaming |
+| `title_view_pages_avg` | The 64 KiB pages those views showed, per view | Near 1: the page-mapping copies map a view a page; `VICTORY_MAP_RUNS` (on by default with 24 GiB or less) maps a run of consecutive pages in one view, which raises it |
+| `book_views_noted`, `book_views_let_go_untouched`, `book_views_made_real`, `book_views_now` | Views kept in the runtime's books alone, with no view of the host's until touched (`VICTORY_LAZY_VIEWS`, `VICTORY_SOFT_VIEWS`; all 0 with both off) | `let_go_untouched` is what was spared (no map, no unmap); `made_real` close to `noted` means the views are touched anyway and nothing is gained |
+| `ownerless_entries_kept`, `ownerless_entries_dropped` | Descriptor table entries of views no resource releases (constant buffer views and views of placed memory that do not fit a record): kept now, and freed for the cap (`VICTORY_OWNERLESS_VIEWS`; none dropped with it off) | Kept growing for the whole run is memory that is never given back; with the cap, `dropped` counts entries made stale |
 
 ### A sample
 
@@ -323,7 +396,7 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 3
+format = 4
 kind = "run"
 
 [rox_box]
@@ -486,6 +559,21 @@ lists_in_the_air = 0.00
 bottom_of_pipe_writes = 0.81
 blocking_fence_wait = 0.27
 
+[frame_time.spared]
+# per frame, work the unified-memory switches spared (0 with them off), whole run
+shader_writes_left_on_card_mb = 50.00
+heap_pages_read_in_place = 9.00
+slot_writes_sparing_spans = 0.00
+heap_rounds_begun_first = 0.00
+heap_rounds_asked_at_submit = 0.00
+
+[frame_time.spared.steady]
+shader_writes_left_on_card_mb = 50.00
+heap_pages_read_in_place = 9.00
+slot_writes_sparing_spans = 0.00
+heap_rounds_begun_first = 0.00
+heap_rounds_asked_at_submit = 0.00
+
 [pipelines]
 created_by_title = 4212
 host_made_now = 310
@@ -535,6 +623,78 @@ resident_wait_longest_ms = 41.00
 mapped_waits = 2400
 mapped_wait_ms = 900.00
 mapped_wait_longest_ms = 12.50
+
+[memory.views]
+# views of the host's at title addresses since the start, and the pages one showed on average
+title_views_mapped = 40000
+title_views_unmapped = 39000
+title_view_pages_avg = 2.50
+# views kept in the books alone until touched (VICTORY_LAZY_VIEWS, VICTORY_SOFT_VIEWS)
+book_views_noted = 0
+book_views_let_go_untouched = 0
+book_views_made_real = 0
+book_views_now = 0
+# descriptor table entries of views no resource releases: kept now, freed for the cap (VICTORY_OWNERLESS_VIEWS)
+ownerless_entries_kept = 1048576
+ownerless_entries_dropped = 52000
+
+[memory.map]
+# MiB, sampled when the report is written; a category left out is one nothing counted (not known)
+# private: what the process holds in its own private memory; accounted_total is their sum,
+# unaccounted the process's private commit less it (the driver, the title's own heaps, what is not counted)
+process_private_commit_mib = 18700
+accounted_total_mib = 9300
+unaccounted_mib = 9400
+# private memory, in the total
+title_committed_mib = 4100
+title_default_blocks_mib = 120
+title_buffer_copies_mib = 900
+windows_of_title_memory_mib = 2100
+snapshot_buffers_mib = 64
+list_scratch_mib = 700
+list_upload_buffers_mib = 250
+texture_staging_mib = 900
+send_spare_mib = 0
+view_table_mib = 12
+shader_containers_mib = 40
+shader_translations_mib = 60
+pipeline_library_mib = 30
+# beside it (card memory, mapped sections, descriptor heaps): not in the total
+title_page_pool_mib = 6200
+card_textures_filled_mib = 4300
+card_textures_rendered_mib = 1500
+card_texture_tiles_mib = 0
+card_buffer_copies_mib = 800
+card_sparse_tiles_mib = 1300
+descriptor_heaps_mib = 96
+# counts
+host_lists_alive = 640
+
+[memory.map.peak]
+# the most each category held when a report was written (a report is written every 30 s and at the end)
+accounted_total_mib = 9800
+unaccounted_mib = 9500
+title_committed_mib = 4100
+title_default_blocks_mib = 120
+title_buffer_copies_mib = 1200
+windows_of_title_memory_mib = 2600
+snapshot_buffers_mib = 64
+list_scratch_mib = 900
+list_upload_buffers_mib = 300
+texture_staging_mib = 1100
+send_spare_mib = 0
+view_table_mib = 12
+shader_containers_mib = 40
+shader_translations_mib = 60
+pipeline_library_mib = 30
+title_page_pool_mib = 6200
+card_textures_filled_mib = 4400
+card_textures_rendered_mib = 1500
+card_texture_tiles_mib = 0
+card_buffer_copies_mib = 800
+card_sparse_tiles_mib = 1500
+descriptor_heaps_mib = 96
+host_lists_alive = 700
 
 [textures]
 # textures picked by index (from the view heap by shaders), since the start
@@ -587,7 +747,8 @@ calls = 1
   may have held the heap.
 - **The settles' waits of the last part of a second**
   (`[frame_time.waits]`) are not taken at the end as the other meters are:
-  they are kept where the log's settle line reads them.
+  they are kept where the log's settle line reads them. The same holds for
+  `[frame_time.spared]`.
 - **Per-frame submissions and draws** are counted between two presents of any
   queue; with several presenting queues the frames interleave.
 - **Shaders that fail before the translator** (a container that does not

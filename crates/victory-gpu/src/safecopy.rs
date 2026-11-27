@@ -134,6 +134,44 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
+    ".globl victory_safe_changed",
+    ".globl victory_safe_changed_at",
+    ".globl victory_safe_changed_after",
+    ".globl victory_safe_changed_failed",
+    // rcx title memory, rdx the records last seen, r8 records of 32 bytes,
+    // r9 a bit per record (the caller zeroes them). Each record of title
+    // memory is loaded once (the one load of it, below), compared with the
+    // one last seen, and where they differ stored over it and its bit set.
+    // eax: whether every record could be read (where one could not, those
+    // before it are done and the rest are untouched).
+    "victory_safe_changed:",
+    "xor r10d, r10d",
+    "test r8, r8",
+    "jz 3f",
+    "2:",
+    "victory_safe_changed_at:",
+    "vmovdqu ymm0, ymmword ptr [rcx]",
+    "victory_safe_changed_after:",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [rdx]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 4f",
+    "vmovdqu ymmword ptr [rdx], ymm0",
+    "bts qword ptr [r9], r10",
+    "4:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "inc r10",
+    "cmp r10, r8",
+    "jb 2b",
+    "3:",
+    "vzeroupper",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_changed_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -149,6 +187,29 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
+    fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64) -> u32;
+    fn victory_safe_changed_at();
+    fn victory_safe_changed_after();
+    fn victory_safe_changed_failed();
+}
+
+/// The records of 32 bytes at `title` (`records` of them) that differ from
+/// those in `seen`, read where they are, each once: such a record goes over
+/// the one in `seen` and gets its bit in `bits` (record `n`: bit `n % 64` of
+/// word `n / 64`). False if a page of title memory could not be read: the
+/// records before it are done then, the others are as they were. Ported from
+/// trustno1-coder/VIctory-NVIDIA 769fe52 (from Belobug/VIctory-Belobug-AMD
+/// 15ab94e).
+///
+/// # Safety
+/// `seen` is `records * 32` bytes of ours that nothing else reads or writes
+/// meanwhile; `bits` has at least `records.div_ceil(64)` words, all 0;
+/// `title` is as [`copy`]'s source. [`on`] must have been asked.
+pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bits: &mut [u64]) -> bool {
+    assert!(bits.len() >= records.div_ceil(64));
+    // SAFETY: a fault reading title memory leaves through the failing exit
+    // ([`failing_exit`]); the rest is the caller's.
+    unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr()) != 0 }
 }
 
 /// What [`merge`] did.
@@ -354,6 +415,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     if (from..to).contains(&at) {
         return Some(victory_safe_put_failed as *const () as usize);
     }
+    let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_changed_failed as *const () as usize);
+    }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
     (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
 }
@@ -407,6 +472,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The records that differ get their bits and go over those last seen,
+    /// as a compare of a copy finds them; a page that is not there fails, the
+    /// records before it done and the rest left as they were.
+    #[test]
+    fn changed_records_are_found_where_they_are() {
+        assert!(on());
+        let pages = Pages::new(3 << 12);
+        pages.fill();
+        let records: usize = (3 << 12) / 32;
+        let bits_of = |bits: &[u64]| -> Vec<usize> { (0..records).filter(|n| bits[n / 64] >> (n % 64) & 1 != 0).collect() };
+        // SAFETY: inside the allocation.
+        let title = unsafe { std::slice::from_raw_parts(pages.0, pages.1) }.to_vec();
+        let mut seen = title.clone();
+        let differ = [0usize, 1, 31, 63, 64, 65, 127, 200, 383];
+        for &n in &differ {
+            seen[n * 32 + n % 32] ^= 0x11;
+        }
+        // As the copy and compare of `crate::descriptor` would find them.
+        let mut by_copy = Vec::new();
+        for n in 0..records {
+            if title[n * 32..n * 32 + 32] != seen[n * 32..n * 32 + 32] {
+                by_copy.push(n);
+            }
+        }
+        assert_eq!(by_copy, differ);
+        let mut bits = vec![0u64; records.div_ceil(64)];
+        // SAFETY: inside the allocation; `seen` and `bits` are ours.
+        assert!(unsafe { changed(pages.0, seen.as_mut_ptr(), records, &mut bits) });
+        assert_eq!(bits_of(&bits), by_copy);
+        assert_eq!(seen, title);
+        bits.fill(0);
+        // SAFETY: as above.
+        assert!(unsafe { changed(pages.0, seen.as_mut_ptr(), records, &mut bits) });
+        assert!(bits.iter().all(|&b| b == 0), "nothing new the second time");
+        // The second page is not there: records 0 (first page) and 200 (third).
+        for n in [0usize, 200] {
+            seen[n * 32] ^= 0x22;
+        }
+        // SAFETY: a page of our allocation.
+        unsafe { VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT) };
+        let mut bits = vec![0u64; records.div_ceil(64)];
+        // SAFETY: as above; the page that is not there fails the call.
+        assert!(!unsafe { changed(pages.0, seen.as_mut_ptr(), records, &mut bits) });
+        assert_eq!(bits_of(&bits), [0]);
+        assert_eq!(seen[..32], title[..32]);
+        assert_ne!(seen[200 * 32..201 * 32], title[200 * 32..201 * 32], "after the failure: as it was");
     }
 
     /// The dwords that changed are stored, and no byte of any other, at

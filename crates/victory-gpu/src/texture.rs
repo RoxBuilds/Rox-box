@@ -740,6 +740,12 @@ pub(crate) fn memory() -> [u64; 3] {
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
+/// For the run report: the bytes of staging buffers alive (pieces of the
+/// pool's blocks among them).
+pub(crate) fn report_staged() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -1687,7 +1693,11 @@ impl Staging {
             }
             return size;
         }
-        if through_copy() {
+        // (A texture with pages in views the runtime keeps in its books
+        // alone, `VICTORY_SOFT_VIEWS`, has no memory to read in place: its
+        // bytes come from the pages, through the copy. `_mapped` is held: no
+        // view becomes one of those before the read in place below is done.)
+        if through_copy() || !crate::watch::soft_runs(self.memory as usize, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1982,6 +1992,32 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if crate::watch::soft().is_some() {
+        // Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`)
+        // are committed as far as the title goes, and stay as they are;
+        // Windows is asked about what lies between them.
+        let runs = crate::watch::soft_runs(at as usize, len);
+        if runs.is_empty() {
+            return committed_there(at, len);
+        }
+        let (mut from, end) = (at as usize, at as usize + len);
+        for (run, bytes) in runs {
+            if run > from && !committed_there(from as *const u8, run - from) {
+                return false;
+            }
+            from = run + bytes;
+        }
+        return from >= end || committed_there(from as *const u8, end - from);
+    }
+    // Memory the runtime keeps in its books alone (`VICTORY_LAZY_VIEWS`) is
+    // committed as far as the title goes: made a mapping before Windows is
+    // asked.
+    crate::watch::materialize(at as usize, len);
+    committed_there(at, len)
+}
+
+/// [`committed`], of memory the host has mapped or has not.
+fn committed_there(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }

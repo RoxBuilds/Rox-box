@@ -25,6 +25,10 @@ shader lowering concepts from upstream contributors:
 - **PalmVIDev** — copy-back of shader writes that keeps concurrent title
   writes (the run-wise merge credited in `crates/victory-gpu/src/shadow.rs`,
   upstream VIctory #2009)
+- **trustno1-coder/VIctory-NVIDIA** (`GPL-3.0-or-later`) — shader writes into
+  write-combined memory left on the card, and the descriptor-heap record
+  sync switches (several by way of Belobug/VIctory-Belobug-AMD), credited per
+  commit where they were ported
 
 Individual upstream changes are credited where they were adapted, in code
 comments of the form "after upstream ..." with the upstream commit or pull

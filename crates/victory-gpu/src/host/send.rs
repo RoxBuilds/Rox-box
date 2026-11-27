@@ -170,6 +170,16 @@ pub(super) fn spare_bytes() -> u64 {
     SPARE.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.size).sum()
 }
 
+/// For the run report: the bytes of sends' memory kept now, or `None` while
+/// the list is in use (nothing is waited for).
+pub(super) fn report_spare() -> Option<u64> {
+    match SPARE.try_lock() {
+        Ok(spare) => Some(spare.iter().map(|m| m.size).sum()),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().iter().map(|m| m.size).sum()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Whether the memory lies in the card's memory, written by the CPU through
 /// the bus (`VICTORY_SEND_BAR=1`): the copies on the card's drawing queue, which
 /// nothing overlaps, then cross no bus. In a captured frame they took a sixth

@@ -181,3 +181,43 @@ for:
 
 If a run shows otherwise, switch them off one at a time (`=0`) and compare
 two reports with `victory report --diff`.
+
+One run of a title on an 8 GiB card with 16 GiB of RAM has since been read.
+It confirmed the card's side: `vram_peak` stayed under `vram_budget_at_peak`
+and `vram_over_budget` was false. It did not confirm the rest:
+`resident_waits` stayed in the tens of thousands, because the wall on that PC
+was not the card but the PC's own memory (the budget governor at red for most
+of the run, free RAM down to a few hundred MiB).
+
+## When the PC's memory is the wall
+
+A PC with 16 GiB of RAM can run out of memory before the card does. The
+report's `[memory.pressure]` says so (`governor_red_s`, `lowest_free_ram_mib`),
+`[memory.map]` says where the process's memory is by our own categories, and
+`[memory.views]` counts the views of title pages. These switches are aimed at
+it; all were ported from other projects of the same family (credited where
+they are read, and in `THIRD_PARTY_NOTICES.md`) and **none has been confirmed
+by a run of a title here yet**:
+
+- `VICTORY_MAP_RUNS` (on by default with 24 GiB of RAM or less; `=0` off): a
+  run of consecutive title pages is mapped as one view, not a view a page.
+  `[memory.views]` `title_view_pages_avg` should be above 1 and
+  `title_views_mapped` lower.
+- `VICTORY_OWNERLESS_VIEWS=<n>` (off): at most `n` table entries of views no
+  resource releases are kept (1048576 is the figure it was measured with
+  elsewhere). `ownerless_entries_kept` stops growing.
+- `VICTORY_LAZY_VIEWS=1`, `VICTORY_SOFT_VIEWS=copies` (off, experimental):
+  views of title pages are kept in our books and mapped only when touched.
+  `book_views_let_go_untouched` against `book_views_made_real` says whether
+  it saves anything.
+- `VICTORY_WC_NO_BACK=1` (off): what shaders write into large copies of
+  write-combined title memory stays on the card. `[frame_time.spared]`
+  `shader_writes_left_on_card_mb` counts it; `copying_back_ms` and the
+  `title_memory_changed_under_shader_writes` wait should fall.
+- `VICTORY_SYNC_IN_PLACE=1`, `VICTORY_SPANS_QUICK=1`, `VICTORY_SYNC_FINE=1`,
+  `VICTORY_HEAP_SYNC_FIRST=1`, `VICTORY_HEAP_SYNC_AT_SUBMIT=1` (off): the
+  descriptor heaps' records are read and compared with less work and earlier.
+  `[frame_time.spared]` counts each; `preparing_ms` should fall.
+
+Turn them on one group at a time with `scripts\play.cmd ... -More "NAME=1"`
+and compare two reports with `victory report --diff`.

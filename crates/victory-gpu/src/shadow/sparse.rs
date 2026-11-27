@@ -143,6 +143,11 @@ fn fallback() -> bool {
 /// take the pool's lock: set wherever the pool changes.
 static GIVEN: AtomicU64 = AtomicU64::new(0);
 
+/// The bytes of the tiles given now, for the run report.
+pub(super) fn given_now() -> u64 {
+    GIVEN.load(Ordering::Relaxed)
+}
+
 fn note_given(pool: &Pool) {
     GIVEN.store(pool.given_bytes(), Ordering::Relaxed);
 }
@@ -321,10 +326,21 @@ fn runs_of(mut bits: u64) -> Vec<(usize, usize)> {
 }
 
 /// The tiles of the 4 MiB of addresses from `cell` on in which this process
-/// has committed pages it may read.
+/// has committed pages it may read. Views the runtime keeps in its books
+/// alone are committed memory as far as the title goes: with
+/// `VICTORY_SOFT_VIEWS` they count as they are (their bytes are read from
+/// their pages, `crate::host`'s reads), with `VICTORY_LAZY_VIEWS` they are
+/// made mappings of the host's before Windows is asked.
 fn committed_tiles(cell: u64) -> u64 {
     let (mut at, end) = (cell as usize, (cell + WINDOW) as usize);
     let mut bits = 0;
+    if crate::watch::soft().is_some() {
+        for (from, n) in crate::watch::soft_runs(at, end - at) {
+            bits |= tiles_of(from - at, from + n - at);
+        }
+    } else {
+        crate::watch::materialize(at, end - at);
+    }
     while at < end {
         // SAFETY: plain data filled in by the query.
         let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
