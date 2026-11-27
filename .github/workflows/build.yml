@@ -60,10 +60,11 @@ jobs:
           # No game folder and no graphics card here: the report is what is tried.
           .\victory.exe check
           # The frame path with the binary as shipped, on the software adapter
-          # (docs/selftest.md). Shown, not enforced yet: what a hosted runner's
-          # adapter can do is read from these lines first.
+          # (docs/selftest.md): the hosted runners' adapter has shader model 6.6
+          # and runs every stage, so a stage that fails here fails the build.
+          # The rates are for reading in the log; nothing is compared yet.
           .\victory.exe selftest --warp --bench
-          Write-Host "selftest exit code: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { Write-Host "selftest exit code: $LASTEXITCODE"; exit 1 }
           exit 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
