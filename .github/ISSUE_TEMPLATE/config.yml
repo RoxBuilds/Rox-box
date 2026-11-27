@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question or chat (Discord)
+    url: https://discord.gg/aSmCFjCDTR
+    about: Help with setup, questions and community chat. Never share game files, keys or other copyrighted material there.
+  - name: Ask a question (GitHub Discussions)
+    url: https://github.com/RoxBuilds/Rox-box/discussions
+    about: Questions about using or building Rox-box that are not a bug report or a feature request.

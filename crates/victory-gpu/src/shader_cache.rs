@@ -127,7 +127,17 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // (what a translation has to say of a costly form goes to the log, cache or none)
     victory_shader::emit::on_costly_form_kept(costly_form_kept);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // (Each call is a translation done now, from the cache or without one:
+    // counted for the run report, a failure under the translator's reason.)
+    let translate = |c: &[u8]| {
+        use victory_pipeline::report::{Stat, bump};
+        let translated = victory_shader::emit::translate(c);
+        match &translated {
+            Ok(_) => bump(Stat::ShadersTranslated),
+            Err(e) => crate::runreport::shader_failed(e),
+        }
+        translated.map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

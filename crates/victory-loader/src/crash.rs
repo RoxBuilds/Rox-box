@@ -52,6 +52,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
+            victory_core::report::panicked();
             append_to_log(&format!(
                 "Rox-box: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
@@ -494,8 +495,67 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
+    // The run report first, allocating nothing on this thread: the end is
+    // stored and the report's own thread writes it while this one reports
+    // the crash; then this waits a little for it (it may be blocked behind
+    // what this thread holds: the heap, say).
+    // SAFETY: the system passes valid exception pointers.
+    let (code, at) = unsafe {
+        let record = &*(*info).ExceptionRecord;
+        (record.ExceptionCode as u32, record.ExceptionAddress as usize)
+    };
+    use victory_core::report::{Exception, crash};
+    let written = crash(crash_place(at), Exception::of_code(code));
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    written.wait(std::time::Duration::from_secs(2));
+}
+
+/// Bases of the title's images, for [`crash_place`] (read without a lock
+/// from the exception filter).
+static TITLE_IMAGES: [std::sync::atomic::AtomicUsize; 64] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+
+/// A title image is mapped at `base`.
+pub(crate) fn note_title_image(base: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for slot in &TITLE_IMAGES {
+        if slot.load(Relaxed) == base
+            || slot.compare_exchange(0, base, Relaxed, Relaxed).is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Where the code at `at` is, in the run report's words: the module that
+/// holds it is ours, the title's, the host's, or there is none. No
+/// allocation, no lock.
+fn crash_place(at: usize) -> victory_core::report::CrashIn {
+    use victory_core::report::CrashIn;
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: looks up the module containing `at`; no reference taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 || module.is_null() {
+        return CrashIn::NoModule;
+    }
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: the handle of this process's executable; no reference taken.
+    let ours = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let base = module as usize;
+    if module == ours {
+        CrashIn::RoxBoxCode
+    } else if TITLE_IMAGES.iter().any(|b| b.load(std::sync::atomic::Ordering::Relaxed) == base) {
+        CrashIn::TitleCode
+    } else {
+        CrashIn::HostDll
+    }
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),

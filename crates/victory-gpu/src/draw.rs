@@ -890,6 +890,7 @@ pub(crate) static CONSTANTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// line at the first and at every 4,096th.
 fn constants_dropped() {
     let n = CONSTANTS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::runreport::hint(victory_pipeline::report::LeftOut::OutOfMemory);
     #[cfg(feature = "diagnostics")]
     crate::pipeline::note_why(CONSTANTS_REFUSED.to_owned());
     if n == 1 || n.is_multiple_of(4096) {
@@ -1713,6 +1714,7 @@ impl State {
                 }
                 Some(_) => {
                     once!("a draw whose descriptor table found no free slots is dropped");
+                    crate::runreport::hint(victory_pipeline::report::LeftOut::NoDescriptorSlots);
                     return false;
                 }
                 None => {}
@@ -3026,12 +3028,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::hint(victory_pipeline::report::LeftOut::BuilderOff);
+            crate::runreport::left_out(self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3045,6 +3050,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3058,6 +3064,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3445,6 +3452,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3955,6 +3963,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3999,6 +4008,7 @@ impl State {
                 // want of scratch memory ([`null_constants`]).
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_why("no memory for its rectangles' vertices".to_owned());
+                crate::runreport::hint(victory_pipeline::report::LeftOut::OutOfMemory);
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -4064,6 +4074,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::runreport::left_out(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4136,6 +4147,12 @@ impl State {
         Some((scratch, at))
     }
 
+    /// An indirect execution [`State::execute_indirect`] could not run is
+    /// counted as left out (the run report).
+    pub(crate) fn left_out(&self) {
+        crate::runreport::left_out(self.pipeline);
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -4156,6 +4173,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::runreport::hint(victory_pipeline::report::LeftOut::BuilderOff);
             return false;
         }
         const DRAW: u32 = 0;
@@ -4302,6 +4320,7 @@ impl State {
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why(crate::indirect::refused_why().says());
+                    crate::runreport::hint(victory_pipeline::report::LeftOut::IndirectNotBounded);
                     return false;
                 };
                 self.host_pipeline = 0;

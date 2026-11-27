@@ -63,9 +63,13 @@ pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod runreport;
+#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
+#[cfg(windows)]
+pub mod selftest;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
@@ -94,6 +98,9 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// Copies the GPU side's counters into the run report (its sampler).
+#[cfg(windows)]
+pub use runreport::sample as report_sample;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

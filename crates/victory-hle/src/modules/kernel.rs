@@ -238,12 +238,14 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleExited(code));
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleAborted);
     host::abort()
 }
 
@@ -251,12 +253,14 @@ pub extern "C" fn abort() -> ! {
 /// the host's `abort`.
 pub extern "C" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleAborted);
     host::abort()
 }
 
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleAborted);
     host::abort()
 }
 
@@ -286,6 +290,8 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        use victory_loader::report::{End, finish};
+        let _ = finish(End::TitleExited(code as i32));
     }
     host::terminate_process(process, code)
 }

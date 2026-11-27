@@ -2872,8 +2872,12 @@ extern "system" fn execute_indirect(
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            if !ran {
+                s.left_out();
+            }
         });
     } else {
+        victory_pipeline::report::left_out(victory_pipeline::report::LeftOut::Other);
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",

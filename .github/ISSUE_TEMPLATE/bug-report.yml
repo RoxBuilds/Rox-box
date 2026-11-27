@@ -1,0 +1,66 @@
+name: Something goes wrong in a run
+description: A run stops, crashes, shows wrong output or is far slower than it should be.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. Rox-box is a clean-room, non-commercial project, so a report may never name the title or contain anything made from it. Describe what happens in **platform terms** (which API, which Direct3D 12 call, which message of ours), and use the numbers-only run report below.
+
+        Read [CONTRIBUTING.md](https://github.com/RoxBuilds/Rox-box/blob/main/CONTRIBUTING.md#reporting-a-problem-without-breaking-the-rules) first. Reports that break these rules are edited or closed.
+  - type: input
+    id: version
+    attributes:
+      label: Rox-box version
+      description: The version of the download (for example 0.2.0), or the source-tree commit if you built it yourself. `victory.exe --version` prints it.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, in your own words
+      description: In platform terms. What did you expect, and what did the layer do instead? Do not name the title or its publisher.
+      placeholder: "The run stopped after about a minute with an error line from the layer about an unimplemented import ..."
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `play.cmd -Check`
+      description: Paste only the lines Rox-box itself printed (the OK, WARN and MISSING lines). Replace any folder path with something generic such as `D:\MyTitles\SomeTitle`, and leave out anything that came from the title.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: run-report
+    attributes:
+      label: Run report (`victory.exe report`)
+      description: Paste the text that `victory.exe report` prints for the latest run. It holds numbers only. If it holds anything that looks like a title name or file name, remove it before posting.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Result of `victory.exe selftest`
+      description: Paste what it prints. It uses Rox-box's own built-in test scene and needs no game files. If it does not run, say what it printed instead.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: switches
+    attributes:
+      label: Switches used
+      description: The options you gave `play.cmd` (for example `-Fast`, `-Safe`, `-Display 1920x1080`) and any `VICTORY_*` environment variables you set. Write "none" if there were none.
+      placeholder: "-Fast -Display 1280x720"
+    validations:
+      required: true
+  - type: checkboxes
+    id: clean-room
+    attributes:
+      label: Clean-room rules
+      options:
+        - label: I have not named the title, and I have not attached or pasted title files, logs, screenshots, video or crash dumps.
+          required: true

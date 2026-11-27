@@ -150,6 +150,8 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // The shareable run report (`VICTORY_REPORT=0`: none).
+    crate::report::start(&cfg);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -166,11 +168,16 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
+    let joined = main
         .join()
-        .map_err(|_| anyhow::anyhow!("the title's main thread stopped on an internal error (see the lines above)"))??;
-    println!("title exited with {code}");
-    Ok(())
+        .map_err(|_| anyhow::anyhow!("the title's main thread stopped on an internal error (see the lines above)"))
+        .and_then(|code| code);
+    if let Ok(code) = &joined {
+        println!("title exited with {code}");
+    }
+    use victory_core::report::{End, finish};
+    let _ = finish(joined.as_ref().map_or(End::RoxBoxError, |&code| End::TitleExited(code as i32)));
+    joined.map(|_| ())
 }
 
 /// The debugging aids (docs/debugging.md): scheduled stack dumps, watched values and

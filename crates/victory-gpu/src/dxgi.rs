@@ -244,6 +244,7 @@ fn display_size() -> (u32, u32) {
             _ => (3840, 2160),
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        victory_pipeline::report::display_mode(size.0, size.1);
         size
     })
 }

@@ -8,7 +8,9 @@ mod inspect;
 mod preflight;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+mod report;
 mod run;
+mod selftest;
 mod shader;
 mod translate;
 #[cfg(windows)]
@@ -172,6 +174,21 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Run the frame path end to end with a stand-in title of our own (no
+    /// game files, no config): device, clears and presents, title memory, a
+    /// translated shader. Exit code 0 when every stage passes.
+    Selftest {
+        /// On the software adapter (WARP), to tell a driver problem from a
+        /// layer problem.
+        #[arg(long)]
+        warp: bool,
+        /// Frames of the clear-and-present stage.
+        #[arg(long, default_value_t = 120)]
+        frames: u32,
+        /// Also time a few of the layer's own hot paths.
+        #[arg(long)]
+        bench: bool,
+    },
     /// Check everything a run needs (config, game folder, title executable,
     /// processor, Windows, memory, graphics card) and say how to fix what
     /// is missing. Starts nothing.
@@ -179,6 +196,16 @@ enum Command {
         /// The title executable (default: the only .exe in the configured
         /// game folder).
         exe: Option<PathBuf>,
+    },
+    /// Show the newest run report (every `run --execute` writes one; it is
+    /// safe to attach to a public issue), then its path on stderr.
+    Report {
+        /// List the reports kept, newest first.
+        #[arg(long, conflicts_with = "path")]
+        list: bool,
+        /// Print only the newest report's path.
+        #[arg(long)]
+        path: bool,
     },
 }
 
@@ -238,7 +265,7 @@ fn publish_external_paths(cfg: &victory_core::Config) {
 }
 
 fn real_main() -> Result<()> {
-    victory_core::logging::init("info");
+    victory_core::logging::init(selftest::log_level());
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -251,7 +278,7 @@ fn real_main() -> Result<()> {
     let reads_no_config = matches!(
         cli.command,
         Command::Config | Command::Check { .. } | Command::Inspect { .. } | Command::LibExports { .. }
-    );
+    ) || matches!(cli.command, Command::Selftest { .. });
     match victory_core::Config::load() {
         Ok(cfg) => publish_external_paths(&cfg),
         Err(_) if reads_no_config => {}
@@ -316,6 +343,8 @@ fn real_main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
         Command::Check { exe } => preflight::check(exe.as_deref()),
+        Command::Report { list, path } => report::run(list, path),
+        Command::Selftest { warp, frames, bench } => selftest::run(warp, frames, bench),
     }
 }
 

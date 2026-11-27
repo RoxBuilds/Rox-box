@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest something Rox-box should do, or do better, for players.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Rox-box implements a **platform**, never a single title: a request is considered by what the platform does (an API, a file format, a switch, the launcher), not by what one title needs. Do not name any title or publisher, and do not attach title files, logs, screenshots or video.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The goal, and what stops you today. Platform terms, please.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Rox-box to do?
+      description: Your idea, as concretely as you can. Alternatives you considered are welcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - Launcher (play.cmd, first-run setup)
+        - Documentation
+        - Graphics layer
+        - Shader translation
+        - Runtime / system APIs
+        - Loader
+        - Something else / not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: clean-room
+    attributes:
+      label: Clean-room rules
+      options:
+        - label: I have not named the title, and I have not attached or pasted title files, logs, screenshots, video or crash dumps.
+          required: true

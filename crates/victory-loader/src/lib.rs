@@ -52,6 +52,9 @@ pub use crash::{
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
+/// The run report, for victory-hle, whose path to victory-core this crate
+/// is (a dependency of its own would change the lock file).
+pub use victory_core::report;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -71,6 +71,8 @@
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
+pub mod synth;
+
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
@@ -918,37 +920,7 @@ mod tests {
         out
     }
 
-    fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
-        let (stream, rc) =
-            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
-        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-        let mut out = b"XBCH".to_vec();
-        out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
-        out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(stream);
-        out
-    }
-
-    /// `DXIL` part data: program header, XDAT index, then the blobs.
-    fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
-        let mut out = vec![0u8; XDAT_OFFSET];
-        out.extend_from_slice(b"XDAT");
-        out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0x24u32.to_le_bytes());
-        let mut offset = out.len() + 12 * blobs.len();
-        for (kind, blob) in blobs {
-            for v in [*kind, offset as u32, blob.len() as u32] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            offset += blob.len();
-        }
-        for (_, blob) in blobs {
-            out.extend_from_slice(blob);
-        }
-        out
-    }
+    use super::synth::{dxil_part as part, xbch};
 
     #[test]
     fn finds_graphics_programs() {

@@ -39,7 +39,7 @@ project this one descends from.
 | Crate | Role | Start in |
 |---|---|---|
 | `apps/victory` | The command-line front end: one module per command | `src/main.rs` |
-| `crates/victory-core` | Config lookup, logging, and the runtime half of the asset policy | `src/config.rs`, `src/policy.rs` |
+| `crates/victory-core` | Config lookup, logging, the runtime half of the asset policy, and the shareable run report | `src/config.rs`, `src/policy.rs`, `src/report.rs` |
 | `crates/victory-pe` | Read-only parsing of PE32+ images and import libraries | `src/image.rs` |
 | `crates/victory-loader` | Prepares, maps, binds and starts the title image; thread and TLS plumbing; crash reports; emulation of a few console-CPU instructions | `src/lib.rs` |
 | `crates/victory-hle` | The console's system APIs, one module per area, and the policy for passing shared APIs to the host | `src/lib.rs`, `src/modules/mod.rs` |
@@ -89,7 +89,8 @@ The whole sequence is `apps/victory/src/run.rs::run`. In order:
    (`victory-loader/src/thunks.rs`). Without `--execute` the run stops here,
    having printed what is bound and what is missing.
 7. **Start.** A crash reporter is installed (`victory_loader::report_crashes`,
-   writing `crashes.log` in the title's data folder), then
+   writing `crashes.log` in the title's data folder), the run report is begun
+   (`apps/victory/src/report.rs::start`), then
    `LoadedImage::spawn_main` runs the title DLLs' initialisers, the TLS
    callbacks and the original entry point on a thread with the stack size the
    image asks for. From here on the process runs title code.
@@ -210,6 +211,10 @@ logs its table offset, so a run says what to write next.
   ([docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)).
 - `replay/`, `capture.rs`, `timeline/` (diagnostics builds): recording a frame
   and running it again ([docs/replay.md](docs/replay.md)).
+- `selftest.rs`: a stand-in title that drives the D3D12.X tables end to end
+  with no title files ([docs/selftest.md](docs/selftest.md)); `runreport.rs`:
+  what the graphics layer feeds the run report
+  ([docs/run-report.md](docs/run-report.md)).
 
 ### Shader translation (`victory-shader`)
 
@@ -322,6 +327,9 @@ with the `diagnostics` feature ([docs/debugging.md](docs/debugging.md)).
   frame ([docs/replay.md](docs/replay.md)).
 - **To change what a player sees first**: `apps/victory/src/preflight.rs` and
   `scripts/play.ps1`.
+- **To try a change with no title files**: `victory selftest --warp`
+  ([docs/selftest.md](docs/selftest.md)).
+- **To see what to work on**: [ROADMAP.md](ROADMAP.md).
 
 Most files open with a module comment that explains the console behaviour
 being reproduced and why the code is shaped as it is. Approximations are
@@ -335,6 +343,8 @@ marked `shortcut:` in the code.
 - [docs/debugging.md](docs/debugging.md)
 - [docs/replay.md](docs/replay.md)
 - [docs/findings.md](docs/findings.md)
+- [docs/selftest.md](docs/selftest.md)
+- [docs/run-report.md](docs/run-report.md)
 - [docs/low-memory-gpus.md](docs/low-memory-gpus.md)
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)
 - [docs/README-fxceless.md](docs/README-fxceless.md)

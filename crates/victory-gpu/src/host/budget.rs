@@ -100,6 +100,7 @@ fn ask() -> Sample {
     if let Some([card_budget, card_used, budget, used]) = super::made_host().and_then(|h| h.video_memory()) {
         s.card = [card_budget, card_used];
         s.shared = [budget, used];
+        crate::runreport::video_memory(s.card, s.shared);
     }
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -303,11 +304,14 @@ pub(crate) fn look() {
         tend(need);
     }
     let now = level_of(&s, &lines());
+    use victory_pipeline::report::{Stat, max, set};
+    max(Stat::GovernorWorst, now as u64 + 1);
     let was = LOOKED.swap(now as u8, Ordering::Relaxed);
     if was == now as u8 {
         return;
     }
     let n = CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+    set(Stat::GovernorChanges, n);
     if n <= 8 || n.is_power_of_two() {
         tracing::info!(
             changes = n,

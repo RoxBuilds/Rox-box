@@ -457,6 +457,24 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines compiled during the run, and loaded from the library
+/// instead, since the start (for the run report).
+#[cfg(windows)]
+pub(crate) fn host_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
+/// Why a draw or dispatch of `this` is left out as far as its pipeline
+/// tells, in the run report's words, without allocating.
+#[cfg(windows)]
+pub(crate) fn left_out_reason(this: This) -> victory_pipeline::report::LeftOut {
+    if this.is_null() {
+        return victory_pipeline::report::LeftOut::NoPipeline;
+    }
+    make::left_out_reason(&pipeline(this).host)
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -558,6 +576,7 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    victory_pipeline::report::bump(victory_pipeline::report::Stat::PipelinesCreated);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]

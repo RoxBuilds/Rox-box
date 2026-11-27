@@ -79,6 +79,9 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            if made.is_none() {
+                victory_pipeline::report::bump(victory_pipeline::report::Stat::PipelinesFailed);
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -107,6 +110,23 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+/// Why `p` has no host pipeline, in the run report's words and without
+/// allocating ([`missing`] in a diagnostics build): not made yet (within the
+/// frame's wait budget), a shader of it that does not translate, or refused
+/// by the host; `Other` if it has one (its draw was left out for another
+/// reason).
+pub(crate) fn left_out_reason(p: &Pending) -> victory_pipeline::report::LeftOut {
+    use victory_pipeline::report::LeftOut;
+    match p.made.get() {
+        None => LeftOut::PipelineNotReady,
+        Some(Some(_)) => LeftOut::Other,
+        Some(None) if p.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))) => {
+            LeftOut::ShaderNotTranslated
+        }
+        Some(None) => LeftOut::PipelineRefused,
     }
 }
 

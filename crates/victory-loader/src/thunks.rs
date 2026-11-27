@@ -67,6 +67,8 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
             let (dll, symbol) = (&site.dll, &site.symbol);
             let text = format!("Rox-box: unimplemented import {dll}!{symbol} called");
             crate::log_crash(&text);
+            // (Its name is in the report only if the DLL is the platform's.)
+            let _ = victory_core::report::finish(victory_core::report::End::UnimplementedImport);
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
                 if IsDebuggerPresent() != 0 {

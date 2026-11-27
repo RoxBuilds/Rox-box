@@ -16,6 +16,8 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+# Copies `play.cmd -Setup` keeps of it
+/victory.toml.bak-*
 # Local-only inputs (patch manifests, shader profiles, tables you supply,
 # the policy denylist)
 /local/

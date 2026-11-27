@@ -1,0 +1,48 @@
+name: Development task (for contributors)
+description: Propose a change you intend to make, before you open a pull request.
+title: "[Task] "
+labels: ["dev-task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything larger than a fix, [CONTRIBUTING.md](https://github.com/RoxBuilds/Rox-box/blob/main/CONTRIBUTING.md) asks for an issue first. Say what you intend, so that the plan can be agreed before you write code. The clean-room rules apply to this issue as much as to the code: no title or publisher names, no title files, no logs, screenshots or video, no proprietary SDK material.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What will change, and why
+      description: The platform behaviour involved (the API, file format, instruction or shader construct) and what is wrong or missing today.
+    validations:
+      required: true
+  - type: input
+    id: crate
+    attributes:
+      label: Which crate (or script) does it touch?
+      description: For example a crate name under crates/, xtask, or scripts/play.ps1.
+      placeholder: "crates/..."
+    validations:
+      required: true
+  - type: input
+    id: switch
+    attributes:
+      label: Which VICTORY_* switch selects the old behaviour?
+      description: A change in runtime behaviour goes behind a switch with the previous behaviour still selectable. Write "none, because ..." if the change is not a behaviour change (documentation, a refactor, a test).
+      placeholder: "VICTORY_..."
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: How will it be tested without title files?
+      description: The test builds its own synthetic input. Describe it.
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you start
+      options:
+        - label: I have not named the title, and I have not attached or pasted title files, logs, screenshots, video or crash dumps.
+          required: true
+        - label: I will write the change myself, without proprietary code or SDK material, and license it under GPL-3.0-or-later.
+          required: true

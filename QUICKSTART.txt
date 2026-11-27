@@ -19,22 +19,45 @@ WHAT YOU NEED
 SET UP (ONCE)
   1. Unzip the whole folder anywhere you like (not inside a copy of the
      Rox-box source code). Keep its files together.
-  2. Copy  victory.example.toml  to  victory.toml  in the same folder
+  2. Double-click  play.cmd.  The first time, it asks for the folder that
+     holds your own, legally obtained title files (the title's .exe and
+     everything shipped beside it) and opens a window to pick it. Or, if you
+     prefer: drag that folder onto  play.cmd  in Explorer.
+     It remembers your choice in  victory.toml  (next to victory.exe), never
+     replaces a victory.toml you already have, then runs "victory check":
+     every prerequisite is listed as OK, WARN or MISSING, and each line that
+     is not OK says how to fix it. If nothing is MISSING it asks
+     "Start now? [Y/n]".
+  To pick another folder later: run  play.cmd -Setup  (the old victory.toml
+  is kept as victory.toml.bak-<date>, and only its game_dir line changes).
+  To test your PC without starting anything: open a terminal in the folder
+  (type  cmd  in Explorer's address bar) and run  play.cmd -Check.
+
+  Doing it by hand instead (the same result):
+  a. Copy  victory.example.toml  to  victory.toml  in the same folder
      (next to victory.exe).
-  3. Open victory.toml in Notepad and set game_dir to the folder that holds
+  b. Open victory.toml in Notepad and set game_dir to the folder that holds
      your title's files, in single quotes:
          game_dir = 'D:\MyTitles\SomeTitle'
-  4. Open a terminal in the folder (type  cmd  in Explorer's address bar)
-     and run:
-         play.cmd -Check
-     This runs "victory check": every prerequisite is listed as OK, WARN or
-     MISSING, and each line that is not OK says how to fix it. It starts
-     nothing.
+  c. Run  play.cmd -Check  in a terminal, as above.
+
+CHECK YOUR PC FIRST
+  Two commands, in a terminal opened in the folder, are new in this version:
+         victory.exe selftest
+     tests your graphics card and driver with Rox-box's own built-in test
+     scene. It needs no game files.
+         victory.exe report
+     prints the latest run report: a short summary of a run, with numbers
+     only (no title names, no files, no screenshots). It is safe to attach
+     when you report a problem.
 
 PLAY
   Double-click  play.cmd  (or run it in the terminal).
-  If the game folder holds more than one .exe, name the one to run:
+  If the game folder holds more than one .exe, name the one to run (or drag
+  that .exe onto play.cmd):
          play.cmd -Exe "D:\MyTitles\SomeTitle\title.exe"
+  Dragging a folder onto play.cmd uses it for that run only; if there is no
+  victory.toml yet, you are asked whether to remember it.
   Useful switches:
          play.cmd -Fast                lower memory use and resolution
          play.cmd -Display 1920x1080   the display size the title is told
@@ -60,6 +83,8 @@ THE FIRST RUN IS SLOW
 WHERE THINGS GO
   Logs (with -Log)      %LOCALAPPDATA%\victory\logs
   Crash log             %LOCALAPPDATA%\victory\data\<title id>\crashes.log
+  Run reports           %LOCALAPPDATA%\victory\data\reports
+                        (numbers only; the one file that is safe to share)
   Saves and settings    %LOCALAPPDATA%\victory\data     (keep this)
   Cache                 %LOCALAPPDATA%\victory\cache    (safe to delete)
   Change the last two with cache_dir and data_dir in victory.toml.
@@ -79,7 +104,10 @@ TROUBLESHOOTING
      game_dir must hold the complete, decrypted files.
   5. Anything else: run  play.cmd -Log  and read the end of the newest file in
      %LOCALAPPDATA%\victory\logs. If you report a problem, describe it in
-     your own words: do not attach title files, logs or screenshots.
+     your own words and, if you like, attach the output of  victory.exe report
+     (the run report: numbers only). Never attach title files, logs,
+     screenshots, video or crash dumps: they contain the title's own text,
+     images and addresses.
 
 LICENSE AND NOTICE
   Rox-box is free software under the GNU General Public License, version 3

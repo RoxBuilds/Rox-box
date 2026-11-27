@@ -317,6 +317,7 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
     if KIND == PIPELINE && SLOT == 0x58 / 8 {
         SERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    victory_pipeline::report::method_missing(KINDS[KIND], (SLOT * 8) as u32);
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],
@@ -395,7 +396,9 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table
 }
 
-#[cfg(test)]
+/// The method at byte `offset` of an object's table, as title code calls
+/// it (the tests, and `crate::selftest`, which drives objects only so).
+#[cfg(any(test, windows))]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     // SAFETY: `object` is ours and its table has the slot.
     let f = unsafe { *(*object).functions.add(offset / 8) };

@@ -590,7 +590,7 @@ fn oom_retry_as<T>(
 
 /// Of [`oom_retry`], since the start: asks that went through when asked
 /// again, and those that did not.
-static OOM_RETRIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static OOM_RETRIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 thread_local! {
     /// This thread lands the flights ([`relay_worker`]): it never waits for
@@ -1354,10 +1354,12 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    let mut removed = None;
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            removed = Some(e.code().0);
             log_removal_context();
         }
         match host.log_messages() {
@@ -1372,6 +1374,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
+    crate::runreport::host_failed(removed);
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -1452,8 +1455,12 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        // (This crate's own tests too: how they run on a PC without a card.)
-        if cfg!(any(test, feature = "diagnostics")) && crate::switch::on("VICTORY_D3D12_WARP") {
+        // (This crate's own tests too: how they run on a PC without a card;
+        // and `victory selftest --warp`, which tells a driver's fault from
+        // the layer's, in any build.)
+        if (cfg!(any(test, feature = "diagnostics")) || crate::selftest::running())
+            && crate::switch::on("VICTORY_D3D12_WARP")
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -1559,6 +1566,8 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        let waves = (o1.WaveLaneCountMin, o1.WaveLaneCountMax);
+        crate::runreport::host_device(&device, adapter.as_ref(), waves);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -5131,6 +5140,7 @@ pub(crate) mod budget;
 pub(crate) mod commit;
 mod planes;
 mod residency;
+pub(crate) mod selfcheck;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]

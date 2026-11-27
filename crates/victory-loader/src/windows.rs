@@ -94,6 +94,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         "image mapped"
     );
     crate::threads::mapped(&loaded);
+    crate::crash::note_title_image(loaded.base());
     Ok(loaded)
 }
 
@@ -263,6 +264,7 @@ impl LoadedImage {
                     policy,
                     calls: AtomicU64::new(0),
                 }));
+                victory_core::report::import_site(&site.dll, &site.symbol, &site.calls);
                 slots.push((slot, block.emit(site)?));
                 report.missing.push(MissingImport {
                     dll: site.dll.clone(),

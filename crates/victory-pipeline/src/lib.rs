@@ -12,6 +12,9 @@
 mod cache;
 
 pub use cache::{Cache, CacheKey};
+/// The run report, for victory-gpu, whose one path to victory-core this
+/// crate is (a dependency of its own would change the lock file).
+pub use victory_core::report;
 
 /// A deterministic transformation of one input into one output.
 pub trait Converter: Send + Sync {

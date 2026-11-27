@@ -73,6 +73,13 @@ what the layer did. Quote **our** messages (a line of `victory check`, an
 `error:` line, the name of an unimplemented import) after removing paths and
 anything from the title. Do not name the title. Do not attach files.
 
+One file is the exception: the **run report**. Every `victory run --execute`
+writes one to `<data_dir>\reports`, and `victory report` prints the newest. It
+holds only numbers, Rox-box's own words and facts about the PC, by
+construction ([docs/run-report.md](docs/run-report.md)), and may be pasted
+into an issue as it is. Do not add anything to it. The output of
+`victory selftest`, which runs no title at all, may be pasted too.
+
 ### How the policy is enforced
 
 1. `.gitignore` keeps common data types, logs and `local/` out of
@@ -136,6 +143,16 @@ maintainer at once, so that history can be rewritten.
   input in the test. Tests that can use real files take their paths from
   environment variables and skip when those are unset; they assert on
   properties, never on snapshots of title data.
+- **The frame path without a title.** `victory selftest --warp` drives the
+  device, command lists, memory synchronisation and a translated shader with
+  a stand-in title of our own, and `cargo test --workspace` runs it
+  (`apps/victory/tests/selftest.rs`). If your change reaches that path, add a
+  stage or extend one ([docs/selftest.md](docs/selftest.md)). Shader programs
+  for tests are assembled with `victory_shader::native::synth` from the public
+  instruction encodings, never taken from a title.
+- **The run report.** A new counter is a `report::Stat` fed with one relaxed
+  atomic; never pass a runtime string to it
+  ([docs/run-report.md](docs/run-report.md), "Adding to it").
 
 ## What every pull request must pass
 
@@ -168,6 +185,7 @@ and assembles the zip under `dist\` (git-ignored).
 ## Pull request workflow
 
 1. For anything larger than a fix, open an issue first and say what you intend.
+   [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap` say what is wanted.
 2. Branch from `main`. Keep a pull request to one subject; separate
    refactoring from behaviour changes.
 3. Write commit messages that say what changed and why. If you measured

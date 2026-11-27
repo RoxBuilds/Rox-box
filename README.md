@@ -56,6 +56,8 @@ This is research software, version 0.1. Be realistic about it:
   programs first.
 
 There is no compatibility list and no promise that any particular title works.
+[ROADMAP.md](ROADMAP.md) says where the project is going and what to work on
+next.
 
 ## For players
 
@@ -94,38 +96,55 @@ files, and use the Direct3D 12 runtime that ships with Windows 11.
 3. **Unzip** the whole folder anywhere (not inside a copy of the Rox-box source
    code) and keep its files together: `victory.exe`, `play.cmd`, `play.ps1`,
    `victory.example.toml`, `QUICKSTART.txt` and the license files.
-4. **Copy** `victory.example.toml` to `victory.toml`, next to `victory.exe`.
-5. **Edit** `victory.toml` and set `game_dir` to the folder that holds your own,
-   legally obtained title files (the title's executable and everything shipped
-   beside it), in single quotes:
-
-   ```toml
-   [paths]
-   game_dir = 'D:\MyTitles\SomeTitle'
-   ```
-
-6. **Check**. Open a Command Prompt in the folder (type `cmd` in Explorer's
-   address bar) and run:
-
-   ```
-   play.cmd -Check
-   ```
-
-   The commands in this section are written for the Command Prompt. In
-   PowerShell, put `.\` in front of them: `.\play.cmd -Check`,
-   `.\victory.exe shaders`.
-
-   This runs `victory check`: every prerequisite is listed as `OK`, `WARN` or
-   `MISSING`, and each line that is not `OK` says how to fix it. It starts
-   nothing and writes nothing.
-7. **Play**. Double-click `play.cmd`, or run it from the terminal. If the game
-   folder holds more than one `.exe`, name the one to run:
+4. **Double-click `play.cmd`.** The first time, a window asks for the folder
+   that holds your own, legally obtained title files (the title's executable
+   and everything shipped beside it); you can also drag that folder onto
+   `play.cmd`. Rox-box remembers it in `victory.toml` next to `victory.exe`,
+   checks your PC (`victory check`: every prerequisite is listed as `OK`,
+   `WARN` or `MISSING`, and each line that is not `OK` says how to fix it) and
+   asks `Start now? [Y/n]`.
+5. **Play**. From then on, double-click `play.cmd`. If the game folder holds
+   more than one `.exe`, drag the one to run onto `play.cmd`, or name it:
 
    ```
    play.cmd -Exe "D:\MyTitles\SomeTitle\title.exe"
    ```
 
+`play.cmd -Setup` asks for the folder again: the old `victory.toml` is kept as
+`victory.toml.bak-<date>` and only its `game_dir` line changes. A folder
+dragged onto `play.cmd` is used for that run only. To set things up by hand
+instead, copy `victory.example.toml` to `victory.toml` and set `game_dir`, in
+single quotes:
+
+```toml
+[paths]
+game_dir = 'D:\MyTitles\SomeTitle'
+```
+
+`play.cmd -Check` runs the check alone; it starts nothing and writes nothing.
+The commands in this section are written for the Command Prompt (type `cmd` in
+Explorer's address bar to open one in the folder). In PowerShell, put `.\` in
+front of them: `.\play.cmd -Check`, `.\victory.exe shaders`.
+
 The same steps, shorter, are in [QUICKSTART.txt](QUICKSTART.txt) inside the zip.
+
+### Check your PC without a title
+
+```
+victory.exe selftest
+```
+
+runs Rox-box's whole frame path with a stand-in title made of its own code: it
+creates the device, clears and presents frames, moves memory between the
+processor's side and the graphics card's, and translates and runs a shader. It
+needs no game files and no setup, takes a few seconds and opens a small window
+for a moment. Each stage is `OK`, `FAIL` or `SKIP`. If a stage fails, update
+the graphics driver; if it still fails, run `victory.exe selftest --warp`, the
+same test on Windows' software adapter. Passing there means the driver or the
+card is at fault; failing there means Rox-box is, and the `FAIL` line is what
+to report. `victory.exe selftest --bench` adds a few speed figures that can be
+compared between PCs. [docs/selftest.md](docs/selftest.md) explains every
+line.
 
 ### The first run: shader translation and warm-up
 
@@ -166,6 +185,8 @@ run after you close the title. That is advice, not an error.
 | Switch | Effect |
 |---|---|
 | `-Check` | Runs `victory check` and starts nothing |
+| `-Setup` | Asks for the game folder again and updates `game_dir` in `victory.toml` (a copy of the old file is kept) |
+| `<folder>` or `<file.exe>` first | What dragging onto `play.cmd` passes: a folder is the game folder for this run, an `.exe` is `-Exe` |
 | `-Exe <file>` | The title executable, when `game_dir` holds several |
 | `-Fast` | Low-memory preset: `-Console SeriesS`, `-Display 1280x720`, `-Output 1280x720`, and timed waits instead of spinning |
 | `-Safe` | Turns the newer, more experimental optimisations off |
@@ -183,7 +204,7 @@ Two things to know about switches:
 - `play.ps1` **clears every `VICTORY_*` environment variable** except the path
   ones (`VICTORY_CONFIG`, `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`,
   `VICTORY_DATA_DIR`, the three optional-file variables and the two
-  `VICTORY_SKIP_*` checks) and then sets its own. A switch you set in the
+  `VICTORY_SKIP_*` checks and `VICTORY_REPORT`) and then sets its own. A switch you set in the
   terminal beforehand is ignored: pass it with `-More`.
 - `-More` and `-SettingsValues` take `NAME=value` pairs separated by `;`, in
   double quotes: `play.cmd -More "VICTORY_AMBIENT=0.8;VICTORY_WINDOW_MAX=1920x1080"`.
@@ -214,6 +235,7 @@ Window and input:
 |---|---|
 | Run logs (with `-Log`) | `%LOCALAPPDATA%\victory\logs` |
 | Crash log | `%LOCALAPPDATA%\victory\data\<title id>\crashes.log` |
+| Run reports (safe to share) | `%LOCALAPPDATA%\victory\data\reports` |
 | Saves and title settings | `%LOCALAPPDATA%\victory\data` (keep this) |
 | Caches: prepared images, translated shaders, pipelines | `%LOCALAPPDATA%\victory\cache` (safe to delete) |
 | Backups of an edited settings XML | `%LOCALAPPDATA%\victory\backups` |
@@ -236,7 +258,7 @@ below are the ones `victory check` and a run print.
 
 | Message | What to do |
 |---|---|
-| `Config file  no victory.toml found` | Copy `victory.example.toml` to `victory.toml` next to `victory.exe` and set `game_dir` |
+| `Config file  no victory.toml found` | Double-click `play.cmd` and pick your folder (or run `play.cmd -Setup`); by hand, copy `victory.example.toml` to `victory.toml` next to `victory.exe` and set `game_dir` |
 | `Config file  the config file ... is not valid` | Compare it with `victory.example.toml`. Windows paths go in 'single quotes'; unknown entries are refused |
 | `Game folder  not set` / `... does not exist` | Set or correct `game_dir` under `[paths]` in `victory.toml` |
 | `Title executable  no .exe file in the game folder` | Point `game_dir` at the folder that holds the title's executable |
@@ -259,9 +281,29 @@ below are the ones `victory check` and a run print.
 | `WARNING: ... warmed with another build` / `No warm-up stamp` | Advice only: see [The first run](#the-first-run-shader-translation-and-warm-up) |
 | The title stops or the screen freezes mid-run | Read the end of `crashes.log` (see above) and of the newest file in `%LOCALAPPDATA%\victory\logs` after a run with `-Log` |
 
-If you report a problem, describe it in your own words. **Do not attach or
-paste title files, logs, screenshots or crash dumps**: they contain material
-from the title. See [CONTRIBUTING.md](CONTRIBUTING.md).
+### Reporting a problem: the run report
+
+Every run writes a **run report**: a short text file with how the run went
+(frame times, how many draws were left out and why, memory, how it ended) and
+what PC it ran on. It holds numbers, Rox-box's own words and the names of your
+processor, graphics card and driver, and nothing else: no title name, no file
+or folder names, no addresses, nothing read from the title. It is the one file
+that is safe to post.
+
+```
+victory.exe report
+```
+
+prints the newest one (`victory.exe report | clip` copies it). Open an issue
+with the form on this repository's **Issues** page, describe what happened in
+your own words, and paste the report and the output of `victory.exe selftest`.
+`VICTORY_REPORT=0` (set in Windows, or `play.cmd -More "VICTORY_REPORT=0"`)
+turns the reports off. [docs/run-report.md](docs/run-report.md) lists every
+field.
+
+**Do not attach or paste title files, logs, screenshots, video or crash
+dumps**: they contain material from the title. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## For developers
 
@@ -331,8 +373,13 @@ target\release\victory.exe run <title.exe> --execute --console series-x
 ```
 
 `victory --help` lists every command: `inspect`, `census`, `lib-exports`,
-`shader-info`, `translate`, `shaders`, `warm`, `run`, `config`, `check` (and
-`replay` in a diagnostics build).
+`shader-info`, `translate`, `shaders`, `warm`, `run`, `config`, `check`,
+`selftest`, `report` (and `replay` in a diagnostics build).
+
+`victory selftest --warp` runs the whole frame path with a stand-in title of
+our own code on the software adapter, so a change to the graphics layer or the
+translator can be tried with no title files; `cargo test --workspace` runs it
+too ([docs/selftest.md](docs/selftest.md)).
 
 ### Package a release
 
@@ -355,7 +402,7 @@ package as a GitHub Release.
 | Path | Holds |
 |---|---|
 | `apps/victory` | The `victory` command-line program |
-| `crates/victory-core` | Configuration, logging, the runtime half of the asset policy |
+| `crates/victory-core` | Configuration, logging, the runtime half of the asset policy, the run report |
 | `crates/victory-pe` | Read-only PE32+ and import-library parsing |
 | `crates/victory-loader` | Preparing, mapping, binding and starting a title image; crash reports |
 | `crates/victory-hle` | The console's system APIs, implemented on Windows |
@@ -372,6 +419,7 @@ package as a GitHub Release.
 
 ### Further reading
 
+- [ROADMAP.md](ROADMAP.md): the goal, the milestones and the open tasks.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit, and where to start
   reading.
 - [CONTRIBUTING.md](CONTRIBUTING.md): conventions, the checks every change must
@@ -384,6 +432,10 @@ package as a GitHub Release.
 - [docs/low-memory-gpus.md](docs/low-memory-gpus.md): switches for 8 GB / 32-lane
   graphics cards and hosts with little RAM.
 - [docs/findings.md](docs/findings.md): where a frame's time goes.
+- [docs/selftest.md](docs/selftest.md): the title-free self-test and its
+  benchmark.
+- [docs/run-report.md](docs/run-report.md): the shareable run report, field by
+  field, and how to add a counter.
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): ray-tracing passes and the
   ambient fallback.
 - [docs/README-fxceless.md](docs/README-fxceless.md): notes on the upstream
@@ -438,6 +490,10 @@ modifications in this release include:
 - A hermetic distribution build (`[profile.release-dist]`, `cargo xtask dist`)
   that strips debug metadata and build-machine paths, a one-command build
   script, a preflight check (`victory check`) and a packaged release.
+- A title-free self-test and benchmark (`victory selftest`), with a builder
+  for synthetic shader containers written from the public instruction
+  encodings; a numbers-only run report written by every run
+  (`victory report`); and first-run setup in the launcher.
 
 Individual upstream changes are credited where they were adapted, in code
 comments. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the upstream

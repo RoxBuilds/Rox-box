@@ -1,0 +1,62 @@
+name: Hardware / driver result
+description: Share what Rox-box's own tests say on your PC, whether it works or not.
+title: "[Hardware] "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Results from many different PCs help find driver and graphics-card differences. A report from a PC where everything works is as useful as one where it does not.
+
+        Everything here comes from Rox-box's own commands: nothing needs game files. Do not name any title, and do not attach title files, logs, screenshots, video or crash dumps.
+  - type: input
+    id: version
+    attributes:
+      label: Rox-box version
+      description: The version of the download, or the source-tree commit. `victory.exe --version` prints it.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall, on this PC
+      options:
+        - Everything I tried works
+        - Works with problems
+        - Does not work
+        - I only ran the tests
+    validations:
+      required: true
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Result of `victory.exe selftest`
+      description: Paste what it prints. It tests the graphics card and driver with Rox-box's own built-in test scene.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: bench
+    attributes:
+      label: Result of `victory.exe selftest --bench` (optional)
+      description: Paste what it prints, if you ran it.
+      render: text
+  - type: textarea
+    id: run-report
+    attributes:
+      label: Run report (`victory.exe report`) (optional)
+      description: Paste the text of the latest run report. It holds numbers only. If it holds anything that looks like a title name or file name, remove it before posting.
+      render: text
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: The graphics card model, driver version and Windows build are useful (the lines of `play.cmd -Check` give them). Describe what you saw in platform terms, not by title.
+  - type: checkboxes
+    id: clean-room
+    attributes:
+      label: Clean-room rules
+      options:
+        - label: I have not named the title, and I have not attached or pasted title files, logs, screenshots, video or crash dumps.
+          required: true
