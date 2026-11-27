@@ -1212,7 +1212,8 @@ mod tests {
             Err(super::LoadError::MissingEnv)
         ));
         assert!(matches!(
-            super::Tables::from_file(std::path::Path::new("Z:\\does\\not\\exist\\bcpack-tables.bin")),
+            // (a folder that is not there, under the temp folder: a drive letter means nothing off Windows)
+            super::Tables::from_file(&std::env::temp_dir().join("rox-no-such-folder").join("bcpack-tables.bin")),
             Err(super::LoadError::Io(..))
         ));
 

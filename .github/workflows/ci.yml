@@ -17,7 +17,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The branch rule requires a status check named exactly `Check`; without a
+  # display name the job would report as `check`.
   check:
+    name: Check
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -38,3 +41,36 @@ jobs:
       - name: Launcher self-test
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\play.ps1 -SelfTest
+
+  # The translator and the format code need nothing from Windows, so
+  # contributors without a Windows PC can work on them: this job proves they
+  # build and test on Linux. The crates holding Windows-only code (loader,
+  # hle, gpu, the apps, xtask) stay with the Windows job above.
+  pure-linux:
+    name: Pure crates (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # The version pinned in rust-toolchain.toml (it also fetches the Windows
+      # target's std, which is harmless here); the file is left as it is.
+      # `rustup toolchain install` adds the components the file lists for the
+      # host too; the explicit `component add` is a guard in case it does not.
+      - run: rustup toolchain install
+      - run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # victory-shader's Windows-only code (the dxil.dll validator and the host
+      # D3D12 checks) is behind cfg(windows) and its `host` feature is off, so
+      # the default build here is the pure translator.
+      - name: Clippy
+        run: >
+          cargo clippy --locked
+          -p victory-pe -p victory-formats -p victory-pipeline
+          -p victory-core -p victory-game -p victory-shader
+          --all-targets -- -D warnings
+      # Tests that need dxil.dll or a D3D12 device are compiled out off Windows.
+      - name: Tests
+        run: >
+          cargo test --locked
+          -p victory-pe -p victory-formats -p victory-pipeline
+          -p victory-core -p victory-game -p victory-shader
