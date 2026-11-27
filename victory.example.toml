@@ -1,0 +1,93 @@
+# Rox-box configuration.
+#
+# 1. Copy this file to `victory.toml`:
+#      - release download: next to victory.exe
+#      - source tree:      at the repository root (it is git-ignored)
+# 2. Set game_dir below to the folder that holds YOUR title's files.
+# 3. Run `play.cmd -Check` (or `victory check`): it says what is still missing.
+#
+# Where the file is looked for, in order:
+#   the file named by the VICTORY_CONFIG environment variable,
+#   victory.toml in the current directory,
+#   victory.toml next to victory.exe.
+#
+# Paths: write Windows paths in 'single quotes' (no doubling of backslashes).
+# A relative path is relative to this file's folder. Each entry can also be
+# given as the environment variable named beside it, which wins over the file.
+#
+# What may be where: keep everything of a title outside any copy of the
+# Rox-box source tree. cache_dir and data_dir receive data made from the
+# title's files, so they are refused inside one. game_dir and test_titles
+# are only read: inside one they still work, and `victory check` and
+# `victory config` warn about it (game files there are one `git add` away
+# from being published). The optional files can be anywhere.
+
+[paths]
+# REQUIRED. The folder with your own, legally obtained title files: the
+# title's executable and everything shipped beside it.
+#                                                   env: VICTORY_GAME_DIR
+game_dir = 'C:\Games\MyTitle'
+
+# Derived data that can be deleted at any time and is made again when
+# needed: prepared images, translated shaders, pipeline caches.
+# Default: %LOCALAPPDATA%\victory\cache             env: VICTORY_CACHE_DIR
+# cache_dir = 'D:\rox-data\cache'
+
+# What titles save (their persistent storage and settings). Keep it: it is
+# never made again. Per-title crash logs are written here too.
+# Default: %LOCALAPPDATA%\victory\data              env: VICTORY_DATA_DIR
+# data_dir = 'D:\rox-data\data'
+
+# ---------------------------------------------------------------------------
+# Optional files. Leave them out unless you have them: a file that is named
+# here must exist and be well formed, or `victory check` and a run say so.
+# ---------------------------------------------------------------------------
+
+# A TOML file of byte-checked binary patches you wrote for your title
+# (default: no patches are applied).                env: VICTORY_PATCHES_FILE
+# patches_file = 'patches.toml'
+#
+# Schema (every field except `group` and `when_*` is required):
+#   [[patch]]
+#   name = "example_patch"
+#   group = "example_group"     # optional: all patches in a group apply atomically
+#   when_env = "SOME_ENV_VAR"   # optional: only when this variable is set and non-zero
+#   when_value = "1"            # optional: only when it has exactly this value
+#   rva = "0x1000"              # hex or integer offset from the module base
+#   expected = "90 90"          # bytes that must be there before writing
+#   replace = "c3 90"           # replacement bytes, of the same length
+
+# A TOML file describing shaders of your title that need special handling
+# (ambient pass names and bindings, bake hashes, cull labels).
+# Default: none (generic structural detection only).
+#                                                   env: VICTORY_SHADER_PROFILE
+# shader_profile = 'shader-profile.toml'
+#
+# Schema:
+#   [ambient]
+#   resolve_substring = "CS_Example_Resolve"
+#   radiance_substring = "CS_Example_Radiance"
+#   air_substring = "CS_Example_Air"
+#   light_binding = [1, 0]
+#   depth_binding = [0, 0]
+#   radiance_binding = [1, 1]
+#   air_binding = [1, 2]
+#
+#   [bake]
+#   old_pixel_shaders = []
+#   pixel_shaders = []
+#   geometry_shaders = []
+#
+#   [[cull_shaders]]
+#   hash = "0000000000000000"
+#   label = "example"
+
+# The BCPack entropy/dictionary tables (a file of 77,982 bytes that you
+# supply), needed only by titles that submit BCPack-compressed storage
+# requests.                                         env: VICTORY_BCPACK_TABLES
+# bcpack_tables = 'bcpack-tables.bin'
+
+# For developers: folders of other titles, used by `victory census` and
+# `victory translate` to exercise platform-level code.
+# env: VICTORY_TEST_TITLES (separated by ';')
+test_titles = []

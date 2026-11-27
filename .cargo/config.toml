@@ -1,0 +1,13 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+[build]
+# Remap relative workspace source paths in compiler/debug output. The
+# hermetic distribution build is `cargo xtask dist` (scripts/build.ps1 -Dist):
+# it also remaps the workspace, user-profile and Cargo-home folders, links the
+# C runtime in and checks the binary for build-machine paths.
+rustflags = [
+    "--remap-path-prefix=crates=/src/crates",
+    "--remap-path-prefix=apps=/src/apps",
+    "--remap-path-prefix=xtask=/src/xtask",
+]

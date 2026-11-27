@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# RULE #1: nothing from a title (or any other proprietary source) is ever
+# committed.
+# Everything is built from files the user supplies at runtime.
+# This file is the first line of defence; `cargo xtask policy` (also run by
+# the pre-commit hook in .githooks/) is the second and is authoritative.
+# See docs/asset-policy.md.
+# ---------------------------------------------------------------------------
+
+# Build output
+/target/
+# Release packages (scripts/package-release.ps1)
+/dist/
+/tests/fixtures/*/target/
+/dist/
+
+# Local configuration (contains paths to YOUR files)
+/victory.toml
+# Local-only inputs (patch manifests, shader profiles, tables you supply,
+# the policy denylist)
+/local/
+
+# Secrets and environment files
+.env
+.env.*
+*.key
+*.pem
+
+# Places people tend to drop data into. Keep data outside the repo instead.
+/game/
+/games/
+/assets/
+/data/
+/dump/
+/dumps/
+/extracted/
+/cache/
+/out/
+
+# Logs, crash reports, captures and profiles of a run
+*.log
+*.dmp
+*.mdmp
+profile-*.txt
+/capture/
+/captures/
+/capture-*/
+/crashes/
+crashes.log
+
+# Executables, libraries, symbols
+*.exe
+*.dll
+*.pdb
+*.lib
+*.sys
+*.obj
+*.exp
+*.ilk
+
+# Console packages and containers
+*.xvd
+*.xvc
+*.msixvc
+*.xsp
+*.cab
+*.msi
+
+# Typical title data (non-exhaustive on purpose; the policy check is an allowlist)
+*.bin
+*.dat
+*.pak
+*.dds
+*.ktx
+*.ktx2
+*.dxbc
+*.dxil
+*.cso
+*.spv
+*.wav
+*.xma
+*.ogg
+*.opus
+*.mp3
+*.mp4
+*.bik
+*.bk2
+*.zip
+*.7z
+*.rar
+
+# Editor / OS noise
+.vs/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

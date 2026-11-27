@@ -1,0 +1,88 @@
+ROX-BOX QUICK START
+===================
+
+Rox-box runs a console title's 64-bit executable on a Windows PC. It contains
+no game: you point it at your own, legally obtained title files. It is
+experimental: expect low frame rates, visual errors and titles that do not
+start.
+
+WHAT YOU NEED
+  - Windows 11, or a fully updated Windows 10 (64-bit)
+  - A processor with AVX2 (Intel from 2013, AMD from 2015)
+  - A graphics card with Direct3D 12 (feature level 12_0) and Shader Model 6.6,
+    with a current driver; mesh-shader support is recommended
+  - Plenty of memory: at least 12 GB of free commit memory (RAM plus page
+    file) when you start
+  - Nothing to install: no runtime, no redistributable, no compiler
+
+SET UP (ONCE)
+  1. Unzip the whole folder anywhere you like (not inside a copy of the
+     Rox-box source code). Keep its files together.
+  2. Copy  victory.example.toml  to  victory.toml  in the same folder
+     (next to victory.exe).
+  3. Open victory.toml in Notepad and set game_dir to the folder that holds
+     your title's files, in single quotes:
+         game_dir = 'D:\MyTitles\SomeTitle'
+  4. Open a terminal in the folder (type  cmd  in Explorer's address bar)
+     and run:
+         play.cmd -Check
+     This runs "victory check": every prerequisite is listed as OK, WARN or
+     MISSING, and each line that is not OK says how to fix it. It starts
+     nothing.
+
+PLAY
+  Double-click  play.cmd  (or run it in the terminal).
+  If the game folder holds more than one .exe, name the one to run:
+         play.cmd -Exe "D:\MyTitles\SomeTitle\title.exe"
+  Useful switches:
+         play.cmd -Fast                lower memory use and resolution
+         play.cmd -Display 1920x1080   the display size the title is told
+         play.cmd -Safe                turns the newer optimisations off
+         play.cmd -Log                 writes everything the run says to a
+                                       log file
+  Alt+Enter switches to a borderless window. Without a controller, the
+  keyboard is one: W A S D and I J K L are the sticks, the arrows the D-pad,
+  Enter / Backspace / X / Y the buttons, Esc the Menu button.
+
+THE FIRST RUN IS SLOW
+  Shaders are translated and compiled the first time they are used, and
+  kept. To do that work ahead of time, in the terminal:
+         victory.exe shaders
+     translates every shader found in the game folder (a few minutes).
+         victory.exe warm --used --settle
+     after you have played, compiles the pipelines earlier runs drew with.
+     It only knows what earlier runs wrote down: play.cmd records the
+     pipelines of every run, so play once first.
+  A "WARNING: ..." line about warm-up or recorded pipelines before a run is
+  advice, not an error; it names the command to run after you close the title.
+
+WHERE THINGS GO
+  Logs (with -Log)      %LOCALAPPDATA%\victory\logs
+  Crash log             %LOCALAPPDATA%\victory\data\<title id>\crashes.log
+  Saves and settings    %LOCALAPPDATA%\victory\data     (keep this)
+  Cache                 %LOCALAPPDATA%\victory\cache    (safe to delete)
+  Change the last two with cache_dir and data_dir in victory.toml.
+  "victory.exe config" shows the folders in use.
+
+TROUBLESHOOTING
+  1. Always start with  play.cmd -Check  and fix every MISSING line.
+  2. "No Direct3D 12 device" or "Shader Model 6.6 ... not supported": update
+     the graphics driver from the card maker's site, then Windows itself.
+  3. Stops with a memory error: close other programs (browsers first) and
+     make the page file larger or fixed (Advanced system settings >
+     Performance > Virtual memory); then try  play.cmd -Fast.
+  4. "The title's own DLLs are missing" or the executable is "not a Windows
+     executable image": the title folder is incomplete or still encrypted;
+     game_dir must hold the complete, decrypted files.
+  5. Anything else: run  play.cmd -Log  and read the end of the newest file in
+     %LOCALAPPDATA%\victory\logs. If you report a problem, describe it in
+     your own words: do not attach title files, logs or screenshots.
+
+LICENSE AND NOTICE
+  Rox-box is free software under the GNU General Public License, version 3
+  or later (LICENSE). It comes with NO WARRANTY. THIRD_PARTY_LICENSES.md lists
+  the software it is built from. The source code of this exact version is
+  published on the page this download came from.
+  Rox-box is an independent, non-commercial project. It is not affiliated
+  with or endorsed by any hardware vendor, platform holder or publisher, and
+  it includes no game files, keys or proprietary code.
