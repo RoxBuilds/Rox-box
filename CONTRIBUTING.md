@@ -144,8 +144,9 @@ maintainer at once, so that history can be rewritten.
   environment variables and skip when those are unset; they assert on
   properties, never on snapshots of title data.
 - **The frame path without a title.** `victory selftest --warp` drives the
-  device, command lists, memory synchronisation and a translated shader with
-  a stand-in title of our own, and `cargo test --workspace` runs it
+  device, command lists, memory synchronisation, a translated compute shader
+  and a draw with a translated vertex and pixel shader with a stand-in title
+  of our own, and `cargo test --workspace` runs it
   (`apps/victory/tests/selftest.rs`). If your change reaches that path, add a
   stage or extend one ([docs/selftest.md](docs/selftest.md)). Shader programs
   for tests are assembled with `victory_shader::native::synth` from the public

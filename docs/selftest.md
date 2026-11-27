@@ -25,7 +25,7 @@ passes. Only the checks look behind the tables: a picture is read back from
 the host texture the layer made for the title's render target, and the swap
 chain is asked how many presents it took.
 
-The driver is `crates/victory-gpu/src/selftest.rs`; the shader container comes
+The driver is `crates/victory-gpu/src/selftest.rs`; the shader containers come
 from `crates/victory-shader/src/native/synth.rs`.
 
 ## Reading the output
@@ -37,6 +37,7 @@ Each stage prints one line in the style of `victory check`:
 [  OK   ] Clear + present   120 frames cleared and presented; 3 of them read back and matched
 [  OK   ] Unified memory    ...
 [ SKIP  ] Translated shader the adapter has shader model 6.5; translated shaders need 6.6
+[ SKIP  ] Translated draw   the adapter has shader model 6.5; translated shaders need 6.6
 ```
 
 `FAIL` lines say what was expected and what was found, in our words. The run
@@ -94,13 +95,47 @@ removed), which ends the run at once as it would end a title's.
    that shader's buffer, which now has a host copy, so the copy is made on the
    card (`host/place.rs`) and must land too. Skipped where the adapter has no
    shader model 6.6.
+5. **Translated draw.** A vertex program and a pixel program (wave32) are
+   assembled from the public GFX10 encodings and wrapped in containers with
+   the `ISG1`/`OSG1` signature parts they link by and their stage data. The
+   vertex program takes x and y from its `POSITION` attribute (input row 0,
+   which the fetch shader loads into v4-v5), exports `pos0` and, as `param0`
+   (`COLOR`, row 1), the four root constants of its root slot 0. The pixel
+   program interpolates that colour's red, green and blue (`v_interp_p1_f32`
+   and `v_interp_p2_f32` at the pixel centre, `attr0`) and takes alpha from
+   its own root constant (slot 1). Its code holds the colour export for a
+   16-bit float target (compressed, which the translator refuses); the stage
+   data's export patch for target 0 holds the one for 32-bit channels, which
+   the layer applies (`NativeProgram::patched_code`), as the console does for
+   the format a pipeline renders to. The two containers, the title's root
+   signature, an input layout, the blend, rasterizer, depth-stencil,
+   topology and target-format state go to the device's `CreatePipelineState`
+   (0x2b0) as a pipeline-state stream, the description a title of the
+   current generation uses (`pipeline::create_stream`; the plain graphics
+   description at 0x50 keeps its containers only and gets no host pipeline).
+   The host pipeline is made on first use (`pipeline/host.rs`), both programs
+   translated by `shader_cache::host_shader`. A list then clears the render
+   target and sets it (`OMSetRenderTargets`), a viewport, a scissor, the
+   topology, the root signature, the pipeline, a vertex buffer in title
+   memory (an upload-heap buffer the title fills through `Map`, copied to the
+   card by the draw, `shadow.rs`) and each stage's root constants, all
+   through the list's table, and draws one triangle over the target
+   (`draw.rs`). It is presented and every pixel read back and compared; then
+   a second list draws twice, with other constants, the second draw cut to
+   the left half by its scissor, and both halves must show their own draw.
+   Skipped where the adapter has no shader model 6.6.
 
 ## What it does not prove
 
 - Anything about a particular title: its shaders use far more of the
   instruction set than the one program here, and its frames far more state.
-- Graphics pipelines: no vertex or pixel shader is translated or drawn with
-  yet (see "Adding a stage").
+- Most of a graphics pipeline: the draw's programs read no texture, sampler,
+  constant buffer or descriptor table; there is no index buffer, depth,
+  stencil, blending or second target; the vertex program gets its attribute
+  from the input layout (a title's vertex programs often fetch their own with
+  typed buffer loads, which no stage here uses); the console's own
+  topologies (rectangles, quads) and wave64 graphics programs are not drawn;
+  the plain graphics description (0x50) is not used.
 - Mesh, indirect, ray-tracing, tiled resources, depth, MSAA, formats other
   than RGBA8, more than one queue, waits between queues, the pipeline library
   and the shader cache on disk (the self-test uses neither, so it writes
@@ -125,6 +160,7 @@ percent. Debug builds are many times slower; compare release builds.
 | `list_recording` | calls/s | 20,000 one-pixel `ClearRenderTargetView` calls through the list's table onto the host list: the cost of a command arriving as a call. |
 | `shader_translation` | ms | The synthetic compute container to DXIL (`shader_cache::host_shader`). |
 | `pipeline_creation` | ms | From the pipeline's first use to its host pipeline being ready: translation again plus the driver's compile. |
+| `graphics_pipeline_creation` | ms | The same for stage 5's vertex and pixel pipeline: both translations plus the driver's compile. |
 
 A rate that cannot be measured on the PC (no AVX2, no shader model 6.6) is
 left out.
@@ -136,8 +172,10 @@ left out.
 CI, in a process of its own (the host device is one per process). Like the
 crate's GPU tests it is skipped where there is no Direct3D 12 device at all
 (exit code 3); a stage that is skipped (no shader model 6.6) does not fail it.
-`victory_shader::native::synth`'s own tests check that its containers read back
-as written and that the program translates.
+`victory_shader::native::synth`'s own tests check that its containers and
+signature parts read back as written, that each instruction encoder decodes
+back (with the crate's own decoder) to what it says it writes, and that the
+programs translate (the pixel program only with its export patch).
 
 ## Adding a stage
 
@@ -155,10 +193,19 @@ as written and that the program translates.
 4. Make it cheap: the integration test runs every stage on the software
    adapter.
 
-What a graphics stage still needs: `synth` to attach the `ISG1`/`OSG1`
-signature parts a vertex and a pixel program link by (the emitter writes them
-for its own output in `emit/container.rs`, crate-private), encodings for
-`exp pos0`, `exp param0` and the pixel program's export patch, and a builder
-for the pipeline stream the device's `CreatePipelineState` (0x2b0) reads, with
-the render target's format; then targets, viewport and scissor through the
-list's table and a draw, read back as in stage 2.
+A graphics program's container needs what the translator reads of it
+(`synth::draw_vertex`, `synth::draw_pixel`):
+
+- `ISG1` and `OSG1` (`synth::signature`): per element the semantic name and
+  index, the system value, the component type, the register and the mask.
+  The translator keeps them as they are in the host's signatures, so the
+  vertex program's output rows and the pixel program's input rows must be
+  the same rows for the host's stages to link. An attribute the stage data
+  names by row must have that row in `ISG1`; `exp pos0` needs `SV_Position`
+  in `OSG1`; `exp mrt<n>` needs `SV_Target` at register n.
+- The stage data (`StageIo::Vs`, `StageIo::Ps` in `native.rs`): for a vertex
+  program its inputs (row, channels, the VGPR channel 0 arrives in) and its
+  outputs (row, `param<n>`); for a pixel program its inputs (row, `attr<n>`),
+  `SPI_PS_INPUT_ADDR` (which barycentrics and system values arrive in which
+  VGPRs, `io.rs`) and, per render target, the export patch the layer applies.
+- The root layout: which user SGPRs hold which root parameter.

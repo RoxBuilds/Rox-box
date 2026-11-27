@@ -26,7 +26,13 @@
 //! 4. a translated shader: a compute program assembled by
 //!    `victory_shader::native::synth`, in a container, made into a host
 //!    pipeline the way a title's is, dispatched, and its stores read back
-//!    from title memory (twice, with other constants the second time).
+//!    from title memory (twice, with other constants the second time);
+//! 5. a translated draw: a vertex and a pixel program, also from `synth`,
+//!    with the signatures they link by and the pixel program's
+//!    export patch, made into a host graphics pipeline from a pipeline-state
+//!    stream, drawn from a vertex buffer in title memory into the render
+//!    target with root constants for each stage, presented and read back
+//!    pixel by pixel (one list of one draw, one of two).
 //!
 //! With `bench`, a few of the layer's own hot paths are timed on synthetic
 //! data ([`Rate`]); see `docs/selftest.md` for what they mean.
@@ -144,7 +150,7 @@ impl Report {
 }
 
 /// The stage names, in order.
-pub const STAGES: [&str; 4] = ["Device", "Clear + present", "Unified memory", "Translated shader"];
+pub const STAGES: [&str; 5] = ["Device", "Clear + present", "Unified memory", "Translated shader", "Translated draw"];
 
 /// Runs every stage, telling `said` of each as it finishes. `hung` is
 /// called from another thread if a step takes longer than the patience
@@ -198,6 +204,14 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
     Watchdog::arm(STAGES[3]);
     let outcome = title.translated_shader(imports, &mut bench);
     tell(&mut report, STAGES[3], outcome);
+
+    Watchdog::arm(STAGES[4]);
+    let outcome = if presented {
+        title.translated_draw(imports, &mut bench)
+    } else {
+        Outcome::Skip("needs clear + present".into())
+    };
+    tell(&mut report, STAGES[4], outcome);
 
     if options.bench {
         Watchdog::arm("Benchmark");
@@ -386,6 +400,132 @@ struct Planes {
     rest: [u8; 0x90 - 0x28],
 }
 
+/// `D3D12_VERTEX_BUFFER_VIEW`.
+#[repr(C)]
+struct VertexView {
+    address: u64,
+    size: u32,
+    stride: u32,
+}
+
+/// `D3D12_PIPELINE_STATE_STREAM_DESC`: the stream's size and where it is.
+#[repr(C)]
+struct StreamDesc {
+    size: usize,
+    stream: *const u8,
+}
+
+/// `D3D12_SHADER_BYTECODE`.
+#[repr(C)]
+struct Code {
+    code: *const u8,
+    size: usize,
+}
+
+/// One subobject of a pipeline-state stream: its type, then its
+/// description at its own alignment, the whole padded to a pointer, as the
+/// D3D12 headers' stream helpers lay it out (and a title's code passes it).
+#[repr(C, align(8))]
+struct Sub<T>(u32, T);
+
+/// The pipeline-state stream of a vertex and pixel pipeline, with the
+/// state a title of the current generation gives one (D3D12's subobject
+/// types: root signature 0, VS 1, PS 2, blend 8, sample mask 9, rasterizer
+/// 10, input layout 12, topology 14, target formats 15, depth format 16,
+/// samples 17, depth-stencil with bounds 21).
+#[repr(C)]
+struct GraphicsStream {
+    root: Sub<This>,
+    vs: Sub<Code>,
+    ps: Sub<Code>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    sample_mask: Sub<u32>,
+    rasterizer: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+    layout: Sub<D3D12_INPUT_LAYOUT_DESC>,
+    topology: Sub<u32>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    depth_format: Sub<u32>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
+/// The draw's one vertex attribute: x and y floats at the start of each
+/// vertex of vertex buffer 0.
+fn position_input() -> D3D12_INPUT_ELEMENT_DESC {
+    D3D12_INPUT_ELEMENT_DESC {
+        SemanticName: windows::core::s!("POSITION"),
+        SemanticIndex: 0,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT,
+        InputSlot: 0,
+        AlignedByteOffset: 0,
+        InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+        InstanceDataStepRate: 0,
+    }
+}
+
+impl GraphicsStream {
+    /// Opaque triangles into one RGBA8 target: no blending, no culling (the
+    /// triangle's winding is left to the programs), no depth.
+    fn new(root: This, vs: &[u8], ps: &[u8], inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> GraphicsStream {
+        let code = |c: &[u8]| Code { code: c.as_ptr(), size: c.len() };
+        let target = D3D12_RENDER_TARGET_BLEND_DESC {
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ZERO,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let keep = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        let mut formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        formats.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(RGBA8 as i32);
+        GraphicsStream {
+            root: Sub(0, root),
+            vs: Sub(1, code(vs)),
+            ps: Sub(2, code(ps)),
+            blend: Sub(8, D3D12_BLEND_DESC { RenderTarget: [target; 8], ..Default::default() }),
+            sample_mask: Sub(9, u32::MAX),
+            rasterizer: Sub(
+                10,
+                D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+            ),
+            depth: Sub(
+                21,
+                D3D12_DEPTH_STENCIL_DESC1 {
+                    DepthEnable: false.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                    StencilEnable: false.into(),
+                    StencilReadMask: 0xff,
+                    StencilWriteMask: 0xff,
+                    FrontFace: keep,
+                    BackFace: keep,
+                    DepthBoundsTestEnable: false.into(),
+                },
+            ),
+            layout: Sub(12, D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: inputs.as_ptr(), NumElements: inputs.len() as u32 }),
+            // D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+            topology: Sub(14, 3),
+            targets: Sub(15, formats),
+            depth_format: Sub(16, 0),
+            samples: Sub(17, DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
+        }
+    }
+}
+
 // The interface ids a title asks with (the PC ones).
 const DEVICE11: Iid = guid(0x5405c344, 0xd457, 0x444e, [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39]);
 const QUEUE: Iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
@@ -412,7 +552,9 @@ type MakeRtv = extern "system" fn(This, This, *const c_void, u64);
 type MakeUav = extern "system" fn(This, This, This, *const RawUav, u64);
 type MakeRoot = extern "system" fn(This, u32, *const u8, usize, *const Iid, *mut This) -> HRESULT;
 type MakeCompute = extern "system" fn(This, *const ComputeDesc, *const Iid, *mut This) -> HRESULT;
+type MakeStream = extern "system" fn(This, *const StreamDesc, *const Iid, *mut This) -> HRESULT;
 type HeapStart = extern "system" fn(This) -> u64;
+type GpuAddress = extern "system" fn(This) -> u64;
 type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
 type ResetAllocator = extern "system" fn(This) -> HRESULT;
 type Close = extern "system" fn(This) -> HRESULT;
@@ -427,6 +569,12 @@ type SetHeaps = extern "system" fn(This, u32, *const This);
 type SetTable = extern "system" fn(This, u32, u64);
 type SetConstants = extern "system" fn(This, u32, u32, *const u32, u32);
 type Dispatch = extern "system" fn(This, u32, u32, u32);
+type SetTopology = extern "system" fn(This, u32);
+type SetViewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
+type SetScissors = extern "system" fn(This, u32, *const Rect);
+type SetVertexBuffers = extern "system" fn(This, u32, u32, *const VertexView);
+type SetTargets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+type Draw = extern "system" fn(This, u32, u32, u32, u32);
 type Execute = extern "system" fn(This, u32, *const This);
 type Signal = extern "system" fn(This, This, u64) -> HRESULT;
 type Present = extern "system" fn(This, u32, *const Planes, *const u8) -> HRESULT;
@@ -447,6 +595,7 @@ const COPY_SOURCE: u32 = 0x800;
 const RTV_HEAP: u32 = 2;
 const VIEW_HEAP: u32 = 0;
 const SHADER_VISIBLE: u32 = 1;
+const TRIANGLE_LIST: u32 = 4;
 
 /// The side of the picture of stages 2 and 3: small, so that the window
 /// is small and a frame costs the card nothing.
@@ -811,10 +960,9 @@ impl Title {
         Ok(format!("a {SIDE}x{SIDE} tiled texture uploaded, presented, partly rewritten and seen again"))
     }
 
-    /// The root signature the program's layout asks for: four root
-    /// constants (`b0`) and a table of one UAV (`u0`), serialized through the
-    /// title's import and created on the device.
-    fn root_signature(&self, imports: &Imports) -> Result<This, Failed> {
+    /// The root signature the compute program's layout asks for: four root
+    /// constants (`b0`) and a table of one UAV (`u0`).
+    fn compute_root(&self, imports: &Imports) -> Result<This, Failed> {
         let range = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
             NumDescriptors: 1,
@@ -838,12 +986,23 @@ impl Title {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
         ];
+        self.root_signature(imports, &parameters, D3D12_ROOT_SIGNATURE_FLAG_NONE)
+    }
+
+    /// The root signature of `parameters`, serialized through the title's
+    /// import and created on the device.
+    fn root_signature(
+        &self,
+        imports: &Imports,
+        parameters: &[D3D12_ROOT_PARAMETER],
+        flags: D3D12_ROOT_SIGNATURE_FLAGS,
+    ) -> Result<This, Failed> {
         let desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: 2,
+            NumParameters: parameters.len() as u32,
             pParameters: parameters.as_ptr(),
             NumStaticSamplers: 0,
             pStaticSamplers: std::ptr::null(),
-            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            Flags: flags,
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
         let hr = (imports.serialize_root)((&raw const desc).cast(), 1, &mut blob, &mut error);
@@ -864,27 +1023,172 @@ impl Title {
         Ok(root)
     }
 
-    fn translated_shader(&self, imports: &Imports, bench: &mut Bench) -> Outcome {
-        let host = match crate::host::host() {
-            Some(h) => h,
-            None => return Outcome::Skip("no device".into()),
+    /// Why translated shaders cannot run on this adapter, if they cannot.
+    fn no_translated_shaders() -> Option<String> {
+        let Some(host) = crate::host::host() else {
+            return Some("no device".into());
         };
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
         // SAFETY: a plain query into our structure.
         let asked = unsafe {
             host.device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
         };
-        if asked.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Outcome::Skip(format!(
+        (asked.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0).then(|| {
+            format!(
                 "the adapter has shader model {}.{}; translated shaders need 6.6",
                 model.HighestShaderModel.0 >> 4,
                 model.HighestShaderModel.0 & 15
-            ));
+            )
+        })
+    }
+
+    fn translated_shader(&self, imports: &Imports, bench: &mut Bench) -> Outcome {
+        if let Some(why) = Self::no_translated_shaders() {
+            return Outcome::Skip(why);
         }
         match self.compute(imports, bench) {
             Ok(detail) => Outcome::Ok(detail),
             Err(f) => Outcome::Fail(f.reason),
         }
+    }
+
+    fn translated_draw(&self, imports: &Imports, bench: &mut Bench) -> Outcome {
+        if let Some(why) = Self::no_translated_shaders() {
+            return Outcome::Skip(why);
+        }
+        self.draw(imports, bench).into_outcome()
+    }
+
+    /// The root signature the draw programs' layouts ask for: four root
+    /// constants for the vertex stage (`b0`, root slot 0) and one for the
+    /// pixel stage (`b1`, slot 1), as a title would declare them.
+    fn draw_root(&self, imports: &Imports) -> Result<This, Failed> {
+        let constants = |register, count, visibility| D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: register, RegisterSpace: 0, Num32BitValues: count },
+            },
+            ShaderVisibility: visibility,
+        };
+        let parameters = [constants(0, 4, D3D12_SHADER_VISIBILITY_VERTEX), constants(1, 1, D3D12_SHADER_VISIBILITY_PIXEL)];
+        self.root_signature(imports, &parameters, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)
+    }
+
+    /// The synthetic vertex and pixel programs, from their containers to
+    /// the pixels they draw: a pipeline-state stream given to the device's
+    /// `CreatePipelineState`, then targets, viewport, scissor, topology, a
+    /// vertex buffer in title memory, root constants and draws through the
+    /// list's table, presented and read back. Twice: one draw over the
+    /// whole target, then two (other constants; the second cut to the left
+    /// half by its scissor) in one list.
+    fn draw(&self, imports: &Imports, bench: &mut Bench) -> Result<String, Failed> {
+        use victory_shader::native::synth;
+        let (vs, ps) = (synth::draw_vertex(), synth::draw_pixel());
+        let root = self.draw_root(imports)?;
+        let inputs = [position_input()];
+        let stream = GraphicsStream::new(root, &vs, &ps, &inputs);
+        let desc = StreamDesc { size: size_of::<GraphicsStream>(), stream: (&raw const stream).cast() };
+        let mut pipeline = Self::null();
+        check("CreatePipelineState", slot::<MakeStream>(self.device, 0x2b0)(self.device, &desc, &PIPELINE, &mut pipeline))?;
+        // One triangle over the whole target: (-1, -1), (-1, 3), (3, -1),
+        // as x, y floats in a title buffer.
+        const STRIDE: u32 = 8;
+        let corners: [f32; 6] = [-1.0, -1.0, -1.0, 3.0, 3.0, -1.0];
+        let vertices = self.buffer(UPLOAD_HEAP, 256, 0)?;
+        let memory = Self::mapped(vertices, 256)?;
+        for (at, c) in memory.chunks_exact_mut(4).zip(corners) {
+            at.copy_from_slice(&c.to_le_bytes());
+        }
+        let view = VertexView {
+            address: slot::<GpuAddress>(vertices, 0x58)(vertices),
+            size: STRIDE * 3,
+            stride: STRIDE,
+        };
+        // As for the compute pipeline: the host pipeline is made on first
+        // use, by the workers; a draw before it is ready would be dropped.
+        let began = Instant::now();
+        self.frame(|t| {
+            slot::<SetPipeline>(t.list, 0xc8)(t.list, pipeline);
+            Ok(())
+        })?;
+        self.sync()?;
+        while crate::pipeline::host_pipeline(pipeline).is_none() {
+            if began.elapsed() > Duration::from_secs(30) {
+                return Err("no host graphics pipeline 30 s after the pipeline's first use (the host refused it or a \
+                            program did not translate, see the log)"
+                    .into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        bench.graphics = Some(began.elapsed());
+        let half = Rect { left: 0, top: 0, right: SIDE as i32 / 2, bottom: SIDE as i32 };
+        let whole = Rect { right: SIDE as i32, ..half };
+        // Colours whose channels are whole steps of an 8-bit target.
+        let step = |n: u32| (n as f32 / 255.0).to_bits();
+        let rounds: [&[([u32; 4], u32, &Rect)]; 2] = [
+            &[([step(40), step(200), step(90), step(17)], step(230), &whole)],
+            &[
+                ([step(250), step(5), step(128), step(0)], step(64), &whole),
+                ([step(16), step(96), step(240), step(255)], step(255), &half),
+            ],
+        ];
+        let viewport = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: SIDE as f32, Height: SIDE as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let mut draws = 0;
+        for (round, draws_of) in rounds.iter().enumerate() {
+            let ran_before = crate::draw::drawn();
+            self.frame(|t| {
+                let l = t.list;
+                t.transition(t.target, COMMON, RENDER_TARGET);
+                slot::<ClearRtv>(l, 0x1a0)(l, t.rtv, &[0.0, 0.0, 0.0, 0.0], 0, std::ptr::null());
+                slot::<SetTargets>(l, 0x190)(l, 1, &t.rtv, 0, std::ptr::null());
+                slot::<SetViewports>(l, 0xa8)(l, 1, &viewport);
+                slot::<SetTopology>(l, 0xa0)(l, TRIANGLE_LIST);
+                slot::<SetRoot>(l, 0x110)(l, root);
+                slot::<SetPipeline>(l, 0xc8)(l, pipeline);
+                slot::<SetVertexBuffers>(l, 0x180)(l, 0, 1, &view);
+                for (vs_constants, ps_constant, scissor) in draws_of.iter() {
+                    slot::<SetScissors>(l, 0xb0)(l, 1, *scissor);
+                    slot::<SetConstants>(l, 0x140)(l, 0, 4, vs_constants.as_ptr(), 0);
+                    slot::<SetConstants>(l, 0x140)(l, 1, 1, ps_constant, 0);
+                    slot::<Draw>(l, 0x60)(l, 3, 1, 0, 0);
+                }
+                t.transition(t.target, RENDER_TARGET, COMMON);
+                Ok(())
+            })?;
+            self.present()?;
+            self.sync()?;
+            let ran = crate::draw::drawn() - ran_before;
+            if ran < draws_of.len() as u64 {
+                return Err(format!(
+                    "list {}: {ran} of {} draws ran on the host; the others were dropped",
+                    round + 1,
+                    draws_of.len()
+                )
+                .into());
+            }
+            draws += draws_of.len();
+            let (_, _, pixels) = read_back(self.target)?;
+            for (at, pixel) in pixels.chunks_exact(4).enumerate() {
+                let (x, y) = (at as u32 % SIDE, at as u32 / SIDE);
+                // The last draw whose scissor holds the pixel.
+                let last = draws_of.iter().rev().find(|d| (x as i32) < d.2.right && (y as i32) < d.2.bottom);
+                let Some((vs_constants, ps_constant, _)) = last else { continue };
+                let want = synth::draw_colour(*vs_constants, *ps_constant).map(|c| (c * 255.0).round() as u8);
+                if !near(pixel, &want) {
+                    return Err(format!(
+                        "list {}: pixel ({x}, {y}) is {pixel:?}, the programs draw {want:?} there",
+                        round + 1
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(format!(
+            "a {}-byte vertex and a {}-byte pixel container translated, made a host graphics pipeline from a \
+             pipeline stream; {draws} draws in 2 lists presented and read back, every pixel matched",
+            vs.len(),
+            ps.len()
+        ))
     }
 
     /// The synthetic compute program, from its container to the values it
@@ -897,7 +1201,7 @@ impl Title {
         let began = Instant::now();
         crate::shader_cache::host_shader(&container).map_err(|e| format!("the translator refused our program: {e}"))?;
         bench.translate = Some(began.elapsed());
-        let root = self.root_signature(imports)?;
+        let root = self.compute_root(imports)?;
         let desc = ComputeDesc {
             root,
             code: container.as_ptr(),
@@ -1019,6 +1323,14 @@ impl Title {
         if let Some(d) = measured.pipeline {
             rates.push(Rate { name: "pipeline_creation", value: ms(d), unit: "ms", what: "first use to a host compute pipeline, translation included" });
         }
+        if let Some(d) = measured.graphics {
+            rates.push(Rate {
+                name: "graphics_pipeline_creation",
+                value: ms(d),
+                unit: "ms",
+                what: "first use to a host vertex and pixel pipeline, both translations included",
+            });
+        }
         rates
     }
 
@@ -1078,12 +1390,13 @@ impl Title {
     }
 }
 
-/// What stage 2 and the shader stage measured for the benchmark.
+/// What stage 2 and the shader stages measured for the benchmark.
 #[derive(Default)]
 struct Bench {
     present: Option<Duration>,
     translate: Option<Duration>,
     pipeline: Option<Duration>,
+    graphics: Option<Duration>,
 }
 
 fn ms(d: Duration) -> f64 {
@@ -1277,6 +1590,21 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Planes, resources), 0x10);
         assert_eq!(size_of::<Planes>(), 0x90);
         assert_eq!(size_of::<QueueDesc>(), 16);
+        assert_eq!(size_of::<VertexView>(), size_of::<D3D12_VERTEX_BUFFER_VIEW>());
+        assert_eq!(size_of::<Code>(), size_of::<D3D12_SHADER_BYTECODE>());
+        // Each subobject is as long as the layer's walk of a stream takes
+        // it to be (`pipeline::subobject`, D3D12's padding to a pointer).
+        assert_eq!(size_of::<Sub<This>>(), 16);
+        assert_eq!(size_of::<Sub<Code>>(), 24);
+        assert_eq!(size_of::<Sub<D3D12_BLEND_DESC>>(), 336);
+        assert_eq!(size_of::<Sub<u32>>(), 8);
+        assert_eq!(size_of::<Sub<D3D12_RASTERIZER_DESC>>(), 48);
+        assert_eq!(size_of::<Sub<D3D12_DEPTH_STENCIL_DESC1>>(), 64);
+        assert_eq!(size_of::<Sub<D3D12_INPUT_LAYOUT_DESC>>(), 24);
+        assert_eq!(size_of::<Sub<D3D12_RT_FORMAT_ARRAY>>(), 40);
+        assert_eq!(size_of::<Sub<DXGI_SAMPLE_DESC>>(), 16);
+        assert_eq!(std::mem::offset_of!(GraphicsStream, samples), 0x258);
+        assert_eq!(size_of::<GraphicsStream>(), 0x268);
     }
 
     #[test]

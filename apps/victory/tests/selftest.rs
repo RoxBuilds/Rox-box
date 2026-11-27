@@ -1,7 +1,7 @@
 //! `victory selftest` on the software adapter: the whole frame path (device,
 //! command lists through the function tables, submission with title memory
-//! kept in step, a translated shader, present) on every `cargo test` and in
-//! CI, with no title files.
+//! kept in step, a translated compute shader and a translated draw, present)
+//! on every `cargo test` and in CI, with no title files.
 //!
 //! The binary runs in a process of its own: the host device is one per
 //! process, and the debug layer must not come on beside the other GPU
@@ -27,7 +27,7 @@ fn the_self_test_passes_on_the_software_adapter() {
         return;
     }
     assert!(output.status.success(), "the self-test failed ({:?}):\n{stdout}\n{stderr}", output.status);
-    for stage in ["Device", "Clear + present", "Unified memory", "Translated shader"] {
+    for stage in ["Device", "Clear + present", "Unified memory", "Translated shader", "Translated draw"] {
         assert!(
             stdout.lines().any(|l| l.contains(stage) && (l.starts_with("[  OK   ]") || l.starts_with("[ SKIP  ]"))),
             "no OK or SKIP line for {stage}:\n{stdout}"

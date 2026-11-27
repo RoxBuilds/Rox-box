@@ -136,8 +136,9 @@ victory.exe selftest
 
 runs Rox-box's whole frame path with a stand-in title made of its own code: it
 creates the device, clears and presents frames, moves memory between the
-processor's side and the graphics card's, and translates and runs a shader. It
-needs no game files and no setup, takes a few seconds and opens a small window
+processor's side and the graphics card's, translates and runs a compute
+shader, and draws with a translated vertex and pixel shader. It needs no game
+files and no setup, takes a few seconds and opens a small window
 for a moment. Each stage is `OK`, `FAIL` or `SKIP`. If a stage fails, update
 the graphics driver; if it still fails, run `victory.exe selftest --warp`, the
 same test on Windows' software adapter. Passing there means the driver or the

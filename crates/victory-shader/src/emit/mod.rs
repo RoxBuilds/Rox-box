@@ -1436,8 +1436,9 @@ fn vertex_output_interpolation(
     Ok(())
 }
 
-/// The rows of an `ISG1`/`OSG1` part.
-fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+/// The rows of an `ISG1`/`OSG1` part (also how `native::synth`'s tests
+/// read back the parts they write).
+pub(crate) fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;

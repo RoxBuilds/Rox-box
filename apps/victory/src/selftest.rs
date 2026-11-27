@@ -52,7 +52,7 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
     if !report.rates.is_empty() {
         println!("\nBenchmark (name, value, unit; docs/selftest.md says how to read them):");
         for r in &report.rates {
-            println!("{:<20} {:>12.2} {}", r.name, r.value, r.unit);
+            println!("{:<26} {:>12.2} {}", r.name, r.value, r.unit);
         }
     }
     println!();
