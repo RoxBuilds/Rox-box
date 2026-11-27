@@ -263,19 +263,18 @@ fn cpu_item(has_avx2: bool, skip: Option<&str>) -> Item {
     }
 }
 
+/// Windows 11 (build 22000) is the first Windows whose own Direct3D 12 runtime
+/// gives Shader Model 6.6; Windows 10's stops at 6.5, whatever the driver.
+const WINDOWS_11_BUILD: u32 = 22000;
+const NEEDS_WINDOWS_11: &str = "Windows 11 (64-bit) is required: Windows 10's Direct3D 12                                 runtime stops at Shader Model 6.5, and titles need 6.6";
+
 fn windows_item(version: Option<(u32, u32, u32)>) -> Item {
     match version {
-        None => Item::warn("Windows", "version unknown", "Windows 10 version 2004 or newer is needed"),
-        Some((major, minor, build)) if major < 10 => Item::missing(
+        None => Item::warn("Windows", "version unknown", NEEDS_WINDOWS_11),
+        Some((major, minor, build)) if major < 10 || build < WINDOWS_11_BUILD => Item::missing(
             "Windows",
-            format!("version {major}.{minor} (build {build}) is too old"),
-            "Windows 10 version 2004 (build 19041) or newer is needed; Windows 11 is best",
-        ),
-        Some((major, minor, build)) if build < 19041 => Item::warn(
-            "Windows",
-            format!("version {major}.{minor} build {build} is older than Windows 10 version 2004"),
-            "install the pending Windows updates (build 19041 or newer is needed for the \
-             graphics features titles use)",
+            format!("version {major}.{minor} build {build} is older than Windows 11"),
+            NEEDS_WINDOWS_11,
         ),
         Some((major, minor, build)) => Item::ok("Windows", format!("{major}.{minor} build {build}")),
     }
@@ -349,7 +348,7 @@ fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::No
         Item::missing(
             "Shader Model 6.6",
             format!("not supported: the driver and Windows give {major}.{minor} at most"),
-            format!("{UPDATE} (Windows 11, or a fully updated Windows 10)"),
+            format!("{UPDATE} (Windows 11 is required)"),
         )
     };
     let mesh = if gpu.mesh_shaders {
@@ -379,7 +378,7 @@ fn host_items() -> Vec<Item> {
         items.extend(gpu_items(victory_gpu::preflight::gpu()));
     }
     #[cfg(not(windows))]
-    items.push(Item::missing("Windows", "this is not Windows", "titles run on Windows 10 or 11 (x64)"));
+    items.push(Item::missing("Windows", "this is not Windows", "titles run on Windows 11 (x64)"));
     items
 }
 
@@ -714,8 +713,12 @@ mod tests {
             assert!(item.message().contains("AVX2") && item.message().contains(SKIP_CPU_CHECK_ENV));
         }
         assert_eq!(windows_item(Some((10, 0, 26100))).state, State::Ok);
-        assert_eq!(windows_item(Some((10, 0, 18363))).state, State::Warn);
-        assert_eq!(windows_item(Some((6, 1, 7601))).state, State::Missing);
+        assert_eq!(windows_item(Some((10, 0, 22000))).state, State::Ok);
+        for old in [(10, 0, 19045), (10, 0, 18363), (6, 1, 7601)] {
+            let item = windows_item(Some(old));
+            assert_eq!(item.state, State::Missing);
+            assert!(item.message().contains("Windows 11") && item.message().contains("6.5"), "{}", item.message());
+        }
         assert_eq!(windows_item(None).state, State::Warn);
         assert_eq!(memory_item(Some((20_000, 40_000))).state, State::Ok);
         let low = memory_item(Some((4096, 16_384)));

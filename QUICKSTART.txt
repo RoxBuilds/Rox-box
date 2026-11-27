@@ -7,7 +7,8 @@ experimental: expect low frame rates, visual errors and titles that do not
 start.
 
 WHAT YOU NEED
-  - Windows 11, or a fully updated Windows 10 (64-bit)
+  - Windows 11 (64-bit). Windows 10 cannot run titles: its Direct3D 12
+    runtime stops at Shader Model 6.5, whatever the graphics card
   - A processor with AVX2 (Intel from 2013, AMD from 2015)
   - A graphics card with Direct3D 12 (feature level 12_0) and Shader Model 6.6,
     with a current driver; mesh-shader support is recommended
@@ -68,6 +69,8 @@ TROUBLESHOOTING
   1. Always start with  play.cmd -Check  and fix every MISSING line.
   2. "No Direct3D 12 device" or "Shader Model 6.6 ... not supported": update
      the graphics driver from the card maker's site, then Windows itself.
+     On Windows 10 the shader model check always fails: Windows 11 is
+     required.
   3. Stops with a memory error: close other programs (browsers first) and
      make the page file larger or fixed (Advanced system settings >
      Performance > Virtual memory); then try  play.cmd -Fast.

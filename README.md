@@ -63,13 +63,20 @@ There is no compatibility list and no promise that any particular title works.
 
 | | |
 |---|---|
-| Windows | Windows 11, or Windows 10 version 2004 (build 19041) or newer, 64-bit |
+| Windows | **Windows 11** (build 22000 or newer), 64-bit. Windows 10 is not supported: its built-in Direct3D 12 runtime stops at Shader Model 6.5, whatever the graphics card or driver |
 | Processor | x64 with AVX2 (Intel from 2013, AMD from 2015) |
 | Graphics | Direct3D 12 feature level 12_0 with **Shader Model 6.6** and a current driver. Without mesh-shader support, whatever a title draws with mesh shaders is left out |
 | Memory | At least 12 GB of free *commit* memory (RAM plus page file) when a title starts; more RAM and video memory help a great deal |
 | Software | Nothing to install: no runtime, no redistributable, no compiler |
 
 `play.cmd -Check` (below) tests every one of these on your PC.
+
+**Why not Windows 10?** Translated shaders are Shader Model 6.6, and Windows 10's own Direct3D 12
+runtime cannot go past 6.5. Microsoft's redistributable Direct3D 12 runtime (the Agility SDK) would
+lift that limit, but it is proprietary: its license bars distributing it in any way that brings it
+under a copyleft license such as Rox-box's GPL-3.0, and it adds terms (an end-user agreement, an
+indemnity) that a GPL-3.0 release cannot pass on. So release packages contain only Rox-box's own
+files, and use the Direct3D 12 runtime that ships with Windows 11.
 
 ### Quick start
 
@@ -240,11 +247,11 @@ below are the ones `victory check` and a run print.
 | `Game folder  ... is inside a copy of the Rox-box source tree` (a warning) | The run starts; move the title's folder outside the source tree and correct `game_dir` |
 | `Cache folder` / `Data folder` `MISSING` (`refusing to use ...`) | The folder is inside a copy of the source tree: set `cache_dir` / `data_dir` to a folder outside it |
 | `Processor  this processor has no AVX2 instructions` | The processor is too old for titles |
-| `Windows  version ... is too old` / `older than Windows 10 version 2004` | Install the pending Windows updates |
+| `Windows  version ... is older than Windows 11` | Windows 10 cannot run titles (its Direct3D 12 runtime stops at Shader Model 6.5): upgrade to Windows 11 |
 | `Memory  ... GB of commit memory free of ... GB (under 12 GB)` | Close other programs (browsers first), or enlarge the page file: Advanced system settings > Performance > Virtual memory. Then try `play.cmd -Fast` |
 | `Graphics card  no Direct3D 12 device (feature level 12_0)` | Install or update the graphics driver. Over Remote Desktop or in a virtual machine there may be no such device |
 | `Graphics card  ...: a software adapter, not a graphics card` | The graphics driver is not installed |
-| `Shader Model 6.6  not supported` | Update the graphics driver and Windows; if it stays, the graphics card is too old |
+| `Shader Model 6.6  not supported` | On Windows 11, update the graphics driver and Windows; if it stays, the graphics card is too old. On Windows 10 it is always reported: Windows 11 is required |
 | `Mesh shaders  not supported` (a warning) | The run starts, but whatever the title draws with mesh shaders is left out |
 | `error: this PC or its configuration cannot run a title yet` | `victory run --execute` found something `MISSING`; `play.cmd -Check` shows it |
 | `the title's own DLLs are missing` | The game folder is incomplete: every file of the title belongs next to its executable |
@@ -260,7 +267,7 @@ from the title. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Prerequisites
 
-- Windows 10/11 x64.
+- Windows 10/11 x64 to build; running titles needs Windows 11.
 - [rustup](https://rustup.rs). The toolchain version is pinned in
   [rust-toolchain.toml](rust-toolchain.toml) and is installed automatically.
 - The MSVC C++ build tools: Visual Studio or "Build Tools for Visual Studio"
