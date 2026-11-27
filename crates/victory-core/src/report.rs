@@ -32,6 +32,9 @@
 //! thread only stores the end reason and wakes the helper.
 //!
 //! `VICTORY_REPORT=0` turns it off: no thread, no file, no host queries.
+//!
+//! `victory selftest` writes its result through the same renderer and guard
+//! (`selftest-<UTC time>.txt` beside the run reports, [`write_selftest`]).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -41,8 +44,11 @@ use std::time::{Duration, Instant};
 
 /// The report format's version, the first key of every report. 2 added the
 /// frame line's figures (`[frame_time]`), memory pressure, textures picked by
-/// index and pipelines the title went without.
-pub const FORMAT: u32 = 2;
+/// index and pipelines the title went without. 3: `kind` (`run`, or
+/// `selftest` for the self-test's report); `[frame_time]` holds the frames
+/// of the last part of a second too; a short run's `[frame_time.steady]` is
+/// by whole seconds, or left without figures when there is none.
+pub const FORMAT: u32 = 3;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -719,6 +725,7 @@ pub fn present(drawn: u64, dispatched: u64) {
     }
     let last = LAST_PRESENT_US.swap(now, Relaxed);
     let window = window_of(now);
+    let second = second_of(now);
     WINDOW_PRESENTS[window].fetch_add(1, Relaxed);
     let totals = [
         STAT[Stat::Submissions as usize].load(Relaxed),
@@ -736,11 +743,17 @@ pub fn present(drawn: u64, dispatched: u64) {
             WORK_MAX[i].fetch_max(delta, Relaxed);
             if i == 3 {
                 FIGURES[window][Figure::LeftOut as usize].fetch_add(delta, Relaxed);
+                if let Some(s) = second {
+                    SECONDS[s][Figure::LeftOut as usize].fetch_add(delta, Relaxed);
+                }
             }
         }
     }
     if !first {
         FIGURES[window][Figure::Intervals as usize].fetch_add(1, Relaxed);
+        if let Some(s) = second {
+            SECONDS[s][Figure::Intervals as usize].fetch_add(1, Relaxed);
+        }
     }
     if first || now < last {
         return;
@@ -830,15 +843,44 @@ const SETTLED: [(Figure, &str); 9] = [
     (Figure::SettledFence, "blocking_fence_wait"),
 ];
 
-/// Figures of the frame line, added to the window of now (once a second).
+/// The same figures by whole seconds from the first present, for the first
+/// [`SECONDS_KEPT`]: the steady state of a run too short for a whole window
+/// after its first third ([`steady_state`]) is made from them. Such a run
+/// lasts under 30 s from its first present, so these are enough.
+const SECONDS_KEPT: usize = 32;
+static SECONDS: [[AtomicU64; FIGS]; SECONDS_KEPT] = [const { [const { AtomicU64::new(0) }; FIGS] }; SECONDS_KEPT];
+
+/// The second from the first present that `us` (since the start) is in, if
+/// it is one of those kept; `None` before the first present.
+fn second_of(us: u64) -> Option<usize> {
+    let first = FIRST_PRESENT_US.load(Relaxed);
+    let second = (us.checked_sub(first)? / 1_000_000) as usize;
+    (first != u64::MAX && second < SECONDS_KEPT).then_some(second)
+}
+
+/// Figures of the frame line, added to the window of now (once a second,
+/// and once more when the report that names the run's end is written).
 pub fn figures(values: &[(Figure, u64)]) {
     if !ACTIVE.load(Relaxed) {
         return;
     }
-    let window = &FIGURES[window_of(now_us())];
+    let now = now_us();
+    let window = &FIGURES[window_of(now)];
+    let second = second_of(now).map(|s| &SECONDS[s]);
     for &(figure, value) in values {
         window[figure as usize].fetch_add(value, Relaxed);
+        if let Some(second) = second {
+            second[figure as usize].fetch_add(value, Relaxed);
+        }
     }
+}
+
+/// Whether the report being written is the one that names how the run
+/// ended: the GPU side then gives the frame line's meters one last time
+/// (what they hold since the line's last second), so that `[frame_time]`
+/// covers every frame without the log saying more.
+pub fn ending() -> bool {
+    END.load(SeqCst) != 0
 }
 
 const WINDOW_US: u64 = WINDOW_S * 1_000_000;
@@ -867,6 +909,54 @@ fn split_figures(windows: &[[u64; FIGS]], from_us: Option<u64>) -> ([u64; FIGS],
         }
     }
     (whole, steady)
+}
+
+/// The steady state of a run: from where, its figures, and whether it is a
+/// short run's, by seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Steady {
+    from_us: u64,
+    figures: [u64; FIGS],
+    by_seconds: bool,
+}
+
+/// The steady state of a run whose first present came at `first_us` and
+/// that has lasted `duration_us`: the windows from [`steady_from_us`] on,
+/// when one of them is complete. A shorter run (under 30 s from its first
+/// present) has none, and its figures there were all zeros: its steady
+/// state is then the last two thirds of its frames by time at the frame
+/// meter's resolution: the readings begun at or after the first whole second
+/// (from the first present, `from_us`) at or after a third of the time from
+/// the first present. A reading is kept in the second it was taken in and
+/// covers about the second before it, so those are the readings taken from
+/// the second after that one on. `None` when no reading begun that late was
+/// taken: the run was too short (a run of about a second has one reading,
+/// of all of it).
+fn steady_state(
+    first_us: u64,
+    duration_us: u64,
+    windows: &[[u64; FIGS]],
+    seconds: &[[u64; FIGS]],
+) -> Option<Steady> {
+    let from_us = steady_from_us(first_us, duration_us);
+    if from_us + WINDOW_US <= duration_us {
+        let (_, figures) = split_figures(windows, Some(from_us));
+        return Some(Steady { from_us, figures, by_seconds: false });
+    }
+    let from_second = (duration_us.saturating_sub(first_us) / 3).div_ceil(1_000_000);
+    let skip = from_second as usize + 1;
+    let mut figures = [0u64; FIGS];
+    for second in seconds.iter().skip(skip) {
+        for (f, &value) in second.iter().enumerate() {
+            figures[f] = figures[f].saturating_add(value);
+        }
+    }
+    let read = figures[Figure::Frames as usize] > 0 || figures[Figure::Intervals as usize] > 0;
+    read.then_some(Steady {
+        from_us: first_us + from_second * 1_000_000,
+        figures,
+        by_seconds: true,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,10 +1199,23 @@ fn now_us() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
-/// Whether a report is being kept: the GPU side asks before it queries the
-/// device for the host facts.
+/// Whether a report is being kept, or the self-test's will be written
+/// ([`keep_host_facts`]): the GPU side asks before it queries the device for
+/// the host facts.
 pub fn active() -> bool {
-    ACTIVE.load(Relaxed)
+    ACTIVE.load(Relaxed) || FACTS.load(Relaxed)
+}
+
+/// Set by [`keep_host_facts`].
+static FACTS: AtomicBool = AtomicBool::new(false);
+
+/// The self-test's report will be written ([`write_selftest`]): the host's
+/// facts are kept as for a run (the GPU side's, when it makes its device),
+/// but nothing of a run is counted and no helper thread starts.
+pub fn keep_host_facts() {
+    if enabled() {
+        FACTS.store(true, Relaxed);
+    }
 }
 
 /// The console model the title is told it runs on.
@@ -1171,19 +1274,8 @@ pub fn begin(dir: PathBuf) -> Option<PathBuf> {
         return None;
     }
     START.get_or_init(Instant::now);
-    let stamp = utc_stamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-    );
-    let mut name = format!("run-{stamp}.txt");
-    for n in 2.. {
-        if !dir.join(&name).exists() {
-            break;
-        }
-        name = format!("run-{stamp}-{n}.txt");
-    }
-    prune(&dir, KEEP - 1);
+    let name = new_name(&dir, Kind::Run);
+    prune(&dir, Kind::Run, KEEP - 1);
     {
         let mut state = state();
         state.switches = switches(std::env::vars_os());
@@ -1374,6 +1466,154 @@ impl Written {
 }
 
 // ---------------------------------------------------------------------------
+// The self-test's report.
+//
+// `victory selftest` runs no title, so its result was only the terminal's
+// text, which a player had to copy, without the host's facts a run report
+// collects. It writes a report of its own through the same renderer and
+// guard: the host, then each stage's outcome in our words, the benchmark's
+// rates as numbers. A stage's detail and a failure's text are built at run
+// time (numbers, the adapter's name) and are not written: the outcome and
+// one of our fixed reasons are.
+
+/// How a self-test stage ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageOutcome {
+    Ok,
+    Fail,
+    Skip,
+}
+
+impl StageOutcome {
+    const fn key(self) -> &'static str {
+        match self {
+            StageOutcome::Ok => "ok",
+            StageOutcome::Fail => "fail",
+            StageOutcome::Skip => "skip",
+        }
+    }
+}
+
+/// One stage: our name of it, its outcome, and our fixed wording of why
+/// (a skip's cause, a failure's kind), if there is one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelftestStage {
+    pub name: Ours,
+    pub outcome: StageOutcome,
+    pub reason: Option<Ours>,
+}
+
+/// A rate of the benchmark: our name, the value, our word for its unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelftestRate {
+    pub name: Ours,
+    pub value: f64,
+    pub unit: Ours,
+}
+
+/// What a self-test did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Selftest {
+    /// On the software adapter (`--warp`).
+    pub software_adapter: bool,
+    /// Frames of the clear-and-present stage, and whether rates were taken.
+    pub frames: u32,
+    pub bench: bool,
+    /// How it ended: `completed`, `no_device`, `hung`, `host_gpu_failed`.
+    pub ended: Ours,
+    pub stages: Vec<SelftestStage>,
+    pub rates: Vec<SelftestRate>,
+}
+
+/// Writes the self-test's report in `dir` (`<data_dir>\reports`, made and
+/// checked by the caller) as `selftest-<UTC time>.txt`, keeping the newest
+/// [`KEEP`] of them. Its path; `None` if reports are off or it could not be
+/// written.
+pub fn write_selftest(dir: &Path, test: &Selftest) -> Option<PathBuf> {
+    if !enabled() {
+        return None;
+    }
+    let switches = switches(std::env::vars_os());
+    let text = render_selftest(&Snapshot::take(), test, &switches);
+    let name = new_name(dir, Kind::Selftest);
+    prune(dir, Kind::Selftest, KEEP - 1);
+    let (path, part) = (dir.join(&name), dir.join(format!("{name}.part")));
+    std::fs::write(&part, text).ok()?;
+    std::fs::rename(&part, &path).ok()?;
+    Some(path)
+}
+
+/// The opening comment of a self-test's report.
+const SELFTEST_PREAMBLE: &str = "\
+# Rox-box self-test report
+#
+# Written by `victory selftest` when it ended. The self-test runs a stand-in
+# title made of Rox-box's own code: no game files are read. It is meant to be
+# attached to a public issue, and holds only:
+#   - numbers: the benchmark's rates, counts of stages;
+#   - words from Rox-box's own source code: the stages' names, their outcomes
+#     and our fixed reasons;
+#   - facts about this PC: the Windows build, the processor model, memory
+#     sizes, the graphics adapter's name, vendor and driver version;
+#   - the names of the VICTORY_* switches set, with a value only where it
+#     is a short plain number or word.
+# It never holds: file or folder names, paths, your user or computer name,
+# or the text the self-test printed. docs/selftest.md explains every field.
+";
+
+/// A self-test's report: the host from `s`, then `test`.
+fn render_selftest(s: &Snapshot, test: &Selftest, switches: &[(String, String)]) -> String {
+    let mut d = Doc {
+        out: String::from(SELFTEST_PREAMBLE),
+        host: false,
+    };
+    d.line(format_args!(""));
+    d.int("format", FORMAT);
+    d.word("kind", Ours("selftest"));
+    host_sections(&mut d, s);
+
+    d.table("selftest");
+    d.word("ended", test.ended);
+    d.boolean("software_adapter", test.software_adapter);
+    d.int("frames", test.frames);
+    d.boolean("bench", test.bench);
+    let count = |o: StageOutcome| test.stages.iter().filter(|t| t.outcome == o).count();
+    d.boolean("passed", count(StageOutcome::Fail) == 0 && test.ended == Ours("completed"));
+    d.int("stages_ok", count(StageOutcome::Ok));
+    d.int("stages_failed", count(StageOutcome::Fail));
+    d.int("stages_skipped", count(StageOutcome::Skip));
+    d.table("selftest.switches");
+    d.comment("VICTORY_* variables set; a value only where it is a plain number or word");
+    let mut named: Vec<String> = Vec::new();
+    for (name, value) in switches {
+        let (name, value) = (d.quoted(name), d.quoted(value));
+        if !named.contains(&name) {
+            d.line(format_args!("{name} = {value}"));
+            named.push(name);
+        }
+    }
+    if !test.rates.is_empty() {
+        d.table("selftest.rates");
+        d.comment("the benchmark (docs/selftest.md); each rate's unit is in [selftest.rate_units]");
+        d.keyed_floats(test.rates.iter().map(|r| (r.name.as_str(), r.value)));
+        d.table("selftest.rate_units");
+        for r in &test.rates {
+            let (name, unit) = (d.quoted(r.name.as_str()), d.quoted(r.unit.as_str()));
+            d.line(format_args!("{name} = {unit}"));
+        }
+    }
+    for stage in &test.stages {
+        d.array_table("selftest.stage");
+        d.word("name", stage.name);
+        d.word("outcome", Ours(stage.outcome.key()));
+        if let Some(reason) = stage.reason {
+            d.word("reason", reason);
+        }
+    }
+    d.out
+}
+
+// ---------------------------------------------------------------------------
 // Files.
 
 /// `yyyymmdd-hhmmss` (UTC) of `secs` since the Unix epoch.
@@ -1397,10 +1637,53 @@ fn utc_stamp(secs: u64) -> String {
     )
 }
 
-/// The order of a report's file name (time, then the number added to a
-/// second run in the same second); `None` for any other file.
-fn report_order(name: &str) -> Option<(String, u32)> {
-    let stem = name.strip_prefix("run-")?.strip_suffix(".txt")?;
+/// What a report file is of: a run (`run-<stamp>.txt`) or a self-test
+/// (`selftest-<stamp>.txt`). Each kind keeps its newest [`KEEP`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Run,
+    Selftest,
+}
+
+impl Kind {
+    const fn prefix(self) -> &'static str {
+        match self {
+            Kind::Run => "run-",
+            Kind::Selftest => "selftest-",
+        }
+    }
+
+    /// The kind of the report file called `name`, if it is one.
+    pub fn of_file(name: &str) -> Option<Kind> {
+        [Kind::Run, Kind::Selftest]
+            .into_iter()
+            .find(|k| report_order(name, *k).is_some())
+    }
+}
+
+/// A free name for a new report of `kind` in `dir` (a second report in the
+/// same second gets `-2`, `-3`...).
+fn new_name(dir: &Path, kind: Kind) -> String {
+    let stamp = utc_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    );
+    let prefix = kind.prefix();
+    let mut name = format!("{prefix}{stamp}.txt");
+    for n in 2.. {
+        if !dir.join(&name).exists() {
+            break;
+        }
+        name = format!("{prefix}{stamp}-{n}.txt");
+    }
+    name
+}
+
+/// The order of a report file's name of `kind` (time, then the number added
+/// to a second report in the same second); `None` for any other file.
+fn report_order(name: &str, kind: Kind) -> Option<(String, u32)> {
+    let stem = name.strip_prefix(kind.prefix())?.strip_suffix(".txt")?;
     let (stamp, n) = match stem.get(15..) {
         Some("") => (stem, 1),
         Some(rest) => (&stem[..15], rest.strip_prefix('-')?.parse().ok()?),
@@ -1411,22 +1694,49 @@ fn report_order(name: &str) -> Option<(String, u32)> {
     (b.len() == 15 && b[8] == b'-' && digits(0..8) && digits(9..15)).then(|| (stamp.to_owned(), n))
 }
 
-/// The reports in `dir`, newest first.
+/// The reports in `dir`, runs' and self-tests', newest first.
 pub fn reports_in(dir: &Path) -> Vec<PathBuf> {
+    reports_of(dir, &[Kind::Run, Kind::Selftest])
+}
+
+/// The reports of `kinds` in `dir`, newest first.
+pub fn reports_of(dir: &Path, kinds: &[Kind]) -> Vec<PathBuf> {
     let mut found: Vec<((String, u32), PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter_map(|e| Some((report_order(e.file_name().to_str()?)?, e.path())))
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let order = kinds.iter().find_map(|&k| report_order(name, k))?;
+            Some((order, e.path()))
+        })
         .collect();
     found.sort_by(|a, b| b.0.cmp(&a.0));
     found.into_iter().map(|(_, path)| path).collect()
 }
 
 /// One line about a report, for `victory report --list`: how the run ended,
-/// how long it ran, its average frame rate; `None` if `text` is no report.
+/// how long it ran, its average frame rate; for a self-test, how it ended
+/// and its stages; `None` if `text` is no report.
 pub fn summary(text: &str) -> Option<String> {
     let parsed: toml::Table = toml::from_str(text).ok()?;
+    if parsed.get("kind").and_then(|k| k.as_str()) == Some("selftest") {
+        let test = parsed.get("selftest")?.as_table()?;
+        let n = |key: &str| test.get(key).and_then(|v| v.as_integer()).unwrap_or(0);
+        return Some(format!(
+            "self-test{}, {}: {} ok, {} failed, {} skipped",
+            if test.get("software_adapter").and_then(|v| v.as_bool()) == Some(true) {
+                " on the software adapter"
+            } else {
+                ""
+            },
+            test.get("ended")?.as_str()?,
+            n("stages_ok"),
+            n("stages_failed"),
+            n("stages_skipped"),
+        ));
+    }
     let run = parsed.get("run")?.as_table()?;
     let ended = run.get("ended")?.as_str()?;
     let duration = run.get("duration_s")?.as_float()?;
@@ -1438,10 +1748,10 @@ pub fn summary(text: &str) -> Option<String> {
     Some(format!("{ended}, {duration:.0} s, {fps:.1} fps on average"))
 }
 
-/// Removes all but the newest `keep` reports in `dir`, and any `.part` left
-/// by a process that ended while writing one.
-fn prune(dir: &Path, keep: usize) {
-    for old in reports_in(dir).into_iter().skip(keep) {
+/// Removes all but the newest `keep` reports of `kind` in `dir`, and any
+/// `.part` left by a process that ended while writing one.
+fn prune(dir: &Path, kind: Kind, keep: usize) {
+    for old in reports_of(dir, &[kind]).into_iter().skip(keep) {
         let _ = std::fs::remove_file(old);
     }
     for entry in std::fs::read_dir(dir)
@@ -1453,7 +1763,7 @@ fn prune(dir: &Path, keep: usize) {
         let name = name.to_string_lossy();
         if name
             .strip_suffix(".part")
-            .is_some_and(|n| report_order(n).is_some())
+            .is_some_and(|n| report_order(n, kind).is_some())
         {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -1487,11 +1797,10 @@ struct Snapshot {
     work_sum: [u64; WORK],
     work_max: [u64; WORK],
     first_draw_us: Option<u64>,
-    /// The frame line's figures over the whole run and over the steady
-    /// state, which begins at `steady_from_us` (`None`: no present yet).
+    /// The frame line's figures over the whole run, and the steady state
+    /// (`None`: no present yet, or a run too short for one).
     figures: [u64; FIGS],
-    figures_steady: [u64; FIGS],
-    steady_from_us: Option<u64>,
+    steady: Option<Steady>,
     /// The lowest free memory and commit headroom seen (bytes; `u64::MAX`
     /// not seen), and the microseconds at each governor level.
     lowest: [u64; 2],
@@ -1512,12 +1821,12 @@ impl Snapshot {
         let duration_us = now_us();
         let windows_used = ((duration_us / 1_000_000 / WINDOW_S) as usize + 1).min(WINDOWS);
         let first_present_us = Some(load(&FIRST_PRESENT_US)).filter(|&t| t != u64::MAX);
-        let steady_from = first_present_us.map(|first| steady_from_us(first, duration_us));
-        let windows: Vec<[u64; FIGS]> = FIGURES[..windows_used]
-            .iter()
-            .map(|w| std::array::from_fn(|f| load(&w[f])))
-            .collect();
-        let (figures, figures_steady) = split_figures(&windows, steady_from);
+        let take = |w: &[AtomicU64; FIGS]| -> [u64; FIGS] { std::array::from_fn(|f| load(&w[f])) };
+        let windows: Vec<[u64; FIGS]> = FIGURES[..windows_used].iter().map(take).collect();
+        let seconds: Vec<[u64; FIGS]> = SECONDS.iter().map(take).collect();
+        let (figures, _) = split_figures(&windows, None);
+        let steady = first_present_us
+            .and_then(|first| steady_state(first, duration_us, &windows, &seconds));
         // The time since the governor's last look is the level it found.
         let mut governor_us: [u64; 3] = std::array::from_fn(|i| load(&GOVERNOR_US[i]));
         let (last_look, last_level) = (load(&LAST_LOOK_US), load(&LAST_LEVEL));
@@ -1557,8 +1866,7 @@ impl Snapshot {
             work_max: std::array::from_fn(|i| load(&WORK_MAX[i])),
             first_draw_us: Some(load(&FIRST_DRAW_US)).filter(|&t| t != u64::MAX),
             figures,
-            figures_steady,
-            steady_from_us: steady_from,
+            steady,
             lowest: std::array::from_fn(|i| load(&LOWEST[i])),
             governor_us,
             methods: METHODS.entries(),
@@ -1729,6 +2037,15 @@ impl Doc {
         }
     }
 
+    /// Numbers under keys that are our words, quoted.
+    fn keyed_floats<'a>(&mut self, entries: impl Iterator<Item = (&'a str, f64)>) {
+        for (key, value) in entries {
+            let key = self.quoted(key);
+            let value = if value.is_finite() { value } else { 0.0 };
+            self.line(format_args!("{key} = {value:.2}"));
+        }
+    }
+
     fn ints(&mut self, key: &'static str, values: &[u64]) {
         self.list(key, values.iter().map(u64::to_string));
     }
@@ -1759,7 +2076,15 @@ fn render(s: &Snapshot) -> String {
     };
     d.line(format_args!(""));
     d.int("format", FORMAT);
+    d.word("kind", Ours("run"));
+    host_sections(&mut d, s);
+    run_sections(&mut d, s);
+    d.out
+}
 
+/// `[rox_box]`, `[host]` and `[host.gpu]`: the build and the PC, which a run
+/// report and the self-test's share.
+fn host_sections(d: &mut Doc, s: &Snapshot) {
     d.table("rox_box");
     d.formatted("version", format_args!("{}", env!("CARGO_PKG_VERSION")));
     d.boolean("diagnostics", cfg!(feature = "diagnostics"));
@@ -1826,7 +2151,10 @@ fn render(s: &Snapshot) -> String {
         views => d.int("view_heap_views", views),
     }
     d.host = false;
+}
 
+/// Everything of a run report after the host.
+fn run_sections(d: &mut Doc, s: &Snapshot) {
     d.table("run");
     match s.console {
         Some(model) => d.word("console", model),
@@ -1847,7 +2175,7 @@ fn render(s: &Snapshot) -> String {
             d.comment(
                 "the run had not ended when this was written: it was killed, or ended in a way",
             );
-            d.comment("Rox-box does not see (ExitProcess, say), at most 30 seconds later");
+            d.comment("Rox-box does not see, at most 30 seconds later");
         }
         Some(end) => {
             d.word("ended", Ours(end.key()));
@@ -1954,12 +2282,14 @@ fn render(s: &Snapshot) -> String {
         d.float(avg, s.work_sum[i] as f64 / frames);
         d.int(most, s.work_max[i]);
     }
-    d.comment("the same at steady state (see [frame_time])");
-    let steady = &s.figures_steady;
-    d.float(
-        "left_out_avg_steady",
-        steady[Figure::LeftOut as usize] as f64 / steady[Figure::Intervals as usize].max(1) as f64,
-    );
+    if let Some(steady) = &s.steady {
+        d.comment("the same at steady state (see [frame_time])");
+        let steady = &steady.figures;
+        d.float(
+            "left_out_avg_steady",
+            steady[Figure::LeftOut as usize] as f64 / steady[Figure::Intervals as usize].max(1) as f64,
+        );
+    }
     d.int("submissions_total", s.stat(Stat::Submissions));
     d.table("gpu_work.left_out");
     d.comment("draws and dispatches not run on the host, whole run, by reason");
@@ -1971,20 +2301,31 @@ fn render(s: &Snapshot) -> String {
     d.comment("per frame, from the meters of the log's once-a-second frame line; ms, MB (10^6 bytes)");
     d.comment("whole run here; [frame_time.steady]: the steady state, the frames from the first");
     d.comment("10 s window at or after a third of the time from the first present to this report");
-    frame_time(&mut d, &s.figures);
+    d.comment("(a run with no whole window after that: the readings of the frame meter after it)");
+    frame_time(d, &s.figures);
     d.table("frame_time.steady");
-    match s.steady_from_us {
-        Some(from) => {
-            d.float("from_s", from as f64 / 1e6);
-            frame_time(&mut d, &s.figures_steady);
+    match (&s.steady, s.first_present_us) {
+        (Some(steady), _) => {
+            if steady.by_seconds {
+                d.comment("a short run: the frame meter's readings begun after its first third");
+            }
+            d.float("from_s", steady.from_us as f64 / 1e6);
+            frame_time(d, &steady.figures);
         }
-        None => d.comment("no present yet"),
+        (None, Some(_)) => {
+            d.comment("none: the run was too short, no frame meter reading began after the first");
+            d.comment("third of its time from the first present (the whole run is in [frame_time])");
+        }
+        (None, None) => d.comment("no present yet"),
     }
     d.table("frame_time.waits");
     d.comment("ms per frame the waiting for the card in settles took, by what settled, whole run");
-    settle_waits(&mut d, &s.figures);
+    settle_waits(d, &s.figures);
     d.table("frame_time.waits.steady");
-    settle_waits(&mut d, &s.figures_steady);
+    match &s.steady {
+        Some(steady) => settle_waits(d, &steady.figures),
+        None => d.comment("none (see [frame_time.steady])"),
+    }
 
     d.table("pipelines");
     d.int("created_by_title", s.stat(Stat::PipelinesCreated));
@@ -2085,7 +2426,9 @@ fn render(s: &Snapshot) -> String {
         f[Figure::RefreshAllUs as usize] as f64 / 1e3 / f[Figure::Frames as usize].max(1) as f64
     };
     d.float("refresh_ms", refresh(&s.figures));
-    d.float("refresh_ms_steady", refresh(&s.figures_steady));
+    if let Some(steady) = &s.steady {
+        d.float("refresh_ms_steady", refresh(&steady.figures));
+    }
 
     d.table("unimplemented");
     d.int("methods_called", s.methods.len() as u64);
@@ -2108,7 +2451,6 @@ fn render(s: &Snapshot) -> String {
         d.line(format_args!("name = {name}"));
         d.int("calls", calls);
     }
-    d.out
 }
 
 /// The frame line's figures `f` per frame of the frame meter.
@@ -2354,8 +2696,11 @@ mod tests {
             work_max: [14, 3_950, 1_210, 260],
             first_draw_us: Some(20_900_000),
             figures: whole,
-            figures_steady: steady,
-            steady_from_us: Some(steady_from_us(21_300_000, 62_400_000)),
+            steady: Some(Steady {
+                from_us: steady_from_us(21_300_000, 62_400_000),
+                figures: steady,
+                by_seconds: false,
+            }),
             lowest: [612 << 20, 2_100 << 20],
             governor_us: [41_000_000, 18_500_000, 2_900_000],
             methods: vec![
@@ -2551,7 +2896,10 @@ mod tests {
                 "yellow",
                 "red",
                 "<set>",
-            ]);
+                "run",
+                "selftest",
+            ])
+            .chain([StageOutcome::Ok, StageOutcome::Fail, StageOutcome::Skip].map(StageOutcome::key));
         for word in words {
             assert!(guarded(word, false), "{word}");
         }
@@ -2772,6 +3120,119 @@ mod tests {
         assert_eq!(none, [0; FIGS]);
     }
 
+    /// A run with a whole window after its first third keeps the windows'
+    /// rule; a shorter one takes the whole seconds after its first third;
+    /// one too short for any reading there has no steady state, and says so.
+    #[test]
+    fn a_short_run_has_a_steady_state_by_seconds_or_none() {
+        let frames = |n: u64| {
+            let mut f = [0u64; FIGS];
+            f[Figure::Frames as usize] = n;
+            f
+        };
+        // 30 s from a first present at 0: [10, 20) is a whole window.
+        let windows = vec![frames(10), frames(20), frames(30), frames(0)];
+        let seconds: Vec<[u64; FIGS]> = (1..=32).map(frames).collect();
+        let long = steady_state(0, 30_000_000, &windows, &seconds).unwrap();
+        assert_eq!((long.from_us, long.by_seconds), (10_000_000, false));
+        assert_eq!(long.figures[Figure::Frames as usize], 50);
+        // 6 s from a first present at 2 s: a third is 2 s; the readings taken
+        // in second 3 on (begun at 2 s and later) are kept.
+        let short = steady_state(2_000_000, 8_000_000, &windows, &seconds).unwrap();
+        assert_eq!((short.from_us, short.by_seconds), (4_000_000, true));
+        assert_eq!(short.figures[Figure::Frames as usize], (4..=32).sum::<u64>());
+        // 2.5 s: a third is under a second; the reading taken in second 2,
+        // which began at 1 s, is the first kept.
+        let mut few = vec![[0u64; FIGS]; SECONDS_KEPT];
+        few[0] = frames(30);
+        few[2] = frames(29);
+        let short = steady_state(0, 2_500_000, &windows, &few).unwrap();
+        assert_eq!((short.from_us, short.figures[Figure::Frames as usize]), (1_000_000, 29));
+        // Under a second, read once at its end: nothing after its first third.
+        few[2] = [0; FIGS];
+        assert_eq!(steady_state(0, 700_000, &windows, &few), None);
+        // About a second, read once in its second 1 (the reading began with
+        // the run): too short too, not a steady state as long as the run.
+        few[1] = frames(60);
+        assert_eq!(steady_state(0, 1_100_000, &windows, &few), None);
+        let text = render(&Snapshot { steady: None, ..synthetic() });
+        let parsed: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        let steady = parsed["frame_time"]["steady"].as_table().unwrap();
+        assert!(steady.is_empty(), "{text}");
+        assert!(text.contains("# none: the run was too short"), "{text}");
+        assert!(parsed["gpu_work"].get("left_out_avg_steady").is_none(), "{text}");
+        assert!(parsed["textures"].get("refresh_ms_steady").is_none(), "{text}");
+        let by_seconds = render(&Snapshot {
+            steady: Some(Steady { from_us: 1_000_000, figures: frames(29), by_seconds: true }),
+            ..synthetic()
+        });
+        let parsed: toml::Table = toml::from_str(&by_seconds).unwrap();
+        assert_eq!(parsed["frame_time"]["steady"]["frames"].as_integer(), Some(29));
+        assert!(by_seconds.contains("# a short run"), "{by_seconds}");
+    }
+
+    fn a_selftest() -> Selftest {
+        let stage = |name, outcome, reason| SelftestStage { name: Ours(name), outcome, reason };
+        Selftest {
+            software_adapter: true,
+            frames: 8,
+            bench: true,
+            ended: Ours("completed"),
+            stages: vec![
+                stage("Device", StageOutcome::Ok, None),
+                stage("Clear + present", StageOutcome::Ok, None),
+                stage("Translated shader", StageOutcome::Skip, Some(Ours("the adapter has no shader model 6.6"))),
+            ],
+            rates: vec![
+                SelftestRate { name: Ours("present_interval"), value: 1.25, unit: Ours("ms") },
+                SelftestRate { name: Ours("buffer_copy"), value: 2048.5, unit: Ours("MB per s") },
+            ],
+        }
+    }
+
+    /// The self-test's report: valid TOML, the host, the stages and the
+    /// rates as numbers; what is smuggled through our words is withheld.
+    #[test]
+    fn a_selftest_report_holds_its_stages_and_rates() {
+        let switches = vec![("VICTORY_D3D12_WARP".to_owned(), "1".to_owned())];
+        let text = render_selftest(&synthetic(), &a_selftest(), &switches);
+        let parsed: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        assert_eq!(parsed["kind"].as_str(), Some("selftest"));
+        assert_eq!(parsed["format"].as_integer(), Some(i64::from(FORMAT)));
+        assert_eq!(parsed["host"]["gpu"]["adapter"].as_str(), Some("Some Adapter XT/XTX"));
+        assert!(parsed.get("run").is_none() && parsed.get("frames").is_none(), "{text}");
+        let test = &parsed["selftest"];
+        assert_eq!(test["ended"].as_str(), Some("completed"));
+        assert_eq!(test["passed"].as_bool(), Some(true));
+        assert_eq!((test["stages_ok"].as_integer(), test["stages_skipped"].as_integer()), (Some(2), Some(1)));
+        assert_eq!(test["rates"]["buffer_copy"].as_float(), Some(2048.5));
+        assert_eq!(test["rate_units"]["buffer_copy"].as_str(), Some("MB per s"));
+        assert_eq!(test["switches"]["VICTORY_D3D12_WARP"].as_str(), Some("1"));
+        let stages = test["stage"].as_array().unwrap();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[2]["outcome"].as_str(), Some("skip"));
+        assert_eq!(stages[2]["reason"].as_str(), Some("the adapter has no shader model 6.6"));
+        assert!(stages[0].get("reason").is_none());
+        assert!(text.starts_with("# Rox-box self-test report\n#\n"), "{text}");
+        assert!(!text.contains(WITHHELD), "{text}");
+        assert_eq!(
+            summary(&text).as_deref(),
+            Some("self-test on the software adapter, completed: 2 ok, 0 failed, 1 skipped")
+        );
+        // A caller that leaked a runtime string into our words.
+        for bad in smuggled() {
+            let word = Ours(leak(bad));
+            let mut test = a_selftest();
+            test.stages[0].reason = Some(word);
+            test.stages[1].name = word;
+            test.rates[0].name = word;
+            test.rates[1].unit = word;
+            let text = render_selftest(&synthetic(), &test, &switches);
+            must_not_appear(&text);
+            toml::from_str::<toml::Table>(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        }
+    }
+
     /// The frame line's figures go to the window of now, and the governor's
     /// looks give their time to the level found before.
     #[test]
@@ -2800,15 +3261,22 @@ mod tests {
         assert_eq!(utc_stamp(951_782_400), "20000229-000000");
         assert_eq!(utc_stamp(1_798_761_599), "20261231-235959");
         assert_eq!(
-            report_order("run-20261127-101010.txt"),
+            report_order("run-20261127-101010.txt", Kind::Run),
             Some(("20261127-101010".into(), 1))
         );
         assert_eq!(
-            report_order("run-20261127-101010-3.txt"),
+            report_order("run-20261127-101010-3.txt", Kind::Run),
             Some(("20261127-101010".into(), 3))
         );
-        assert_eq!(report_order("run-2026.txt"), None);
-        assert_eq!(report_order("notes.txt"), None);
+        assert_eq!(
+            report_order("selftest-20261127-101010.txt", Kind::Selftest),
+            Some(("20261127-101010".into(), 1))
+        );
+        assert_eq!(report_order("selftest-20261127-101010.txt", Kind::Run), None);
+        assert_eq!(Kind::of_file("selftest-20261127-101010-2.txt"), Some(Kind::Selftest));
+        assert_eq!(Kind::of_file("run-20261127-101010.txt"), Some(Kind::Run));
+        assert_eq!(report_order("run-2026.txt", Kind::Run), None);
+        assert_eq!(Kind::of_file("notes.txt"), None);
         let dir = std::env::temp_dir().join(format!("victory-report-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in [
@@ -2817,6 +3285,8 @@ mod tests {
             "run-20260102-000000-2.txt",
             "run-20260103-000000.txt",
             "run-20260103-000000.txt.part",
+            "selftest-20260102-120000.txt",
+            "selftest-20260101-120000.txt",
             "notes.txt",
         ] {
             std::fs::write(dir.join(name), "").unwrap();
@@ -2831,15 +3301,19 @@ mod tests {
             names(&dir),
             [
                 "run-20260103-000000.txt",
+                "selftest-20260102-120000.txt",
                 "run-20260102-000000-2.txt",
                 "run-20260102-000000.txt",
+                "selftest-20260101-120000.txt",
                 "run-20260101-000000.txt"
             ]
         );
-        prune(&dir, 2);
+        // Each kind keeps its own newest.
+        prune(&dir, Kind::Run, 2);
+        prune(&dir, Kind::Selftest, 1);
         assert_eq!(
             names(&dir),
-            ["run-20260103-000000.txt", "run-20260102-000000-2.txt"]
+            ["run-20260103-000000.txt", "selftest-20260102-120000.txt", "run-20260102-000000-2.txt"]
         );
         assert!(
             dir.join("notes.txt").exists() && !dir.join("run-20260103-000000.txt.part").exists()

@@ -456,7 +456,8 @@ fn user_items(cfg: &Config, exe: Option<&Path>) -> Vec<Item> {
             "Config file",
             "no victory.toml found",
             format!(
-                "copy victory.example.toml to {} and set game_dir in it",
+                "double-click play.cmd (or run play.cmd -Setup), which sets it up; or copy \
+                 victory.example.toml to {} and set game_dir in it",
                 Config::suggested_location().display()
             ),
         ),

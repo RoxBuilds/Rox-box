@@ -4,8 +4,8 @@
 //! the software adapter, with temporary folders and no config file, the
 //! way a player's run goes. The self-test covers the frame path in one
 //! process of ours; this covers what it cannot: the loader, import binding,
-//! the title's own thread and C runtime, its exit, and the run report, which
-//! is the oracle here.
+//! the title's own thread, C runtime and command line, its exit, and the run
+//! report, which is the oracle here.
 //!
 //! The binary runs in a process of its own (the host device is one per
 //! process). Like `selftest.rs`, the test is skipped where there is no
@@ -13,11 +13,13 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// Frames the demo title is asked for: a second or so at its 60 a second.
 const FRAMES: u32 = 40;
+/// Frames of the runs that check how the title ends.
+const FEW: u32 = 10;
 /// The longest the run may take (it takes a few seconds; a hang fails).
 const PATIENCE: Duration = Duration::from_secs(120);
 
@@ -41,20 +43,88 @@ fn build_demo() -> PathBuf {
 
 /// A fresh folder under the system's temporary folder, outside any source
 /// tree (the runtime refuses to write below a `.victory-root` marker).
-fn scratch() -> PathBuf {
+fn scratch(what: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let dir =
-        std::env::temp_dir().join(format!("rox-box-demo-title-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rox-box-demo-title-{what}-{}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-#[test]
-fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
+/// One run of the demo title, done.
+struct Ran {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    /// The run report's text and its table.
+    text: String,
+    report: toml::Table,
+    root: PathBuf,
+    cache: PathBuf,
+}
+
+impl Ran {
+    /// The last lines of stdout and stderr, for a failure's message.
+    fn tail(&self) -> String {
+        let tail = |text: &str| {
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(40)..].join("\n")
+        };
+        format!("{}\n{}", tail(&self.stdout), tail(&self.stderr))
+    }
+
+    fn int(&self, section: &str, key: &str) -> i64 {
+        self.value(section, key)
+            .and_then(toml::Value::as_integer)
+            .unwrap_or_else(|| panic!("no [{section}] {key}:\n{}", self.text))
+    }
+
+    fn float(&self, section: &str, key: &str) -> f64 {
+        self.value(section, key)
+            .and_then(toml::Value::as_float)
+            .unwrap_or_else(|| panic!("no [{section}] {key}:\n{}", self.text))
+    }
+
+    fn value(&self, section: &str, key: &str) -> Option<&toml::Value> {
+        let mut value = self.report.get(section.split('.').next().unwrap())?;
+        for part in section.split('.').skip(1) {
+            value = value.get(part)?;
+        }
+        value.get(key)
+    }
+
+    /// The demo's line after its frames: they all matched.
+    fn finished(&self, frames: u32) {
+        let done = format!(
+            "demo title: {frames} frames rendered and presented; every value it read back from its own memory matched"
+        );
+        assert!(
+            self.stdout.lines().any(|l| l == done),
+            "no line {done:?}:\n{}",
+            self.tail()
+        );
+    }
+
+    /// The report says the title exited with `code`, and the process ended
+    /// with it.
+    fn exited_with(&self, code: i32) {
+        assert_eq!(self.status.code(), Some(code), "{:?}:\n{}", self.status, self.tail());
+        assert_eq!(self.report["run"]["ended"].as_str(), Some("title_exited"), "{}", self.text);
+        assert_eq!(self.int("run", "exit_code"), i64::from(code), "{}", self.text);
+        assert_eq!(self.int("run", "rox_box_panics"), 0, "{}", self.text);
+    }
+}
+
+/// Runs `victory run <demo> --execute -- <args>` on the software adapter
+/// with temporary folders, no config file and no other `VICTORY_*` variable;
+/// `None` where there is no Direct3D 12 device at all.
+fn run_demo(what: &str, args: &[&str]) -> Option<Ran> {
     let demo = build_demo();
-    let root = scratch();
+    let root = scratch(what);
     let (game, cache, data) = (root.join("game"), root.join("cache"), root.join("data"));
     for dir in [&game, &cache, &data] {
         std::fs::create_dir_all(dir).unwrap();
@@ -65,9 +135,7 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
     std::fs::copy(&demo, &exe).unwrap();
 
     let mut run = Command::new(env!("CARGO_BIN_EXE_victory"));
-    run.args(["run"])
-        .arg(&exe)
-        .args(["--execute", "--", "--frames", &FRAMES.to_string()]);
+    run.args(["run"]).arg(&exe).args(["--execute", "--"]).args(args);
     // Nothing of a developer's shell or configuration: no switches, and no
     // `victory.toml` in the current folder.
     for (key, _) in std::env::vars_os() {
@@ -107,83 +175,62 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
     if status.code() == Some(3) {
         eprintln!("no Direct3D 12 device here; skipped\n{stdout}{stderr}");
         let _ = std::fs::remove_dir_all(&root);
-        return;
+        return None;
     }
-    let tail = |text: &str| {
-        text.lines()
-            .rev()
-            .take(40)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(
-        status.success(),
-        "the run failed ({status:?}):\n{}\n{}",
-        tail(&stdout),
-        tail(&stderr)
-    );
-    let done = format!(
-        "demo title: {FRAMES} frames rendered and presented; every value it read back from its own memory matched"
-    );
-    assert!(
-        stdout.lines().any(|l| l == done),
-        "no line {done:?}:\n{}",
-        tail(&stdout)
-    );
-
     // The run report: the one file of the run, TOML.
     let reports: Vec<PathBuf> = std::fs::read_dir(data.join("reports"))
-        .expect("the run wrote a reports folder")
+        .unwrap_or_else(|e| panic!("the run wrote no reports folder ({e}):\n{stdout}\n{stderr}"))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "txt"))
         .collect();
-    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports.len(), 1, "{reports:?}\n{stdout}\n{stderr}");
     let text = std::fs::read_to_string(&reports[0]).unwrap();
     let report: toml::Table =
         toml::from_str(&text).unwrap_or_else(|e| panic!("the report is not TOML: {e}\n{text}"));
-    let int = |section: &str, key: &str| -> i64 {
-        let mut value = &report[section.split('.').next().unwrap()];
-        for part in section.split('.').skip(1) {
-            value = &value[part];
-        }
-        value
-            .get(key)
-            .and_then(toml::Value::as_integer)
-            .unwrap_or_else(|| panic!("no [{section}] {key}:\n{text}"))
+    Some(Ran { status, stdout, stderr, text, report, root, cache })
+}
+
+#[test]
+fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
+    let Some(ran) = run_demo("frames", &["--frames", &FRAMES.to_string()]) else {
+        return;
     };
-    let float = |section: &str, key: &str| -> f64 {
-        report[section]
-            .get(key)
-            .and_then(toml::Value::as_float)
-            .unwrap_or_else(|| panic!("no [{section}] {key}:\n{text}"))
-    };
-    let run = &report["run"];
-    assert_eq!(run["ended"].as_str(), Some("title_exited"), "{text}");
-    assert_eq!(int("run", "exit_code"), 0, "{text}");
-    assert_eq!(int("run", "rox_box_panics"), 0, "{text}");
+    assert!(ran.status.success(), "the run failed ({:?}):\n{}", ran.status, ran.tail());
+    ran.finished(FRAMES);
+    ran.exited_with(0);
+    let text = &ran.text;
+    assert_eq!(ran.report["kind"].as_str(), Some("run"), "{text}");
     assert_eq!(
-        report["host"]["gpu"]["software_adapter"].as_bool(),
+        ran.report["host"]["gpu"]["software_adapter"].as_bool(),
         Some(true),
         "{text}"
     );
-    assert_eq!(int("frames", "presents"), i64::from(FRAMES), "{text}");
-    // Each frame is one submission with one dispatch and two draws, all run
-    // on the host (the first present's loading is left out of these).
-    assert_eq!(float("gpu_work", "submissions_avg"), 1.0, "{text}");
-    assert_eq!(float("gpu_work", "draws_avg"), 2.0, "{text}");
-    assert_eq!(int("gpu_work", "draws_max"), 2, "{text}");
-    assert_eq!(float("gpu_work", "dispatches_avg"), 1.0, "{text}");
-    assert_eq!(int("gpu_work", "dispatches_max"), 1, "{text}");
-    assert_eq!(int("gpu_work", "left_out_max"), 0, "{text}");
-    assert_eq!(
-        int("gpu_work", "submissions_total"),
-        i64::from(FRAMES),
+    assert_eq!(ran.int("frames", "presents"), i64::from(FRAMES), "{text}");
+    // The frame meter's figures cover every present, its last part of a
+    // second (here all of the run) included; the meter may leave out the
+    // first, which only starts it.
+    let metered = ran.int("frame_time", "frames");
+    assert!(
+        (i64::from(FRAMES) - 1..=i64::from(FRAMES)).contains(&metered),
+        "[frame_time] frames {metered} for {FRAMES} presents:\n{text}"
+    );
+    assert!(ran.float("frame_time", "frame_ms") > 0.0, "{text}");
+    // A run this short has no steady state: no figures, rather than zeros.
+    let steady = ran.report["frame_time"]["steady"].as_table().expect("[frame_time.steady]");
+    assert!(
+        steady.get("frames").is_none_or(|n| n.as_integer().is_some_and(|n| n > 0)),
         "{text}"
     );
-    for (reason, n) in report["gpu_work"]["left_out"]
+    // Each frame is one submission with one dispatch and two draws, all run
+    // on the host (the first present's loading is left out of these).
+    assert_eq!(ran.float("gpu_work", "submissions_avg"), 1.0, "{text}");
+    assert_eq!(ran.float("gpu_work", "draws_avg"), 2.0, "{text}");
+    assert_eq!(ran.int("gpu_work", "draws_max"), 2, "{text}");
+    assert_eq!(ran.float("gpu_work", "dispatches_avg"), 1.0, "{text}");
+    assert_eq!(ran.int("gpu_work", "dispatches_max"), 1, "{text}");
+    assert_eq!(ran.int("gpu_work", "left_out_max"), 0, "{text}");
+    assert_eq!(ran.int("gpu_work", "submissions_total"), i64::from(FRAMES), "{text}");
+    for (reason, n) in ran.report["gpu_work"]["left_out"]
         .as_table()
         .expect("[gpu_work.left_out]")
     {
@@ -191,15 +238,15 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
     }
     // The compute program and the vertex and pixel programs, translated
     // into an empty cache; two pipelines, both made on the host.
-    assert_eq!(int("shaders", "translated_now"), 3, "{text}");
-    assert_eq!(int("shaders", "failed"), 0, "{text}");
-    assert_eq!(int("pipelines", "created_by_title"), 2, "{text}");
+    assert_eq!(ran.int("shaders", "translated_now"), 3, "{text}");
+    assert_eq!(ran.int("shaders", "failed"), 0, "{text}");
+    assert_eq!(ran.int("pipelines", "created_by_title"), 2, "{text}");
     assert_eq!(
-        int("pipelines", "host_made_now") + int("pipelines", "host_from_library"),
+        ran.int("pipelines", "host_made_now") + ran.int("pipelines", "host_from_library"),
         2,
         "{text}"
     );
-    assert_eq!(int("pipelines", "host_failed"), 0, "{text}");
+    assert_eq!(ran.int("pipelines", "host_failed"), 0, "{text}");
     for key in [
         "methods_called",
         "methods_lost",
@@ -208,18 +255,52 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
         "imports_other",
         "imports_other_calls",
     ] {
-        assert_eq!(int("unimplemented", key), 0, "{key}:\n{text}");
+        assert_eq!(ran.int("unimplemented", key), 0, "{key}:\n{text}");
     }
     assert!(
-        report["unimplemented"].get("method").is_none()
-            && report["unimplemented"].get("import").is_none(),
+        ran.report["unimplemented"].get("method").is_none()
+            && ran.report["unimplemented"].get("import").is_none(),
         "{text}"
     );
     // Everything the run wrote is in the temporary folders.
     assert!(
-        cache.join("images").is_dir() && cache.join("shaders").is_dir(),
+        ran.cache.join("images").is_dir() && ran.cache.join("shaders").is_dir(),
         "{}",
-        cache.display()
+        ran.cache.display()
     );
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&ran.root);
+}
+
+/// `ExitProcess` called by the title: the end is recorded with its code,
+/// and `victory run` ends with it.
+#[test]
+fn a_title_that_calls_exit_process_is_reported_with_its_code() {
+    let Some(ran) = run_demo("exit-process", &["--frames", &FEW.to_string(), "--exit-process", "5"]) else {
+        return;
+    };
+    ran.finished(FEW);
+    ran.exited_with(5);
+    let _ = std::fs::remove_dir_all(&ran.root);
+}
+
+/// A code returned from `main` (which its C runtime passes to `exit`).
+#[test]
+fn a_title_that_returns_a_code_ends_the_run_with_it() {
+    let Some(ran) = run_demo("return", &["--frames", &FEW.to_string(), "--return", "7"]) else {
+        return;
+    };
+    ran.finished(FEW);
+    ran.exited_with(7);
+    let _ = std::fs::remove_dir_all(&ran.root);
+}
+
+/// The C runtime's `exit` called by the title with a code of its own.
+#[test]
+fn a_title_that_calls_exit_ends_the_run_with_its_code() {
+    let Some(ran) = run_demo("exit", &["--frames", &FEW.to_string(), "--exit", "9"]) else {
+        return;
+    };
+    ran.finished(FEW);
+    ran.exited_with(9);
+    let _ = std::fs::remove_dir_all(&ran.root);
 }

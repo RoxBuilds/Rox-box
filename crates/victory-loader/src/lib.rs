@@ -60,7 +60,7 @@ pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;
 #[cfg(windows)]
-pub use threads::{disable_thread_calls, exiting_with};
+pub use threads::{disable_thread_calls, exit_process, exiting_with};
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]

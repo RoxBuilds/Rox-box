@@ -93,6 +93,28 @@ pub struct Stage {
     pub outcome: Outcome,
 }
 
+/// Why a stage was skipped, in fixed words: the texts are built from these.
+const NEEDS_DEVICE: &str = "needs the device stage";
+const NEEDS_PRESENT: &str = "needs clear + present";
+const NO_SHADER_MODEL: &str = "the adapter has shader model";
+
+impl Stage {
+    /// Our fixed wording of why the stage was skipped, for the self-test's
+    /// report, which holds no text built at run time (the outcome's own text
+    /// holds the adapter's figures); `None` for a stage that ran.
+    pub fn skip_reason(&self) -> Option<&'static str> {
+        let Outcome::Skip(why) = &self.outcome else {
+            return None;
+        };
+        Some(match why.as_str() {
+            NEEDS_DEVICE => NEEDS_DEVICE,
+            NEEDS_PRESENT => NEEDS_PRESENT,
+            why if why.starts_with(NO_SHADER_MODEL) => "the adapter has no shader model 6.6",
+            _ => "skipped",
+        })
+    }
+}
+
 /// A measured rate: `name value unit`.
 #[derive(Clone, Debug)]
 pub struct Rate {
@@ -153,7 +175,7 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
             report.no_device = no_device;
             tell(&mut report, STAGES[0], Outcome::Fail(reason));
             for name in &STAGES[1..] {
-                tell(&mut report, name, Outcome::Skip("needs the device stage".into()));
+                tell(&mut report, name, Outcome::Skip(NEEDS_DEVICE.into()));
             }
             Watchdog::disarm();
             return report;
@@ -169,7 +191,7 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
     let outcome = if presented {
         unified_memory(&title).into_outcome()
     } else {
-        Outcome::Skip("needs clear + present".into())
+        Outcome::Skip(NEEDS_PRESENT.into())
     };
     tell(&mut report, STAGES[2], outcome);
 
@@ -181,7 +203,7 @@ pub fn run(imports: &Imports, options: &Options, said: &mut dyn FnMut(&Stage), h
     let outcome = if presented {
         translated_draw(&title, &mut bench)
     } else {
-        Outcome::Skip("needs clear + present".into())
+        Outcome::Skip(NEEDS_PRESENT.into())
     };
     tell(&mut report, STAGES[4], outcome);
 
@@ -429,7 +451,7 @@ fn no_translated_shaders() -> Option<String> {
     };
     (asked.is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0).then(|| {
         format!(
-            "the adapter has shader model {}.{}; translated shaders need 6.6",
+            "{NO_SHADER_MODEL} {}.{}; translated shaders need 6.6",
             model.HighestShaderModel.0 >> 4,
             model.HighestShaderModel.0 & 15
         )

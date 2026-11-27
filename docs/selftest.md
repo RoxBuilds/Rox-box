@@ -9,9 +9,10 @@ victory selftest --frames 8 # fewer frames in stage 2 (default 120)
 
 `victory selftest` runs the layer's real frame path end to end with a
 stand-in "title" made entirely of our own code. It needs no config file, no
-game folder and no title files, and it writes nothing of ours: no cache, no
-log file, no crash report (the graphics driver may keep its own shader cache,
-as it does for any program). A small window (64x64) opens for a moment.
+game folder and no title files, and it writes one file of ours: its
+[report](#its-report). No cache, no log file, no crash report (the graphics
+driver may keep its own shader cache, as it does for any program). A small
+window (64x64) opens for a moment.
 
 The stand-in calls only what a title's calls arrive at. Its device comes from
 the `d3d12_xs.dll!D3D12XboxCreateDevice` export, looked up in the runtime's
@@ -54,6 +55,24 @@ Exit codes: `0` every stage passed (skips allowed); `1` a stage failed; `2` a
 wrong command line; `3` there is no Direct3D 12 device at all; `4` a step got
 no answer from the GPU for 60 s (a hang); `5` the host GPU failed (device
 removed), which ends the run at once as it would end a title's.
+
+## Its report
+
+When it ends (however: passed, failed, no device, hung, GPU failed) the
+self-test writes a report through the run report's renderer and privacy
+guard, to `<data_dir>\reports\selftest-<UTC time>.txt`: with no config file
+the default data folder (`%LOCALAPPDATA%\victory\data`), as for a run;
+`VICTORY_DATA_DIR` or the config file's `data_dir` elsewhere. The line naming
+it goes to stderr, never stdout, because the path names your folders.
+`victory report` shows the newest report, which is then this one, and
+`victory report --diff` compares the two newest self-tests. It holds the
+PC's facts a run report holds (Windows, processor, memory, the graphics
+adapter and driver), each stage's name and outcome (`ok`, `fail`, `skip`)
+with our fixed reason for a skip, and the benchmark's rates as numbers: none
+of the text the stages print, which is built at run time. Like a run report
+it may be attached to an issue as it is
+([run-report.md](run-report.md#the-self-tests-report) lists its keys).
+`VICTORY_REPORT=0` writes none.
 
 ## What each stage proves
 
@@ -146,7 +165,7 @@ removed), which ends the run at once as it would end a title's.
 - Mesh, indirect, ray-tracing, tiled resources, depth, MSAA, formats other
   than RGBA8, more than one queue, waits between queues, the pipeline library
   and the shader cache on disk (the self-test uses neither, so it writes
-  nothing).
+  nothing but its report).
 - Memory pressure: everything is small. A card that passes may still run out
   of memory with a title.
 - Performance with a title: the benchmark measures the layer's own paths on
@@ -176,7 +195,9 @@ left out.
 
 `apps/victory/tests/selftest.rs` runs the built binary with
 `selftest --warp --frames 8 --bench` on every `cargo test --workspace` and in
-CI, in a process of its own (the host device is one per process). Like the
+CI, in a process of its own (the host device is one per process), with a
+temporary data folder and no config file, and checks that the report
+appears there, parses as TOML and holds every stage and the rates. Like the
 crate's GPU tests it is skipped where there is no Direct3D 12 device at all
 (exit code 3); a stage that is skipped (no shader model 6.6) does not fail it.
 `victory_shader::native::synth`'s own tests check that its containers and

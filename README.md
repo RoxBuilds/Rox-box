@@ -144,8 +144,9 @@ the graphics driver; if it still fails, run `victory.exe selftest --warp`, the
 same test on Windows' software adapter. Passing there means the driver or the
 card is at fault; failing there means Rox-box is, and the `FAIL` line is what
 to report. `victory.exe selftest --bench` adds a few speed figures that can be
-compared between PCs. [docs/selftest.md](docs/selftest.md) explains every
-line.
+compared between PCs. It leaves a report of the result beside the run
+reports, safe to attach to an issue as it is (`victory.exe report` shows
+it). [docs/selftest.md](docs/selftest.md) explains every line.
 
 ### The first run: shader translation and warm-up
 

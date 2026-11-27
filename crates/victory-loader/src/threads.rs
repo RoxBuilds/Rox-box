@@ -54,10 +54,14 @@ pub(crate) fn attached(base: usize) {
     }
     static AT_EXIT: std::sync::Once = std::sync::Once::new();
     // Registered before the title's own exit functions, so it runs after
-    // them, as `ExitProcess` follows `exit`'s functions on Windows.
-    // SAFETY: registers a function with the host CRT's exit table.
+    // them, as `ExitProcess` follows `exit`'s functions on Windows. The
+    // same for `quick_exit`, which runs the functions `at_quick_exit` gave
+    // it and then ends the process from inside the C runtime: without
+    // this the title images were never detached on that way out.
+    // SAFETY: registers a function with the host CRT's exit tables.
     AT_EXIT.call_once(|| unsafe {
         atexit(detach_all);
+        at_quick_exit(detach_all);
     });
 }
 
@@ -69,7 +73,14 @@ pub(crate) fn detached(base: usize) {
 
 unsafe extern "C" {
     fn atexit(f: extern "C" fn()) -> i32;
+    fn at_quick_exit(f: extern "C" fn()) -> i32;
 }
+
+/// Set by the first [`detach_all`]: the process ends once. (The title's
+/// `ExitProcess` comes here directly, and with `VICTORY_EXIT_DETACH_HOST=1`
+/// the host then ends the process, which must not start the detaching
+/// again.)
+static DETACHING: AtomicBool = AtomicBool::new(false);
 
 /// Set once the process is ending: no more thread notices.
 static EXITING: AtomicBool = AtomicBool::new(false);
@@ -86,6 +97,9 @@ const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 /// (the host's DLLs are not detached, see the end), or, for an exit the
 /// title did not ask for, the CRT ends it.
 extern "C" fn detach_all() {
+    if DETACHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)
@@ -169,6 +183,21 @@ const NO_EXIT_CODE: i64 = i64::MIN;
 /// ask for (none recorded) goes back to the C runtime as before.
 pub fn exiting_with(code: i32) {
     EXIT_CODE.store(i64::from(code), Ordering::SeqCst);
+}
+
+/// The title ends its process with `code` without the C runtime's exit
+/// functions (`ExitProcess`, `_exit`), or its entry point returned `code`:
+/// the way out `exit` takes once those functions have run. The other
+/// threads end, the title images detach, and the process ends with `code`
+/// (`detach_all`). Called directly, the host's `ExitProcess` would end the
+/// process with no title image detached: the Windows loader knows them as
+/// DLLs without an entry point. With `VICTORY_EXIT_DETACH_HOST=1` the host's
+/// `ExitProcess` ends it after the detaching, as `exit` then does.
+pub fn exit_process(code: i32) -> ! {
+    exiting_with(code);
+    detach_all();
+    // SAFETY: ends this process, whose title images have detached.
+    unsafe { windows_sys::Win32::System::Threading::ExitProcess(code as u32) }
 }
 
 /// Ends this process with `code`: when the title images do not detach in

@@ -54,6 +54,23 @@ then Rox-box's line naming the run report, and exit code 0. A mismatch ends it
 with `demo title failed: <what, where>` and exit code 1; a wrong argument with
 exit code 2.
 
+After its frames it can end as a title may, each with a code of 0 to 255
+that the report's `exit_code` and `victory run`'s own exit code then say:
+`--return <code>` returns it from `main` (its C runtime then calls `exit`),
+`--exit <code>` calls the C runtime's `exit`, and `--exit-process <code>`
+calls `ExitProcess`, which skips the C runtime's exit functions.
+
+Before anything else it reads its arguments two ways, from its C runtime
+(`__p___argc`, `__p___argv`) and from the process's command line
+(`GetCommandLineW`, which Rust's `std::env::args` parses), and checks that
+`GetCommandLineA` says the same line as `GetCommandLineW` and that the
+program's name is its own file name with no folder: it stops with
+`demo title failed: ...` (exit code 1) if not. Under Rox-box all of them are
+`demo-title.exe` followed by the arguments after `--`
+(`victory-hle/src/modules/kernel.rs`, `CommandLine`;
+`VICTORY_TITLE_COMMAND_LINE=0` gives the host's line again, which the demo
+then refuses).
+
 The report (`victory report`) should say `ended = "title_exited"`,
 `exit_code = 0`, `presents` equal to the frames asked for, per frame one
 submission, one dispatch and two draws (`[gpu_work]`), nothing in
@@ -73,8 +90,9 @@ title before and while it renders (`tests/fixtures/demo-title/src/main.rs`):
   runtime's and Rust's standard library's (`kernel32`, `ntdll`,
   `vcruntime140`, the `api-ms-win-crt-*` and `api-ms-win-core-synch` sets),
   passed to the host by the default `HostPolicy` but for the few whose
-  console meaning differs, which are ours (`kernel.rs`): the C runtime's
-  argument list and its `exit` and `terminate`, module lookups
+  console meaning differs, which are ours (`kernel.rs`): the command line
+  (`GetCommandLineW` and `A`) and the C runtime's argument list, its
+  `exit` and `terminate`, `ExitProcess`, module lookups
   (`GetModuleHandleW`, `GetProcAddress`, `LoadLibraryA`) and the
   unhandled-exception filter. `victory run` prints how many are ours and
   how many the host's (`bound` line); none may be missing;
@@ -87,11 +105,11 @@ title before and while it renders (`tests/fixtures/demo-title/src/main.rs`):
   counts frames, and the time a draw may wait for its pipeline to be made
   is a budget per such frame (`pipeline/make.rs`): a title that never waits
   for a frame spends one budget for its whole run;
-- take its arguments from its C runtime: Rust's `std::env::args` reads the
-  process's command line, which is Rox-box's;
-- end by returning from `main`, so that its C runtime calls `exit` and the
-  run report says how it ended (a direct `ExitProcess` would leave only the
-  last periodic report).
+- end by returning from `main`, calling `exit` or calling `ExitProcess`:
+  each is bound to ours, which records the end with its code before the
+  title images detach and the process ends with that code
+  (`VICTORY_TITLE_EXITS=0`: the host's `ExitProcess` and `_exit` again,
+  which leave only the last periodic report).
 
 ## What it proves beyond the self-test
 
@@ -104,7 +122,8 @@ adds everything a real run does around it:
   thread-locals in an executable, `victory-loader/src/tls.rs`);
 - import binding through `HleResolver`, with the default host policy;
 - `spawn_main`: the title's thread, its C runtime's start-up and arguments,
-  its `exit` (through ours), the loader's end of the process and its exit
+  its command line read both ways, its `exit` and `ExitProcess` (through
+  ours), the loader's end of the process and its exit
   code (the first runs on a graphics card found the host's DLLs crashing in
   their process-detach after the loader had ended the other threads; the
   process now ends once the title images have detached,
@@ -140,8 +159,12 @@ folder, copies it into a temporary game folder and runs `victory run
 <demo-title.exe> --execute -- --frames 40` on the software adapter in a process
 of its own, with temporary folders, no config file and no other `VICTORY_*`
 variable. It asserts exit code 0, the demo's last line and the run report
-(the values above). Like the self-test's, it is skipped where there is no
-Direct3D 12 device at all: `victory run --execute` then exits with code 3.
+(the values above, and `[frame_time]` `frames` equal to the presents, the
+first one allowed for). Three more runs of 10 frames end through
+`--exit-process 5`, `--return 7` and `--exit 9`: each must end `victory run`
+with that code and leave a report that says `title_exited` with it. Like
+the self-test's, they are skipped where there is no Direct3D 12 device at
+all: `victory run --execute` then exits with code 3.
 
 ## Adding to its scene
 

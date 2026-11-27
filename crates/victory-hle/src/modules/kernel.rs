@@ -289,6 +289,57 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     }
 }
 
+/// Whether the title's own ways of ending its process without the C
+/// runtime's `exit` are ours (`ExitProcess`, `_exit`, `_Exit`, `quick_exit`,
+/// an entry point that returns). On by default; `VICTORY_TITLE_EXITS=0`: the
+/// host's, as before (and an entry point that returns ends `victory run`
+/// with code 0). Ours record the end with the title's code, then leave as
+/// [`exit`] does: the title images detached, the process ended with that
+/// code (`victory_loader::exit_process`). The host's ended the process with
+/// nothing recorded (the run report stayed the last periodic one,
+/// `killed_or_unknown`) and no title image detached; a title's own exit is
+/// always an exit on the platform's terms.
+pub fn title_exits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_EXITS").is_none_or(|v| v != "0"))
+}
+
+/// `ExitProcess` called by the title: see [`title_exits`].
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title ends the process");
+    ends_itself(code as i32)
+}
+
+/// The CRT's `_exit` (no exit functions run): see [`title_exits`].
+pub extern "C" fn _exit(code: i32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title exits without its exit functions");
+    ends_itself(code)
+}
+
+/// See [`_exit`], of which it is the C99 name.
+pub extern "C" fn _Exit(code: i32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title exits without its exit functions");
+    ends_itself(code)
+}
+
+/// The CRT's `quick_exit`: the functions `at_quick_exit` registered run,
+/// then the process ends. The host's runs them; the loader's detaching is
+/// registered with it before the title's, so it comes last, as for `exit`.
+pub extern "C" fn quick_exit(code: i32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title quick-exits");
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleExited(code));
+    #[cfg(windows)]
+    victory_loader::exiting_with(code);
+    host::quick_exit(code)
+}
+
+/// The end is recorded, then the process ends with `code` once the title
+/// images have detached.
+fn ends_itself(code: i32) -> ! {
+    let _ = victory_loader::report::finish(victory_loader::report::End::TitleExited(code));
+    host::exit_process(code)
+}
+
 /// See [`exit`]; only the current process is logged.
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
@@ -364,55 +415,254 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
-/// The title's argument list: the program, then what was given after `--`.
-/// The host's own would be ours (`victory run <exe> ...`), and the title
-/// looks at fixed places in it (`-skipToIIS` only as the first argument).
-struct TitleArgv {
-    count: std::cell::UnsafeCell<i32>,
-    list: std::cell::UnsafeCell<*mut *mut c_char>,
+/// The title's command line, every way a title reads it: `GetCommandLineW`
+/// and `GetCommandLineA`, the C runtime's argument lists (`__p___argc`,
+/// `__p___argv`, `__p___wargv`), its copies of the line (`__p__acmdln`,
+/// `__p__wcmdln`) and what `WinMain` gets (`_get_narrow_winmain_command_line`,
+/// `_get_wide_winmain_command_line`). All say the same: the title's image
+/// name, then the arguments given after `--`, quoted as the C runtime parses
+/// them back.
+///
+/// The host's own would be ours (`victory.exe run <exe> --execute ... --
+/// <its arguments>`), and a title looks at fixed places in it (`-skipToIIS`
+/// only as the first argument). The C runtime's lists were already the
+/// title's while `GetCommandLine` passed to the host, so a title that reads
+/// both (Rust's `std::env::args` reads `GetCommandLineW`) saw two different
+/// command lines.
+///
+/// The program is the image's file name alone, as the title's manifest names
+/// its executable (`<Executable Name=...>`), not the path the player keeps the
+/// files at: a console starts a title from its package, which has no folders
+/// of a PC above it, and a title must not learn the player's folder names
+/// from its command line (it may write it to its logs or crash reports).
+/// shortcut: whether the console puts the package's drive before the name is
+/// not known; a bare name is what every parser of the program's name takes.
+///
+/// Made once, at the first call, and kept for the whole run: the title holds
+/// on to the pointers, and gets the same ones every time, as from Windows and
+/// the C runtime. The narrow forms are in the ANSI code page, as Windows
+/// makes `GetCommandLineA` from the wide line.
+///
+/// `VICTORY_TITLE_COMMAND_LINE=0`: as before, `GetCommandLine` and the C
+/// runtime's wide list and lines are the host's (ours), and only
+/// `__p___argc` and `__p___argv` are the title's, with the host's program
+/// name.
+struct CommandLine {
+    argc: std::cell::UnsafeCell<i32>,
+    argv: std::cell::UnsafeCell<*mut *mut c_char>,
+    wargv: std::cell::UnsafeCell<*mut *mut u16>,
+    /// What `GetCommandLineW` and `A` return.
+    wide: *mut u16,
+    narrow: *mut c_char,
+    /// `_wcmdln` and `_acmdln`: the C runtime's variables, which a title may
+    /// write; they start as the lines above.
+    wcmdln: std::cell::UnsafeCell<*mut u16>,
+    acmdln: std::cell::UnsafeCell<*mut c_char>,
 }
 
-// SAFETY: never written here after it was made; the title's C runtime start
-// reads it once, on one thread.
-unsafe impl Send for TitleArgv {}
+// SAFETY: never written here after it was made; what the title writes
+// through `__p__acmdln` and the like it writes as into the C runtime's own
+// variables, which have no lock either.
+unsafe impl Send for CommandLine {}
 // SAFETY: as above.
-unsafe impl Sync for TitleArgv {}
+unsafe impl Sync for CommandLine {}
 
-/// Kept for the whole run: the title holds on to the pointers.
-fn title_argv(program: &str, args: &[String]) -> TitleArgv {
-    let list: Vec<*mut c_char> = std::iter::once(program)
+/// Whether the title's command line is its own ([`CommandLine`]): its image
+/// name and the arguments after `--`, however it reads it. On by default: a
+/// console title never sees a host launcher's command line.
+/// `VICTORY_TITLE_COMMAND_LINE=0`: `GetCommandLine` and the C runtime's wide
+/// list and lines are the host's (Rox-box's command line) and only
+/// `__p___argc` and `__p___argv` the title's, with the host's program name,
+/// as before. Read once.
+fn title_command_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_COMMAND_LINE").is_none_or(|v| v != "0"))
+}
+
+/// Appends `arg` as the C runtime parses an argument back (and
+/// `CommandLineToArgvW`): bare if it has no blank and no quote; else in
+/// quotes, with a quote inside as `\"` and the backslashes before a quote or
+/// the closing one doubled.
+fn quote_arg(arg: &str, line: &mut String) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+        line.push_str(arg);
+        return;
+    }
+    line.push('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                line.extend(std::iter::repeat_n('\\', 2 * backslashes + 1));
+                line.push('"');
+                backslashes = 0;
+            }
+            c => {
+                line.extend(std::iter::repeat_n('\\', backslashes));
+                line.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    line.extend(std::iter::repeat_n('\\', 2 * backslashes));
+    line.push('"');
+}
+
+/// The command line of `program` and `args`. The program's name is parsed
+/// by other rules (a quote only opens and closes, no backslash escapes), and
+/// a file name holds no quote: it is quoted only when it holds a blank.
+fn command_line(program: &str, args: &[String]) -> String {
+    let mut line = if program.is_empty() || program.contains([' ', '\t']) {
+        format!("\"{program}\"")
+    } else {
+        program.to_owned()
+    };
+    for arg in args {
+        line.push(' ');
+        quote_arg(arg, &mut line);
+    }
+    line
+}
+
+/// A NUL-terminated copy of `units`, kept for the whole run.
+fn leaked<T: Copy + Default>(units: impl IntoIterator<Item = T>) -> *mut T {
+    let all: Box<[T]> = units.into_iter().chain(Some(T::default())).collect();
+    Box::leak(all).as_mut_ptr()
+}
+
+/// A null-terminated list of those, kept for the whole run.
+fn leaked_list<T>(items: Vec<*mut T>) -> *mut *mut T {
+    let all: Box<[*mut T]> = items.into_iter().chain(Some(std::ptr::null_mut())).collect();
+    Box::leak(all).as_mut_ptr()
+}
+
+/// What `program` and `args` give a title: the lists, and the line. The
+/// narrow forms are in the ANSI code page (`ansi`) or, as the argument list
+/// was before, in UTF-8.
+fn make_command_line(program: &str, args: &[String], ansi: bool) -> CommandLine {
+    let all: Vec<&str> = std::iter::once(program)
         .chain(args.iter().map(String::as_str))
-        .filter_map(|a| std::ffi::CString::new(a).ok())
-        .map(std::ffi::CString::into_raw)
         .collect();
-    let count = list.len() as i32;
-    // `argv[argc]` is null.
-    let list: Box<[*mut c_char]> = list.into_iter().chain(Some(std::ptr::null_mut())).collect();
-    TitleArgv {
-        count: count.into(),
-        list: Box::leak(list).as_mut_ptr().into(),
+    // A NUL inside would end it early in both forms alike.
+    let wide = |s: &str| leaked(s.encode_utf16().take_while(|&u| u != 0));
+    let bytes = |s: &str| if ansi { host::ansi(s) } else { s.as_bytes().to_vec() };
+    let narrow = |s: &str| {
+        leaked(bytes(s).into_iter().take_while(|&b| b != 0).map(|b| b as c_char))
+    };
+    let line = command_line(program, args);
+    let (wide_line, narrow_line) = (wide(&line), narrow(&line));
+    CommandLine {
+        argc: (all.len() as i32).into(),
+        argv: leaked_list(all.iter().map(|a| narrow(a)).collect()).into(),
+        wargv: leaked_list(all.iter().map(|a| wide(a)).collect()).into(),
+        wide: wide_line,
+        narrow: narrow_line,
+        wcmdln: wide_line.into(),
+        acmdln: narrow_line.into(),
     }
 }
 
-fn argv() -> &'static TitleArgv {
-    static ARGV: std::sync::OnceLock<TitleArgv> = std::sync::OnceLock::new();
-    ARGV.get_or_init(|| {
-        // The program's name stays what the host says (as it was before).
-        let program = std::env::args_os().next().unwrap_or_default();
+/// The title's image name, for its command line; without a title (the
+/// tests), this program's.
+fn image_name() -> String {
+    let path = runtime::main_image()
+        .and_then(runtime::image_path)
+        .or_else(|| std::env::current_exe().ok());
+    path.as_deref()
+        .and_then(std::path::Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn the_command_line() -> &'static CommandLine {
+    static LINE: std::sync::OnceLock<CommandLine> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
         let args = runtime::title_args();
         tracing::info!(?args, "the title's arguments");
-        title_argv(&program.to_string_lossy(), args)
+        if title_command_line() {
+            make_command_line(&image_name(), args, true)
+        } else {
+            // The program's name as the host says it (as it was before).
+            let program = std::env::args_os().next().unwrap_or_default();
+            make_command_line(&program.to_string_lossy(), args, false)
+        }
     })
 }
 
-/// See [`TitleArgv`].
-pub extern "C" fn __p___argc() -> *mut i32 {
-    argv().count.get()
+/// See [`CommandLine`].
+pub extern "system" fn GetCommandLineW() -> *const u16 {
+    the_command_line().wide
 }
 
-/// See [`TitleArgv`].
+/// See [`CommandLine`].
+pub extern "system" fn GetCommandLineA() -> *const c_char {
+    the_command_line().narrow
+}
+
+/// See [`CommandLine`].
+pub extern "C" fn __p___argc() -> *mut i32 {
+    the_command_line().argc.get()
+}
+
+/// See [`CommandLine`].
 pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
-    argv().list.get()
+    the_command_line().argv.get()
+}
+
+/// See [`CommandLine`].
+pub extern "C" fn __p___wargv() -> *mut *mut *mut u16 {
+    the_command_line().wargv.get()
+}
+
+/// See [`CommandLine`].
+pub extern "C" fn __p__acmdln() -> *mut *mut c_char {
+    the_command_line().acmdln.get()
+}
+
+/// See [`CommandLine`].
+pub extern "C" fn __p__wcmdln() -> *mut *mut u16 {
+    the_command_line().wcmdln.get()
+}
+
+/// The arguments part of `line` (a NUL-terminated command line), as the C
+/// runtime gives `WinMain` its `lpCmdLine`: past the program's name (to the
+/// first blank, or the closing quote of a quoted one) and the blanks after
+/// it.
+///
+/// # Safety
+/// `line` is NUL-terminated.
+unsafe fn winmain_tail<T: Copy + Into<u32>>(line: *mut T) -> *mut T {
+    let (quote, space, tab) = (u32::from(b'"'), u32::from(b' '), u32::from(b'\t'));
+    // SAFETY: every read stops at the NUL.
+    unsafe {
+        let at = |p: *mut T| (*p).into();
+        let mut p = line;
+        let mut quoted = false;
+        while at(p) != 0 && (quoted || (at(p) != space && at(p) != tab)) {
+            if at(p) == quote {
+                quoted = !quoted;
+            }
+            p = p.add(1);
+        }
+        while at(p) == space || at(p) == tab {
+            p = p.add(1);
+        }
+        p
+    }
+}
+
+/// See [`CommandLine`] and [`winmain_tail`]; of the line `_acmdln` holds now.
+pub extern "C" fn _get_narrow_winmain_command_line() -> *mut c_char {
+    // SAFETY: the C runtime's variable, read as it reads its own; it holds
+    // a NUL-terminated line (ours, or one the title put there).
+    unsafe { winmain_tail((*the_command_line().acmdln.get()).cast::<u8>()).cast() }
+}
+
+/// See [`_get_narrow_winmain_command_line`].
+pub extern "C" fn _get_wide_winmain_command_line() -> *mut u16 {
+    // SAFETY: as above.
+    unsafe { winmain_tail(*the_command_line().wcmdln.get()) }
 }
 
 /// The title's thread priorities, but for the lowest two, which become
@@ -451,35 +701,63 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            // `GetCommandLineW` and `A`.
+            "api-ms-win-core-processenvironment-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
         ],
-        exports: vec![
-            hle_export!(__p___argc),
-            hle_export!(__p___argv),
-            hle_export!(GetModuleHandleW),
-            hle_export!(GetModuleHandleA),
-            hle_export!(GetModuleFileNameW),
-            hle_export!(GetModuleFileNameA),
-            hle_export!(LoadLibraryExA),
-            hle_export!(LoadLibraryExW),
-            hle_export!(LoadLibraryA),
-            hle_export!(LoadLibraryW),
-            hle_export!(GetProcAddress),
-            hle_export!(FreeLibrary),
-            hle_export!(DisableThreadLibraryCalls),
-            hle_export!(OutputDebugStringA),
-            hle_export!(OutputDebugStringW),
-            hle_export!(exit),
-            hle_export!(abort),
-            hle_export!(terminate),
-            hle_export!(_invalid_parameter_noinfo_noreturn),
-            hle_export!(TerminateProcess),
-            hle_export!(SetUnhandledExceptionFilter),
-            hle_export!(SetThreadPriority),
-        ],
+        exports: exports(),
     }
+}
+
+fn exports() -> Vec<crate::HleExport> {
+    let mut exports = vec![
+        hle_export!(__p___argc),
+        hle_export!(__p___argv),
+        hle_export!(GetModuleHandleW),
+        hle_export!(GetModuleHandleA),
+        hle_export!(GetModuleFileNameW),
+        hle_export!(GetModuleFileNameA),
+        hle_export!(LoadLibraryExA),
+        hle_export!(LoadLibraryExW),
+        hle_export!(LoadLibraryA),
+        hle_export!(LoadLibraryW),
+        hle_export!(GetProcAddress),
+        hle_export!(FreeLibrary),
+        hle_export!(DisableThreadLibraryCalls),
+        hle_export!(OutputDebugStringA),
+        hle_export!(OutputDebugStringW),
+        hle_export!(exit),
+        hle_export!(abort),
+        hle_export!(terminate),
+        hle_export!(_invalid_parameter_noinfo_noreturn),
+        hle_export!(TerminateProcess),
+        hle_export!(SetUnhandledExceptionFilter),
+        hle_export!(SetThreadPriority),
+    ];
+    // With either switch at 0 these imports are bound to the host's, as
+    // before.
+    if title_command_line() {
+        exports.extend([
+            hle_export!(GetCommandLineW),
+            hle_export!(GetCommandLineA),
+            hle_export!(__p___wargv),
+            hle_export!(__p__acmdln),
+            hle_export!(__p__wcmdln),
+            hle_export!(_get_narrow_winmain_command_line),
+            hle_export!(_get_wide_winmain_command_line),
+        ]);
+    }
+    if title_exits() {
+        exports.extend([
+            hle_export!(ExitProcess),
+            hle_export!(_exit),
+            hle_export!(_Exit),
+            hle_export!(quick_exit),
+        ]);
+    }
+    exports
 }
 
 /// The return addresses above the caller, as `module+rva`, for logs.
@@ -505,6 +783,8 @@ mod host {
         fn crt_exit(code: i32) -> !;
         #[link_name = "abort"]
         fn crt_abort() -> !;
+        #[link_name = "quick_exit"]
+        fn crt_quick_exit(code: i32) -> !;
     }
 
     // SAFETY (every function): forwarding the title's own arguments to the
@@ -575,6 +855,37 @@ mod host {
     pub(super) fn abort() -> ! {
         // SAFETY: see above.
         unsafe { crt_abort() }
+    }
+
+    pub(super) fn quick_exit(code: i32) -> ! {
+        // SAFETY: see above.
+        unsafe { crt_quick_exit(code) }
+    }
+
+    pub(super) fn exit_process(code: i32) -> ! {
+        victory_loader::exit_process(code)
+    }
+
+    /// `text` in the ANSI code page, as Windows makes the narrow command
+    /// line from the wide one (a character it lacks becomes its default).
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        if wide.is_empty() {
+            return Vec::new();
+        }
+        let len = i32::try_from(wide.len()).unwrap_or(i32::MAX);
+        let convert = |out: *mut u8, size: i32| {
+            let (default, used) = (std::ptr::null(), std::ptr::null_mut());
+            // SAFETY: `len` units of `wide`; `out` holds `size` bytes (none
+            // when it is null, which only sizes the conversion).
+            unsafe { WideCharToMultiByte(CP_ACP, 0, wide.as_ptr(), len, out, size, default, used) }
+        };
+        let size = convert(std::ptr::null_mut(), 0);
+        let mut out = vec![0u8; size.max(0) as usize];
+        let n = convert(out.as_mut_ptr(), size);
+        out.truncate(n.max(0) as usize);
+        out
     }
 
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
@@ -673,6 +984,18 @@ mod host {
         std::process::abort()
     }
 
+    pub(super) fn quick_exit(code: i32) -> ! {
+        std::process::exit(code)
+    }
+
+    pub(super) fn exit_process(code: i32) -> ! {
+        std::process::exit(code)
+    }
+
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }
@@ -731,25 +1054,118 @@ mod tests {
 
     /// The title's arguments come right after the program, and the list ends
     /// in a null pointer; without any there is only the program.
+    /// A NUL-terminated wide string, read.
+    fn wide_at(p: *const u16) -> String {
+        wide(p)
+    }
+
+    /// Every list and line of `made`.
+    fn views(made: &CommandLine) -> (Vec<String>, Vec<String>, String, String) {
+        // SAFETY: made above, kept for the whole run; every list ends in a
+        // null pointer and every string in a NUL.
+        unsafe {
+            let count = *made.argc.get() as usize;
+            let (narrow, wide) = (*made.argv.get(), *made.wargv.get());
+            assert!((*narrow.add(count)).is_null() && (*wide.add(count)).is_null());
+            let narrow_list = (0..count)
+                .map(|i| CStr::from_ptr(*narrow.add(i)).to_str().unwrap().to_owned())
+                .collect();
+            let wide_list = (0..count).map(|i| wide_at(*wide.add(i))).collect();
+            let line = CStr::from_ptr(made.narrow).to_str().unwrap().to_owned();
+            (narrow_list, wide_list, line, wide_at(made.wide))
+        }
+    }
+
+    /// The title's arguments come right after the program, and the lists
+    /// end in a null pointer; without any there is only the program. Both
+    /// encodings and both forms (lists and lines) say the same.
     #[test]
     fn the_title_gets_its_own_arguments() {
-        let read = |made: &TitleArgv| {
-            // SAFETY: made above, kept for the whole run.
+        let some = make_command_line("game.exe", &["-skipToIIS".into(), "-x=1".into()], true);
+        let (narrow, wide, line, wide_line) = views(&some);
+        assert_eq!(narrow, ["game.exe", "-skipToIIS", "-x=1"]);
+        assert_eq!(wide, narrow);
+        assert_eq!(line, "game.exe -skipToIIS -x=1");
+        assert_eq!(wide_line, line);
+        let (narrow, _, line, _) = views(&make_command_line("game.exe", &[], true));
+        assert_eq!((narrow, line), (vec!["game.exe".to_owned()], "game.exe".to_owned()));
+        // What the title is given: the same pointers every time, and the
+        // same arguments however it reads them.
+        assert_eq!(__p___argc(), __p___argc());
+        assert_eq!(GetCommandLineW(), GetCommandLineW());
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false));
+            assert_eq!(*__p__wcmdln() as *const u16, GetCommandLineW());
+            assert_eq!(*__p__acmdln() as *const c_char, GetCommandLineA());
+            let program = CStr::from_ptr(**__p___argv()).to_str().unwrap().to_owned();
+            assert_eq!(wide_at(**__p___wargv()), program);
+            // The image's name, never a path.
+            assert!(!program.contains(['\\', '/']) && !program.is_empty(), "{program}");
+            assert_eq!(wide_at(GetCommandLineW()), command_line(&program, &[]));
+            assert_eq!(*_get_wide_winmain_command_line(), 0);
+            assert_eq!(*_get_narrow_winmain_command_line(), 0);
+        }
+    }
+
+    /// `WinMain`'s line is what follows the program's name and its blanks,
+    /// a quoted name with blanks in it included.
+    #[test]
+    fn winmain_gets_what_follows_the_program() {
+        let tail = |line: &str| {
+            let mut units: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: NUL-terminated above.
+            wide_at(unsafe { winmain_tail(units.as_mut_ptr()) })
+        };
+        assert_eq!(tail("game.exe  -a b"), "-a b");
+        assert_eq!(tail("\"my game.exe\"\t-a"), "-a");
+        assert_eq!(tail("game.exe"), "");
+        assert_eq!(tail(""), "");
+    }
+
+    /// The line parses back into the program and the arguments, as Windows'
+    /// own parser (the C runtime's rules) reads it: blanks, quotes,
+    /// backslashes before quotes and at the end, empty arguments.
+    #[cfg(windows)]
+    #[test]
+    fn the_command_line_parses_back_into_the_arguments() {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn CommandLineToArgvW(line: *const u16, count: *mut i32) -> *mut *mut u16;
+        }
+        let parsed = |line: &str| {
+            let units: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
+            let mut count = 0;
+            // SAFETY: a NUL-terminated line; the list it returns has `count`
+            // NUL-terminated strings (left for the process to free).
             unsafe {
-                let (count, list) = (*made.count.get() as usize, *made.list.get());
-                assert!((*list.add(count)).is_null());
-                (0..count)
-                    .map(|i| CStr::from_ptr(*list.add(i)).to_str().unwrap().to_owned())
-                    .collect::<Vec<_>>()
+                let list = CommandLineToArgvW(units.as_ptr(), &mut count);
+                assert!(!list.is_null());
+                (0..count as usize).map(|i| wide_at(*list.add(i))).collect::<Vec<_>>()
             }
         };
-        let some = title_argv("victory.exe", &["-skipToIIS".into(), "-x=1".into()]);
-        assert_eq!(read(&some), ["victory.exe", "-skipToIIS", "-x=1"]);
-        assert_eq!(read(&title_argv("victory.exe", &[])), ["victory.exe"]);
-        // What the title is given: the same list every time.
-        assert_eq!(__p___argc(), __p___argc());
-        // SAFETY: as above.
-        unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
+        let args: Vec<String> = [
+            "plain",
+            "two words",
+            "",
+            "tab\there",
+            "a\"quote",
+            "back\\slash",
+            "trailing\\",
+            "trailing two\\\\",
+            "\\\"both\\\\\"",
+            "--frames",
+            "40",
+            "unicode \u{e9}\u{4e2d}",
+        ]
+        .map(str::to_owned)
+        .into();
+        for program in ["game.exe", "my game.exe"] {
+            let line = command_line(program, &args);
+            let mut expected = vec![program.to_owned()];
+            expected.extend(args.iter().cloned());
+            assert_eq!(parsed(&line), expected, "{line}");
+        }
     }
 
     fn w(text: &str) -> Vec<u16> {

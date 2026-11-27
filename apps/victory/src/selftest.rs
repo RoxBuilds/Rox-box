@@ -2,7 +2,11 @@
 //! our own (`victory_gpu::selftest`), so that a player can find out
 //! whether their graphics card and driver work with the layer before
 //! setting anything up, and CI covers the whole path. Needs no config file
-//! and no game folder, and writes nothing.
+//! and no game folder. It writes one file: its report, beside the run
+//! reports (`<data_dir>\reports\selftest-<UTC time>.txt`; the default data
+//! folder's without a config file; `VICTORY_REPORT=0`: none), which holds
+//! the host's facts, each stage's outcome in our fixed words and the
+//! benchmark's rates, and may be attached to an issue as it is.
 //!
 //! The stand-in's imports are bound as a title's are: looked up in the
 //! runtime's registry under the DLL and name a title imports them by.
@@ -39,6 +43,8 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
     // title's run: ours says which way the self-test failed.
     victory_gpu::on_failure(gpu_failed);
     WARP.store(warp, std::sync::atomic::Ordering::Relaxed);
+    *seen() = Seen { warp, frames, bench, stages: Vec::new() };
+    crate::report::selftest_begins();
     println!(
         "victory {} self-test{} (a stand-in title of our own; no game files)\n",
         env!("CARGO_PKG_VERSION"),
@@ -48,7 +54,17 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
     let report = selftest::run(&imports, &options, &mut |stage| {
         print_stage(stage.name, &stage.outcome);
         let _ = std::io::stdout().flush();
+        seen().stages.push(stage_of(stage));
     }, hung);
+    let rates = report
+        .rates
+        .iter()
+        .map(|r| victory_core::report::SelftestRate {
+            name: victory_core::report::Ours::new(r.name),
+            value: r.value,
+            unit: victory_core::report::Ours::new(unit_words(r.unit)),
+        })
+        .collect();
     if !report.rates.is_empty() {
         println!("\nBenchmark (name, value, unit; docs/selftest.md says how to read them):");
         for r in &report.rates {
@@ -61,6 +77,8 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
     match report.first_failure() {
         None => {
             println!("Self-test passed: {ok} of {} stages OK, {skipped} skipped.", report.stages.len());
+            let _ = std::io::stdout().flush();
+            write_report("completed", None, rates);
             Ok(())
         }
         Some(stage) => {
@@ -68,6 +86,7 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
             println!("Self-test failed at \"{}\": {reason}", stage.name);
             println!("  {}", advice(warp));
             let _ = std::io::stdout().flush();
+            write_report(if report.no_device { "no_device" } else { "completed" }, None, rates);
             if report.no_device {
                 std::process::exit(NO_DEVICE);
             }
@@ -78,6 +97,81 @@ pub fn run(warp: bool, frames: u32, bench: bool) -> Result<()> {
 
 #[cfg(windows)]
 static WARP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the self-test was asked and the stages done so far, for its report,
+/// which a hang or a GPU failure writes from another thread.
+#[cfg(windows)]
+struct Seen {
+    warp: bool,
+    frames: u32,
+    bench: bool,
+    stages: Vec<victory_core::report::SelftestStage>,
+}
+
+#[cfg(windows)]
+fn seen() -> std::sync::MutexGuard<'static, Seen> {
+    static SEEN: std::sync::Mutex<Seen> =
+        std::sync::Mutex::new(Seen { warp: false, frames: 0, bench: false, stages: Vec::new() });
+    SEEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A stage as the report holds it: its name, its outcome, and for a skip
+/// our fixed reason (never the stage's own text, built at run time).
+#[cfg(windows)]
+fn stage_of(stage: &victory_gpu::selftest::Stage) -> victory_core::report::SelftestStage {
+    use victory_core::report::{Ours, SelftestStage, StageOutcome};
+    use victory_gpu::selftest::Outcome;
+    SelftestStage {
+        name: Ours::new(stage.name),
+        outcome: match stage.outcome {
+            Outcome::Ok(_) => StageOutcome::Ok,
+            Outcome::Fail(_) => StageOutcome::Fail,
+            Outcome::Skip(_) => StageOutcome::Skip,
+        },
+        reason: stage.skip_reason().map(Ours::new),
+    }
+}
+
+/// A rate's unit in words (the report writes no slash).
+#[cfg(windows)]
+fn unit_words(unit: &'static str) -> &'static str {
+    match unit {
+        "MB/s" => "MB per s",
+        "GB/s" => "GB per s",
+        "us/GiB" => "us per GiB",
+        "calls/s" => "calls per s",
+        other => other,
+    }
+}
+
+/// Writes the self-test's report: ended as `ended`, with the stages seen,
+/// one more if `last` (the stage a hang or failure stopped), and `rates`.
+#[cfg(windows)]
+fn write_report(
+    ended: &'static str,
+    last: Option<victory_core::report::SelftestStage>,
+    rates: Vec<victory_core::report::SelftestRate>,
+) {
+    let test = {
+        let seen = seen();
+        victory_core::report::Selftest {
+            software_adapter: seen.warp,
+            frames: seen.frames,
+            bench: seen.bench,
+            ended: victory_core::report::Ours::new(ended),
+            stages: seen.stages.iter().copied().chain(last).collect(),
+            rates,
+        }
+    };
+    crate::report::selftest_ends(&test, ended == "completed" || ended == "no_device");
+}
+
+/// The stage a hang or a host GPU failure stopped, failed for `why`.
+#[cfg(windows)]
+fn stopped(name: &'static str, why: &'static str) -> victory_core::report::SelftestStage {
+    use victory_core::report::{Ours, SelftestStage, StageOutcome};
+    SelftestStage { name: Ours::new(name), outcome: StageOutcome::Fail, reason: Some(Ours::new(why)) }
+}
 
 /// What the player should do after a failure.
 #[cfg(windows)]
@@ -133,6 +227,7 @@ fn hung(stage: &'static str) -> ! {
     println!("\nSelf-test failed at \"{stage}\": it hung.");
     println!("  {}", advice(WARP.load(std::sync::atomic::Ordering::Relaxed)));
     let _ = std::io::stdout().flush();
+    write_report("hung", Some(stopped(stage, "no answer from the GPU in 60 s")), Vec::new());
     std::process::exit(HUNG)
 }
 
@@ -143,5 +238,6 @@ fn gpu_failed(what: &str) -> ! {
     println!("\nSelf-test failed: the host GPU failed.");
     println!("  {}", advice(WARP.load(std::sync::atomic::Ordering::Relaxed)));
     let _ = std::io::stdout().flush();
+    write_report("host_gpu_failed", Some(stopped("GPU", "the host GPU failed")), Vec::new());
     std::process::exit(GPU_FAILED)
 }

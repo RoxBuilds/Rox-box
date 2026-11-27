@@ -177,6 +177,15 @@ pub fn run(
     }
     use victory_core::report::{End, finish};
     let _ = finish(joined.as_ref().map_or(End::RoxBoxError, |&code| End::TitleExited(code as i32)));
+    // The entry point returned (a title without a C runtime that calls
+    // `exit`): the process ends with its code, as the title's own `exit`
+    // ends it. It ended with 0 whatever the title returned
+    // (`VICTORY_TITLE_EXITS=0`: so again).
+    if let Ok(&code) = joined.as_ref()
+        && victory_hle::modules::kernel::title_exits()
+    {
+        victory_loader::exit_process(code as i32)
+    }
     joined.map(|_| ())
 }
 

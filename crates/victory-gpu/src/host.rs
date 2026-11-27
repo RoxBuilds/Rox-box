@@ -10986,6 +10986,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        crate::runreport::frame_counted(self.frames, self.since, &SUBMISSION_US, &COPY_BACK, &CARD_CLOCK_US);
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;

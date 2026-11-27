@@ -12,7 +12,9 @@
 //! governor gives its looks.
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use victory_pipeline::report::{self, Figure, GpuFacts, HostText, LeftOut, Stat};
 use windows::Win32::Graphics::Direct3D::{
@@ -100,6 +102,8 @@ fn us(ms: f64, frames: f64) -> u64 {
 /// (ms, MB) and textures (ms, MB), ms waiting for the GPU, and copying back
 /// (ms, MB). With the queue of textures picked by index, as it stands.
 pub(crate) fn frame_line(frames: f64, elapsed: std::time::Duration, figures: [f64; 8]) {
+    // The line has taken the meters: none of its frames are left over.
+    PENDING_FRAMES.store(0, Relaxed);
     let [cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb] = figures;
     report::figures(&[
         (Figure::Frames, frames as u64),
@@ -117,6 +121,81 @@ pub(crate) fn frame_line(frames: f64, elapsed: std::time::Duration, figures: [f6
         Stat::PickedWaitingMost,
         crate::draw::HEAP_TEXTURES_QUEUE[2].load(Relaxed),
     );
+}
+
+// The frames since the frame line's last second. The line takes its meters
+// once a whole second has passed, so a run's last part of a second (a short
+// run: all of it) never reached the report. The meter tells of every frame it
+// counts ([`frame_counted`]); when the report that names the run's end is
+// written, [`last_meters`] takes the meters as the line would and gives them
+// to the report, without a line in the log.
+
+/// Frames the meter counted since its last line, and the microseconds (from
+/// [`BASE`]) when its second began and when it counted the last of them.
+static PENDING_FRAMES: AtomicU32 = AtomicU32::new(0);
+static PENDING_SINCE_US: AtomicU64 = AtomicU64::new(0);
+static PENDING_LAST_US: AtomicU64 = AtomicU64::new(0);
+static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// The meters the line takes that live in `host` (submissions: preparing,
+/// waiting for the card; copying back: microseconds, bytes; the card's
+/// clock), given by the meter as it counts frames.
+struct HostMeters {
+    submission_us: &'static [AtomicU64; 2],
+    copy_back: &'static [AtomicU64; 2],
+    card_clock_us: &'static [AtomicU64; 3],
+}
+
+static HOST_METERS: OnceLock<HostMeters> = OnceLock::new();
+
+/// The frame meter counted a frame: `frames` since its last line, which
+/// began at `since`. A few relaxed stores a present.
+pub(crate) fn frame_counted(
+    frames: u32,
+    since: std::time::Instant,
+    submission_us: &'static [AtomicU64; 2],
+    copy_back: &'static [AtomicU64; 2],
+    card_clock_us: &'static [AtomicU64; 3],
+) {
+    let base = *BASE.get_or_init(|| since);
+    let _ = HOST_METERS.get_or_init(|| HostMeters { submission_us, copy_back, card_clock_us });
+    let us = |at: std::time::Instant| at.saturating_duration_since(base).as_micros() as u64;
+    PENDING_SINCE_US.store(us(since), Relaxed);
+    PENDING_LAST_US.store(us(std::time::Instant::now()), Relaxed);
+    PENDING_FRAMES.store(frames, Relaxed);
+}
+
+/// The meters the frame line takes, taken one last time (the frames since
+/// its last second): given to the report as the line gives them. Nothing if
+/// no frame is left over. shortcut: the settles' waits (`host::late_line`)
+/// are not taken here; their last part of a second stays out of
+/// `[frame_time.waits]`.
+fn last_meters() {
+    let frames = PENDING_FRAMES.swap(0, Relaxed);
+    let Some(host) = HOST_METERS.get().filter(|_| frames > 0) else {
+        return;
+    };
+    let take = |a: &AtomicU64| a.swap(0, Relaxed);
+    let elapsed = PENDING_LAST_US.load(Relaxed).saturating_sub(PENDING_SINCE_US.load(Relaxed));
+    let prep = &crate::host::PREPARING;
+    report::figures(&[
+        (Figure::Frames, u64::from(frames)),
+        (Figure::MeterUs, elapsed),
+        (Figure::PreparingUs, take(&host.submission_us[0])),
+        (Figure::CopiesUpUs, take(&prep[0])),
+        (Figure::CopiesUpBytes, take(&prep[1])),
+        (Figure::TextureRefreshUs, take(&prep[2])),
+        (Figure::TextureRefreshBytes, take(&prep[3])),
+        (Figure::CardWaitUs, take(&host.submission_us[1])),
+        (Figure::CopyBackUs, take(&host.copy_back[0])),
+        (Figure::CopyBackBytes, take(&host.copy_back[1])),
+        (Figure::CardIdleUs, take(&host.card_clock_us[0])),
+        (Figure::CardIdleBehindUs, take(&host.card_clock_us[1])),
+        (Figure::StoodUs, take(&host.card_clock_us[2])),
+        (Figure::HeapBufferPasses, take(&crate::draw::HEAP_BUFFER_PASSES)),
+        (Figure::HeapBufferUs, take(&crate::draw::HEAP_BUFFER_MICROS)),
+        (Figure::RefreshAllUs, take(&crate::texture::REFRESH_WAITS[3])),
+    ]);
 }
 
 /// The card's clock per frame (`host::card_clock_line`): ms with nothing of
@@ -287,6 +366,9 @@ pub(crate) fn shader_failed(e: &victory_shader::ShaderError) {
 /// with the process's memory peaks: registered as the report's sampler by
 /// the run, called before each report is written.
 pub fn sample() {
+    if report::ending() {
+        last_meters();
+    }
     let (made, loaded) = crate::pipeline::host_counts();
     report::set(Stat::PipelinesMadeNow, made);
     report::set(Stat::PipelinesFromLibrary, loaded);
@@ -377,6 +459,24 @@ mod tests {
     #[test]
     fn the_sampler_runs_without_a_run() {
         sample();
+    }
+
+    /// The frames since the line's last second are taken at the end, and
+    /// none that a line has taken. (Another test's presents may count frames
+    /// meanwhile, so only the order of the times is checked here; the demo
+    /// title's test checks that `[frame_time]` counts every present.)
+    #[test]
+    fn the_last_part_of_a_second_is_taken_at_the_end() {
+        static SUBMISSION: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        static BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        static CLOCK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        let since = std::time::Instant::now();
+        frame_counted(3, since, &SUBMISSION, &BACK, &CLOCK);
+        assert!(PENDING_LAST_US.load(Relaxed) >= PENDING_SINCE_US.load(Relaxed));
+        last_meters();
+        frame_counted(5, since, &SUBMISSION, &BACK, &CLOCK);
+        frame_line(5.0, std::time::Duration::from_secs(1), [0.0; 8]);
+        last_meters();
     }
 
     /// The frame line's per-frame figures are made totals again, whatever

@@ -70,6 +70,38 @@ fn indices_and_the_no_argument_form_read_the_reports_folder() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The no-argument form compares the two newest of the newest one's kind:
+/// a self-test's report beside run reports is not compared with them.
+#[test]
+fn the_newest_self_tests_compare_with_each_other() {
+    let selftest = |rate: &str| {
+        format!(
+            "format = 3\nkind = \"selftest\"\n[selftest]\nended = \"completed\"\nstages_ok = 5\n\
+             [selftest.rates]\n\"present_interval\" = {rate}\n[[selftest.stage]]\nname = \"Device\"\noutcome = \"ok\"\n"
+        )
+    };
+    let dir = scratch("kinds");
+    let reports = dir.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::write(reports.join("run-20250101-000000.txt"), A).unwrap();
+    std::fs::write(reports.join("run-20250101-000100.txt"), B).unwrap();
+    std::fs::write(reports.join("selftest-20250101-000200.txt"), selftest("2.00")).unwrap();
+    let out = victory(&dir, true, &["--diff"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs two self-test reports"));
+    std::fs::write(reports.join("selftest-20250101-000300.txt"), selftest("4.00")).unwrap();
+    let out = victory(&dir, true, &["--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("stages: same outcomes (1 in each)"), "{stdout}");
+    assert!(stdout.contains("verdict: present_interval 2.00 -> 4.00 (+100.0 %)"), "{stdout}");
+    // `victory report --list` names both kinds.
+    let out = victory(&dir, true, &["--list"]);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.contains("self-test, completed: 5 ok") && listed.contains("title_exited"), "{listed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fewer_than_two_reports_and_bad_input_exit_with_code_1() {
     let dir = scratch("errors");

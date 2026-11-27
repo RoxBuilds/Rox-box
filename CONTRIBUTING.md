@@ -78,7 +78,9 @@ writes one to `<data_dir>\reports`, and `victory report` prints the newest. It
 holds only numbers, Rox-box's own words and facts about the PC, by
 construction ([docs/run-report.md](docs/run-report.md)), and may be pasted
 into an issue as it is. Do not add anything to it. The output of
-`victory selftest`, which runs no title at all, may be pasted too.
+`victory selftest`, which runs no title at all, may be pasted too, and so
+may the report it writes beside the run reports (`selftest-<time>.txt`,
+which `victory report` then shows).
 
 ### How the policy is enforced
 

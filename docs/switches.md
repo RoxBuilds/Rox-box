@@ -4,7 +4,7 @@ Every `VICTORY_*` environment variable the source reads. This file is generated 
 
 To add a switch, write it in the code (`switch::on`, `toggled!` or a value read), describe it in a comment directly above the read, and run `cargo xtask switches`. `cargo xtask switches --check` (and `cargo test`) fail when this file is stale. `scripts\play.ps1` clears every other `VICTORY_*` variable; see [ARCHITECTURE.md](../ARCHITECTURE.md#configuration-and-switches).
 
-452 switches: 8 paths, 19 in `victory`, 6 in `victory-core`, 345 in `victory-gpu`, 26 in `victory-hle`, 8 in `victory-loader`, 40 in `victory-shader`.
+454 switches: 8 paths, 19 in `victory`, 6 in `victory-core`, 345 in `victory-gpu`, 28 in `victory-hle`, 8 in `victory-loader`, 40 in `victory-shader`.
 
 How to read the tables:
 
@@ -438,6 +438,8 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_SECTION_WINDOW` | value |  | Where bytes of `n` pages from page `index` on can be written, whether or not the pages are mapped anywhere, committed. Every DirectStorage write mapped a view of its pages, committed it, faulted each of its 4 KiB pages in and unmapped it again, all of it under the process's one address-space lock, with 24 workers, the title's own mapping calls (about 100,000 views of one page) and our guards... | `crates/victory-hle/src/modules/xmem.rs` |
 | `VICTORY_STREAM_NOTICE` | value |  | See \[`pages_written`\]. | `crates/victory-hle/src/modules/xmem.rs` |
 | `VICTORY_STREAM_PRIORITY` | value |  | The title's streaming thread runs below normal priority, as do sixteen workers of ours when pipelines are made; on the console nothing else wants its core. Called where that thread maps and submits: lifts a thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`: left as the title set it). | `crates/victory-hle/src/modules/xmem.rs` |
+| `VICTORY_TITLE_COMMAND_LINE` | value |  | Whether the title's command line is its own (\[`CommandLine`\]): its image name and the arguments after `--`, however it reads it. On by default: a console title never sees a host launcher's command line. `VICTORY_TITLE_COMMAND_LINE=0`: `GetCommandLine` and the C runtime's wide list and lines are the host's (Rox-box's command line) and only `__p___argc` and `__p___argv` the title's, with the... | `crates/victory-hle/src/modules/kernel.rs` |
+| `VICTORY_TITLE_EXITS` | value |  | Whether the title's own ways of ending its process without the C runtime's `exit` are ours (`ExitProcess`, `_exit`, `_Exit`, `quick_exit`, an entry point that returns). On by default; `VICTORY_TITLE_EXITS=0`: the host's, as before (and an entry point that returns ends `victory run` with code 0). Ours record the end with the title's code, then leave as \[`exit`\] does: the title images detached... | `crates/victory-hle/src/modules/kernel.rs` |
 | `VICTORY_TITLE_PRIORITIES` | value |  |  | `crates/victory-hle/src/modules/kernel.rs` |
 | `VICTORY_TITLE_USED` | value |  |  | `crates/victory-hle/src/modules/xmem.rs` |
 | `VICTORY_WINDOW_MAX` | value |  |  | `crates/victory-hle/src/modules/lifecycle.rs` |

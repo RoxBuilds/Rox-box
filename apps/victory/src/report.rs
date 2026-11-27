@@ -20,7 +20,8 @@ pub fn run(list: bool, path_only: bool) -> Result<()> {
     let reports = report::reports_in(&dir);
     let none = || {
         format!(
-            "no run reports in {} yet: every `victory run --execute` writes one",
+            "no run reports in {} yet: every `victory run --execute` writes one, and \
+             `victory selftest` one of its own",
             dir.display()
         )
     };
@@ -100,6 +101,10 @@ const SECTIONS: &[&str] = &[
     "memory.pressure",
     "textures",
     "unimplemented",
+    "selftest",
+    "selftest.switches",
+    "selftest.rates",
+    "selftest.rate_units",
 ];
 
 /// What `--diff` was asked to print.
@@ -128,11 +133,21 @@ pub fn diff(args: &[String], threshold_pct: f64, all: bool) -> Result<()> {
     };
     let ((a_path, a_what), (b_path, b_what)) = match args {
         [] => {
-            let list = newest_first()?;
+            // The two newest of the newest one's kind: a self-test and a run
+            // do not compare.
+            let all = newest_first()?;
+            let kind = |p: &PathBuf| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(report::Kind::of_file)
+            };
+            let newest = all.first().and_then(kind);
+            let list: Vec<PathBuf> = all.iter().filter(|p| kind(p) == newest).cloned().collect();
             if list.len() < 2 {
                 bail!(
-                    "`victory report --diff` needs two run reports and {} found: \
-                     every `victory run --execute` writes one",
+                    "`victory report --diff` needs two {} reports and {} found: every `victory run \
+                     --execute` writes a run report, and `victory selftest` a self-test report",
+                    if newest == Some(report::Kind::Selftest) { "self-test" } else { "run" },
                     if list.is_empty() { "none was" } else { "only one was" }
                 );
             }
@@ -187,13 +202,23 @@ fn read_report(what: &str, path: &std::path::Path) -> Result<Table> {
     parse_report(&text).map_err(|e| anyhow::anyhow!("report {what} ({}) {e}", path.display()))
 }
 
-/// A run report's text as a table; the error says what is wrong with it.
+/// A report's text as a table; the error says what is wrong with it.
 fn parse_report(text: &str) -> std::result::Result<Table, String> {
     let table: Table = toml::from_str(text).map_err(|e| format!("is not valid TOML: {e}"))?;
     if !table.contains_key("format") && !table.contains_key("run") {
         return Err("is TOML, but not a run report (no `format` and no `[run]`)".to_owned());
     }
     Ok(table)
+}
+
+/// What a report is of: `selftest` for the self-test's, `run` for a run's
+/// (a report before format 3 has no `kind`, and is a run's).
+fn kind(t: &Table) -> &str {
+    t.get("kind").and_then(Value::as_str).unwrap_or("run")
+}
+
+fn is_selftest(t: &Table) -> bool {
+    kind(t) == "selftest"
 }
 
 /// A number from a report, remembering whether it was written as an integer
@@ -455,6 +480,19 @@ fn plain(v: Option<&Value>) -> String {
 }
 
 fn run_line(label: &str, t: &Table) -> String {
+    if is_selftest(t) {
+        let n = |key: &str| plain(get(t, &["selftest", key]));
+        let warp = get(t, &["selftest", "software_adapter"]).and_then(Value::as_bool) == Some(true);
+        return format!(
+            "{label}: Rox-box {}, self-test{}, ended {}, {} ok, {} failed, {} skipped",
+            plain(get(t, &["rox_box", "version"])),
+            if warp { " on the software adapter" } else { "" },
+            n("ended"),
+            n("stages_ok"),
+            n("stages_failed"),
+            n("stages_skipped"),
+        );
+    }
     let mut line = format!(
         "{label}: Rox-box {}, console {}, display {}, {} s, ended {}",
         plain(get(t, &["rox_box", "version"])),
@@ -525,6 +563,7 @@ fn host_lines(a: &Table, b: &Table) -> Vec<String> {
 fn switch_lines(a: &Table, b: &Table) -> Vec<String> {
     let switches = |t: &Table| {
         get(t, &["run", "switches"])
+            .or_else(|| get(t, &["selftest", "switches"]))
             .and_then(Value::as_table)
             .cloned()
             .unwrap_or_default()
@@ -553,6 +592,73 @@ fn switch_lines(a: &Table, b: &Table) -> Vec<String> {
     lines.extend(only_b);
     lines.extend(differ);
     lines
+}
+
+/// Two self-tests' stages: those whose outcome differs, by name.
+fn stage_lines(a: &Table, b: &Table) -> Vec<String> {
+    let stages = |t: &Table| -> Vec<(String, String)> {
+        get(t, &["selftest", "stage"])
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_table)
+                    .map(|s| (plain(s.get("name")), plain(s.get("outcome"))))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (sa, sb) = (stages(a), stages(b));
+    let mut names: Vec<&String> = sa.iter().map(|(n, _)| n).collect();
+    names.extend(sb.iter().map(|(n, _)| n).filter(|n| !sa.iter().any(|(m, _)| m == *n)));
+    let find = |list: &[(String, String)], name: &str| {
+        list.iter().find(|(n, _)| n == name).map_or("-".to_owned(), |(_, o)| o.clone())
+    };
+    let differing: Vec<String> = names
+        .into_iter()
+        .filter_map(|n| {
+            let (x, y) = (find(&sa, n), find(&sb, n));
+            (x != y).then(|| format!("  {n}  {x} -> {y}"))
+        })
+        .collect();
+    if differing.is_empty() {
+        return vec![format!("stages: same outcomes ({} in each)", sa.len())];
+    }
+    let mut lines = vec![format!("stages: {} with another outcome", differing.len())];
+    lines.extend(differing);
+    lines
+}
+
+/// The last line of two self-tests: the rates both have, A to B.
+fn selftest_verdict(a: &Table, b: &Table) -> String {
+    let rates = |t: &Table| {
+        get(t, &["selftest", "rates"])
+            .and_then(Value::as_table)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (ra, rb) = (rates(a), rates(b));
+    let units = get(b, &["selftest", "rate_units"]).and_then(Value::as_table);
+    let parts: Vec<String> = ra
+        .iter()
+        .filter_map(|(name, x)| {
+            let (x, y) = (Num::of(x)?.v, Num::of(rb.get(name)?)?.v);
+            let unit = units
+                .and_then(|u| u.get(name))
+                .map(|u| format!(" {}", plain(Some(u))))
+                .unwrap_or_default();
+            let pct = if x == 0.0 {
+                String::new()
+            } else {
+                format!(" ({:+.1} %)", (y - x) / x * 100.0)
+            };
+            Some(format!("{name} {x:.2} -> {y:.2}{unit}{pct}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        "verdict: the two self-tests share no rate (`--bench` takes them)".to_owned()
+    } else {
+        format!("verdict: {}", parts.join(", "))
+    }
 }
 
 /// The last line: facts only, from whichever of the keys both reports have.
@@ -605,10 +711,26 @@ pub fn diff_lines(a: &Table, b: &Table, options: &DiffOptions) -> Vec<String> {
             )
         }
     }];
+    if kind(a) != kind(b) {
+        // Their figures are of different things: only the PC compares.
+        lines.push(format!(
+            "kinds differ: A is a {} report, B a {} report; only the build and the PC compare",
+            if is_selftest(a) { "self-test" } else { "run" },
+            if is_selftest(b) { "self-test" } else { "run" },
+        ));
+        lines.push(run_line("A", a));
+        lines.push(run_line("B", b));
+        lines.extend(host_lines(a, b));
+        lines.push("verdict: a self-test and a run do not compare".to_owned());
+        return lines;
+    }
     lines.push(run_line("A", a));
     lines.push(run_line("B", b));
     lines.extend(host_lines(a, b));
     lines.extend(switch_lines(a, b));
+    if is_selftest(a) {
+        lines.extend(stage_lines(a, b));
+    }
     let rows = joined(a, b);
     // A steady-state key is compared under its own heading only when both
     // reports have it; otherwise it is one more whole-run row, with its `-`.
@@ -623,8 +745,8 @@ pub fn diff_lines(a: &Table, b: &Table, options: &DiffOptions) -> Vec<String> {
     if !steady.is_empty() {
         lines.extend(table_lines("steady state", &steady, options));
     }
-    lines.extend(table_lines("whole run", &whole, options));
-    lines.push(verdict(a, b));
+    lines.extend(table_lines(if is_selftest(a) { "self-test" } else { "whole run" }, &whole, options));
+    lines.push(if is_selftest(a) { selftest_verdict(a, b) } else { verdict(a, b) });
     lines
 }
 
@@ -646,6 +768,17 @@ pub fn start(cfg: &victory_core::Config) {
     report::console(report::Ours::new(
         victory_hle::console::current().cli_name(),
     ));
+    gather_host_facts();
+    report::set_platform_dll(platform_dll);
+    report::add_sampler(victory_gpu::report_sample);
+    let _ = report::begin(dir);
+}
+
+/// The host's facts that `victory check` asks for too: Windows, the
+/// processor, memory. (The graphics adapter's come from the GPU side when
+/// it makes its device.)
+#[cfg(windows)]
+fn gather_host_facts() {
     if let Some((major, minor, build)) = victory_gpu::preflight::windows_version() {
         report::host_windows(major, minor, build);
     }
@@ -657,9 +790,51 @@ pub fn start(cfg: &victory_core::Config) {
     ) {
         report::host_memory(installed, free);
     }
-    report::set_platform_dll(platform_dll);
-    report::add_sampler(victory_gpu::report_sample);
-    let _ = report::begin(dir);
+}
+
+/// Before the self-test: its report will want the host's facts, the
+/// adapter's included (`VICTORY_REPORT=0`: none).
+#[cfg(windows)]
+pub fn selftest_begins() {
+    if report::enabled() {
+        report::keep_host_facts();
+        gather_host_facts();
+    }
+}
+
+/// The self-test's report, written when it ends: in `<data_dir>\reports`
+/// (with no config file the default data folder's, as a run's), its path
+/// said on stderr; a warning there if it cannot be written. Nothing if
+/// `VICTORY_REPORT=0`. `sample`: the GPU side's counters are read first,
+/// which a hang or a failure of the GPU skips (its threads may hold what
+/// they need).
+#[cfg(windows)]
+pub fn selftest_ends(test: &report::Selftest, sample: bool) {
+    if !report::enabled() {
+        return;
+    }
+    let dir = victory_core::Config::load().and_then(|cfg| cfg.data_subdir(report::FOLDER));
+    let dir = match dir {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("warning: no self-test report: {e:#}");
+            return;
+        }
+    };
+    // The view heap's size and the like, as before a run's report.
+    if sample {
+        victory_gpu::report_sample();
+    }
+    match report::write_selftest(&dir, test) {
+        // The path names the player's folders: stderr, so that the
+        // self-test's output on stdout can be pasted as it is.
+        Some(path) => eprintln!(
+            "self-test report {} (safe to share in an issue: numbers and Rox-box's own words only; \
+             `victory report` shows it)",
+            path.display()
+        ),
+        None => eprintln!("warning: the self-test report could not be written in {}", dir.display()),
+    }
 }
 
 /// Whether `dll` is the platform's: one our runtime implements or the
@@ -913,6 +1088,66 @@ other = 0
     fn nothing_printed_is_a_path_or_a_file_name() {
         let out = diff_text(BASE, BASE, &DiffOptions { all: true, ..OPTS });
         assert!(!out.contains('\\') && !out.contains(".txt"), "{out}");
+    }
+
+    const SELFTEST: &str = r#"
+format = 3
+kind = "selftest"
+[rox_box]
+version = "0.2.0"
+[host]
+windows_build = 26100
+[host.gpu]
+adapter = "Some Adapter"
+[selftest]
+ended = "completed"
+software_adapter = true
+frames = 8
+stages_ok = 5
+stages_failed = 0
+stages_skipped = 0
+[selftest.switches]
+"VICTORY_D3D12_WARP" = "1"
+[selftest.rates]
+"present_interval" = 2.00
+"buffer_copy" = 1000.00
+[selftest.rate_units]
+"present_interval" = "ms"
+"buffer_copy" = "MB per s"
+[[selftest.stage]]
+name = "Device"
+outcome = "ok"
+[[selftest.stage]]
+name = "Translated draw"
+outcome = "ok"
+"#;
+
+    #[test]
+    fn two_self_tests_compare_their_stages_and_rates() {
+        let b = SELFTEST
+            .replace("\"present_interval\" = 2.00", "\"present_interval\" = 3.00")
+            .replace("name = \"Translated draw\"\noutcome = \"ok\"", "name = \"Translated draw\"\noutcome = \"skip\"");
+        let out = diff_text(SELFTEST, &b, &OPTS);
+        assert!(out.contains("A: Rox-box 0.2.0, self-test on the software adapter, ended completed, 5 ok"), "{out}");
+        assert!(out.contains("stages: 1 with another outcome\n  Translated draw  ok -> skip"), "{out}");
+        assert!(out.contains("switches: same (1 set in each)"), "{out}");
+        let row = out.lines().find(|l| l.trim_start().starts_with("present_interval")).unwrap();
+        assert_eq!(row.split_whitespace().collect::<Vec<_>>(), ["present_interval", "2.00", "3.00", "+1.00", "+50.0", "%"]);
+        let last = out.lines().last().unwrap();
+        assert!(last.starts_with("verdict: "), "{out}");
+        assert!(last.contains("present_interval 2.00 -> 3.00 ms (+50.0 %)"), "{last}");
+        assert!(last.contains("buffer_copy 1000.00 -> 1000.00 MB per s (+0.0 %)"), "{last}");
+        let same = diff_text(SELFTEST, SELFTEST, &OPTS);
+        assert!(same.contains("stages: same outcomes (2 in each)"), "{same}");
+    }
+
+    #[test]
+    fn a_self_test_and_a_run_compare_only_their_pc() {
+        let out = diff_text(BASE, SELFTEST, &OPTS);
+        assert!(out.contains("kinds differ: A is a run report, B a self-test report"), "{out}");
+        assert!(out.contains("host: DIFFERENT") || out.contains("host: same"), "{out}");
+        assert_eq!(out.lines().last(), Some("verdict: a self-test and a run do not compare"));
+        assert!(!out.contains("whole run:"), "{out}");
     }
 
     #[test]

@@ -18,9 +18,10 @@ newest 20 reports are kept; older ones are removed when a run starts.
 The report is written
 
 - when the run ends: the title's entry point returns or it calls `exit`,
-  `abort`, `terminate` or `TerminateProcess` on itself; Rox-box ends it (the
-  window was closed, or the title relaunched itself); an unimplemented import
-  traps; the host GPU fails for good (device removed);
+  `_exit`, `quick_exit`, `ExitProcess`, `abort`, `terminate` or
+  `TerminateProcess` on itself; Rox-box ends it (the window was closed, or
+  the title relaunched itself); an unimplemented import traps; the host GPU
+  fails for good (device removed);
 - on a crash (an unhandled exception): the exception filter only stores how
   the run ended and wakes the report's thread, which writes the file while the
   filter writes `crashes.log`; the filter waits for it at most 2 s;
@@ -34,18 +35,44 @@ At the end of a run one line names the file and says it is safe to share.
 `VICTORY_REPORT=0` turns all of it off: no thread, no file, no host queries.
 (The counters it would read are a handful of atomic adds either way.)
 
+### The self-test's report
+
+`victory selftest` ([selftest.md](selftest.md)) writes a report of its own
+when it ends, through the same renderer and guard:
+`<data_dir>\reports\selftest-<UTC yyyymmdd-hhmmss>.txt` (with no config file
+the default data folder, as for a run; the newest 20 are kept, apart from
+the run reports' 20). Its path is said on stderr, so that the self-test's
+stdout can be pasted as it is; `VICTORY_REPORT=0` writes none. It holds
+`format`, `kind = "selftest"`, `[rox_box]`, `[host]` and `[host.gpu]` as a
+run report does, then:
+
+| Key | Meaning |
+|---|---|
+| **`[selftest]`** | |
+| `ended` | `completed`, `no_device` (no Direct3D 12 device: exit code 3), `hung` (a step had no answer from the GPU for 60 s) or `host_gpu_failed` |
+| `software_adapter`, `frames`, `bench` | What it was asked: `--warp`, `--frames`, `--bench` |
+| `passed`, `stages_ok`, `stages_failed`, `stages_skipped` | Whether no stage failed and it completed; the stages by outcome |
+| **`[selftest.switches]`** | `VICTORY_*` variables set, by the rule below |
+| **`[selftest.rates]`**, **`[selftest.rate_units]`** | With `--bench`: each rate's value, and its unit in words (`MB per s`) |
+| **`[[selftest.stage]]`** | One per stage, in order: `name`, `outcome` (`ok`, `fail`, `skip`) and, for a skip, our fixed `reason` (`needs the device stage`, `needs clear + present`, `the adapter has no shader model 6.6`); for a hang or a GPU failure, the stage it stopped in, `fail`, with that as its reason |
+
+What a stage prints (the adapter's name and driver, a failure's expected
+and found values) is built at run time and is not written: the `FAIL` line
+on the terminal is what says it, and it holds nothing from any title.
+
 ## `victory report`
 
 | Command | Prints |
 |---|---|
-| `victory report` | The newest report, on stdout; then its path, on stderr (so that `victory report \| clip` copies the report alone: the path names your folders) |
-| `victory report --list` | Every report kept, newest first, with how the run ended, how long it ran and its average frame rate |
+| `victory report` | The newest report, a run's or a self-test's, on stdout; then its path, on stderr (so that `victory report \| clip` copies the report alone: the path names your folders) |
+| `victory report --list` | Every report kept, newest first, with how the run ended, how long it ran and its average frame rate; for a self-test, how it ended and its stages by outcome |
 | `victory report --path` | The newest report's path only |
 
 ## Comparing two reports
 
-`victory report --diff` compares the two newest reports (older = A, newer =
-B); `victory report --diff <a> <b>` compares two named ones, each a path to a
+`victory report --diff` compares the two newest reports of the newest one's
+kind (older = A, newer = B: two runs, or two self-tests); `victory report
+--diff <a> <b>` compares two named ones, each a path to a
 report file or a number from `victory report --list` (1 = newest). It needs
 no game folder, and with two paths no config file. It is for an A/B run: the
 same thing run twice with one switch changed. It prints, in plain text meant
@@ -66,6 +93,12 @@ for an issue:
    prints `-` for the other; a key an older format lacks is such a key;
 4. one `verdict:` line of figures only: steady-state frame time, average
    frame rate, draws left out per frame.
+
+Two self-tests' reports compare the same way, with the stages whose
+outcome differs after the switches, `[selftest]` and `[selftest.rates]` as
+the numbers, and the rates both have in the verdict. A self-test's report
+and a run's say which is which, their builds and their PCs, and nothing
+more: their figures are of different things.
 
 Only keys and values that are in the two reports are printed, so the output
 holds what a report holds. The two paths go to stderr, like the one `victory
@@ -144,7 +177,8 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (2; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (3; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
 | **`[host]`** | |
@@ -173,7 +207,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[gpu_work]`** | Per frame (between two presents; the first present's loading is left out), average and most: `submissions`, `draws` (with mesh dispatches) and `dispatches` run on the host, and those `left_out`; `left_out_avg_steady`, the same over the steady state (below); `submissions_total` |
 | **`[gpu_work.left_out]`** | Draws and dispatches the title recorded and the host did not run, the whole run, by reason: `pipeline_not_ready` (not made within the frame's wait budget), `shader_not_translated`, `pipeline_refused` (by the host), `out_of_memory` (constants, scratch, vertices refused), `no_descriptor_slots`, `indirect_not_bounded`, `ray_tracing_builder_off`, `no_pipeline_set`, `other` |
 | **`[frame_time]`** | What a frame cost, per frame over the whole run, from the meters of the log's once-a-second frame line (["Reading the frame figures"](#reading-the-frame-figures)) |
-| **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s` |
+| **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
 | **`[pipelines]`** | `created_by_title`; host pipelines `host_made_now` (compiled during the run) and `host_from_library`; `host_failed` |
 | **`[shaders]`** | Translations `translated_now`, `from_cache`, `failed` |
@@ -190,7 +224,11 @@ says once a second of the frames since its last line, added up over the run
 and divided by the frames the frame meter counted (presents the swap chain
 took). The line takes its meters and sets them to zero, so the report is fed
 where the line takes them (`victory-gpu/src/runreport.rs`, `frame_line` and
-the functions after it) and the log says what it said before.
+the functions after it) and the log says what it said before. The line comes
+once a whole second has passed; what the meters hold of the run's last part
+of a second is taken once more when the report that names the run's end is
+written (`last_meters`), with no line in the log, so `frames` is every
+present the swap chain took (a run's first present only starts the meter).
 
 **The steady state** is the frames from the first 10 s window at or after a
 third of the time from the first present to the report (`from_s`): loading
@@ -199,6 +237,18 @@ fall in the first third. It is by time, not by what was drawn, so a run that
 ends in a long loading screen has some of it in its steady state. Compare the
 two: a figure much higher over the whole run is warm-up; one as high at steady
 state is what every frame pays.
+
+A run with no whole 10 s window after that point (under 30 s from its first
+present) is a short run, and its steady state is the last two thirds of its
+frames by time at the frame meter's resolution: the meter's readings (one a
+second, and the last one when the report is written) begun at or after
+`from_s`, the first whole second from the first present at or after a third
+of the time from it; a comment line says so. A run too short for any such
+reading (the demo title's 40 frames; any run of a second or so, which has one
+reading of all of it) has no steady state:
+`[frame_time.steady]` holds a comment saying why and no figures, and
+`left_out_avg_steady`, `refresh_ms_steady` and `[frame_time.waits.steady]`
+are left out (rather than written as zeros).
 
 | Key | From (the frame line's words) | A high value means |
 |---|---|---|
@@ -273,7 +323,8 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 2
+format = 3
+kind = "run"
 
 [rox_box]
 version = "0.2.0"
@@ -375,6 +426,7 @@ other = 0
 # per frame, from the meters of the log's once-a-second frame line; ms, MB (10^6 bytes)
 # whole run here; [frame_time.steady]: the steady state, the frames from the first
 # 10 s window at or after a third of the time from the first present to this report
+# (a run with no whole window after that: the readings of the frame meter after it)
 frames = 1000
 frame_ms = 20.40
 preparing_ms = 6.20
@@ -526,11 +578,16 @@ calls = 1
 
 ## What it leaves out, and why
 
-- **A title that calls the host's `ExitProcess` itself** ends the process
-  without any code of ours running; the report then is the last periodic one
+- **A title that ends its process in a way not bound to ours** (a direct
+  system call, an import of `ntdll`'s, or any of the C runtime's or
+  `kernel32`'s exits with `VICTORY_TITLE_EXITS=0`) ends it without any code
+  of ours running; the report then is the last periodic one
   (`killed_or_unknown`, at most 30 s old). Writing from the loader's
   process-detach notice is not safe: the other threads are gone by then and
   may have held the heap.
+- **The settles' waits of the last part of a second**
+  (`[frame_time.waits]`) are not taken at the end as the other meters are:
+  they are kept where the log's settle line reads them.
 - **Per-frame submissions and draws** are counted between two presents of any
   queue; with several presenting queues the frames interleave.
 - **Shaders that fail before the translator** (a container that does not
@@ -540,9 +597,11 @@ calls = 1
   thread (memory, slots, indirect bounds), else what its pipeline's state says
   (not made yet, a shader that does not translate, refused); a draw refused
   for any other reason is `other`.
-- **`[frame_time]`** has what the frame line had, and no more: the line's
-  meters, made totals again from its per-frame figures. The frames of a
-  meter's second are counted in the 10 s window it ends in. The card's busy
+- **`[frame_time]`** has what the frame line had, and its last part of a
+  second: the line's meters, made totals again from its per-frame figures.
+  The frames of a meter's second are counted in the 10 s window it ends in
+  (and, for a short run's steady state, the second from the first present it
+  ends in). The card's busy
   share is 100 % when the card's clock could not be made (no idle time is
   then counted).
 - **`first_draw_s`** is known at the present after the first draw, not at the

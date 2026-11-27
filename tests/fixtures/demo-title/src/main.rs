@@ -5,13 +5,17 @@
 //! on every change (docs/demo-title.md).
 //!
 //! Like a title, it imports the console's graphics entry points from
-//! `d3d12_xs.dll`, which no PC has, so only Rox-box can run it; it takes its
-//! arguments from its C runtime (`__p___argc`, `__p___argv`), which Rox-box
-//! gives the ones after `--`; it sets the graphics address range up
+//! `d3d12_xs.dll`, which no PC has, so only Rox-box can run it; it reads its
+//! arguments (the ones after `--`) both from the process's command line
+//! (`GetCommandLineW`, through Rust's `std::env::args`, and
+//! `GetCommandLineA`) and from its C runtime (`__p___argc`, `__p___argv`),
+//! and stops if they disagree; it sets the graphics address range up
 //! (`D3D12ConfigureVirtualMemoryX`) before it makes its device, paces its
 //! frames with the device's frame interval and frame-origin waits, presents
 //! each frame with the token its wait handed out, and ends by returning
-//! from `main` (its C runtime then calls `exit`).
+//! from `main` (its C runtime then calls `exit`), or as asked: with a code
+//! returned from `main`, through the C runtime's `exit`, or through
+//! `ExitProcess`, which skips the C runtime.
 //!
 //! Each frame is the self-test's scene in one list (`victory_standin`, the
 //! code `victory selftest` drives too): a 1 MiB buffer the title changes in
@@ -26,9 +30,12 @@
 //! where (exit code 1).
 //!
 //! `--frames <n>`: frames to render (default 300, five seconds at the 60 a
-//! second it asks for).
+//! second it asks for). After them, `--return <code>` returns `code` from
+//! `main`, `--exit <code>` calls the C runtime's `exit(code)`, and
+//! `--exit-process <code>` calls `ExitProcess(code)` (one of the three).
 
 use std::ffi::{CStr, c_char, c_void};
+use std::io::Write;
 use std::process::ExitCode;
 
 use victory_standin::pc::{
@@ -54,12 +61,19 @@ unsafe extern "system" {
     ) -> HRESULT;
 }
 
-// The C runtime's argument list (`api-ms-win-crt-runtime`): where a
-// title's arguments are, run by Rox-box or not. (Rust's own `std::env::args`
-// reads the process's command line, which under Rox-box is Rox-box's.)
+// The C runtime's argument list and its `exit` (`api-ms-win-crt-runtime`).
 unsafe extern "C" {
     fn __p___argc() -> *mut i32;
     fn __p___argv() -> *mut *mut *mut c_char;
+    fn exit(code: i32) -> !;
+}
+
+// The process's command line, and its end without the C runtime.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCommandLineA() -> *const c_char;
+    fn GetCommandLineW() -> *const u16;
+    fn ExitProcess(code: u32) -> !;
 }
 
 extern "system" fn create_device(
@@ -87,10 +101,29 @@ const FRAMES: u32 = 300;
 const INTERVAL_US: u32 = 16_667;
 
 fn main() -> ExitCode {
-    let frames = match frames_asked() {
-        Ok(frames) => frames,
+    // A title's command line reads the same however it is read: the C
+    // runtime's list and the process's line (which Rust's `std::env::args`
+    // parses, as the C runtime does).
+    let (crt, win32) = (crt_args(), win32_args());
+    if crt != win32 {
+        println!("demo title failed: its command line (GetCommandLineW) and its C runtime's arguments disagree");
+        return ExitCode::FAILURE;
+    }
+    if !lines_agree() {
+        println!("demo title failed: GetCommandLineA and GetCommandLineW say different command lines");
+        return ExitCode::FAILURE;
+    }
+    if crt.first().is_none_or(|program| program.contains(['\\', '/'])) {
+        println!("demo title failed: its command line does not start with its own name alone");
+        return ExitCode::FAILURE;
+    }
+    let (frames, end) = match asked(&crt[1..]) {
+        Ok(asked) => asked,
         Err(problem) => {
-            println!("demo title: {problem} (it takes --frames <n>, 1 or more)");
+            println!(
+                "demo title: {problem} (it takes --frames <n>, 1 or more, and one of --return, --exit \
+                 or --exit-process <code>)"
+            );
             return ExitCode::from(2);
         }
     };
@@ -99,7 +132,14 @@ fn main() -> ExitCode {
             println!(
                 "demo title: {frames} frames rendered and presented; every value it read back from its own memory matched"
             );
-            ExitCode::SUCCESS
+            let _ = std::io::stdout().flush();
+            match end {
+                End::Return(code) => ExitCode::from(code),
+                // SAFETY: the C runtime's `exit`; nothing of ours runs after it.
+                End::Exit(code) => unsafe { exit(code) },
+                // SAFETY: as above, without the C runtime's exit functions.
+                End::ExitProcess(code) => unsafe { ExitProcess(code) },
+            }
         }
         Err(Failed(reason)) => {
             println!("demo title failed: {reason}");
@@ -108,8 +148,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// The arguments after the program's name, from the C runtime.
-fn title_args() -> Vec<String> {
+/// How the demo ends once its frames are done.
+enum End {
+    Return(u8),
+    Exit(i32),
+    ExitProcess(u32),
+}
+
+/// The program's name and the arguments, from the C runtime.
+fn crt_args() -> Vec<String> {
     // SAFETY: the C runtime's own list, made before `main` and never
     // changed: `argc` NUL-terminated strings.
     unsafe {
@@ -117,7 +164,7 @@ fn title_args() -> Vec<String> {
         if argv.is_null() {
             return Vec::new();
         }
-        (1..argc.max(0) as usize)
+        (0..argc.max(0) as usize)
             .map(|i| *argv.add(i))
             .filter(|a| !a.is_null())
             .map(|a| CStr::from_ptr(a).to_string_lossy().into_owned())
@@ -125,23 +172,60 @@ fn title_args() -> Vec<String> {
     }
 }
 
-fn frames_asked() -> Result<u32, String> {
-    let args = title_args();
+/// The same from the process's command line (`GetCommandLineW`, which
+/// Rust's standard library parses).
+fn win32_args() -> Vec<String> {
+    std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Whether the narrow and the wide command line are the same text (where
+/// it is plain ASCII, as the demo's is: the narrow one is in the ANSI code
+/// page).
+fn lines_agree() -> bool {
+    // SAFETY: both return the process's NUL-terminated command line, which
+    // lives as long as the process.
+    unsafe {
+        let narrow = CStr::from_ptr(GetCommandLineA()).to_bytes();
+        let wide = GetCommandLineW();
+        let wide = std::slice::from_raw_parts(wide, (0..).take_while(|&i| *wide.add(i) != 0).count());
+        !narrow.is_ascii() || narrow.iter().map(|&b| u16::from(b)).eq(wide.iter().copied())
+    }
+}
+
+fn asked(args: &[String]) -> Result<(u32, End), String> {
     let mut args = args.iter();
     let mut frames = FRAMES;
+    let mut end = None;
+    let code = |what: &str, arg: Option<&String>| -> Result<u32, String> {
+        arg.and_then(|n| n.parse().ok())
+            .filter(|&n: &u32| n <= 255)
+            .ok_or_else(|| format!("{what} needs a code from 0 to 255"))
+    };
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        let ends = match arg.as_str() {
             "--frames" => {
                 frames = args
                     .next()
                     .and_then(|n| n.parse().ok())
                     .filter(|&n| n > 0)
                     .ok_or("--frames needs a number")?;
+                None
             }
+            "--return" => Some(End::Return(code(arg, args.next())? as u8)),
+            "--exit" => Some(End::Exit(code(arg, args.next())? as i32)),
+            "--exit-process" => Some(End::ExitProcess(code(arg, args.next())?)),
             other => return Err(format!("unknown argument {other:?}")),
+        };
+        if let Some(ends) = ends {
+            if end.is_some() {
+                return Err("only one of --return, --exit and --exit-process".to_owned());
+            }
+            end = Some(ends);
         }
     }
-    Ok(frames)
+    Ok((frames, end.unwrap_or(End::Return(0))))
 }
 
 /// The quarters of the target: the two draws take the top ones, the clear
