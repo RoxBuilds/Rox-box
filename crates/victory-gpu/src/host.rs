@@ -4527,8 +4527,18 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
-        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        static RUNS: OnceLock<Option<usize>> = OnceLock::new();
+        // The most changed runs of title bytes under flights' writes one
+        // submission sends up as copies of their own (`VICTORY_UNDER_RUNS=<n>`;
+        // unset: 4,096 with card steps, else 512, as before), for a run whose
+        // log counts many ranges left to a wait for "more changed runs than
+        // a submission sends up". Each run is a copy command on the card.
+        let asked = *RUNS.get_or_init(|| std::env::var("VICTORY_UNDER_RUNS").ok().and_then(|v| v.trim().parse().ok()));
+        let mut runs_left = asked.unwrap_or(if card_steps::stage() > 0 { 4096 } else { 512 });
+        // And memory nothing watches, compared whole up to a budget
+        // (`VICTORY_UNDER_UNWATCHED_MB`; none by default).
+        let mut whole_left = crate::shadow::under_unwatched_bytes();
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left, &mut whole_left));
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -5245,10 +5255,15 @@ fn late_line(frames: f64) {
     log_blame(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [unwatched, journal, over, snapshot, whole, whole_bytes] = crate::shadow::stale_left().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; left to a wait for the flights: {unwatched:.2} copies of memory not \
+             watched, {journal:.2} ranges the journal could not say, {over:.2} more changed runs than a submission \
+             sends up, {snapshot:.2} without a snapshot; memory not watched compared whole (VICTORY_UNDER_UNWATCHED_MB): \
+             {whole:.1} ranges, {:.2} MB",
+            bytes / (1 << 20) as f64,
+            whole_bytes / (1 << 20) as f64
         );
     }
 }
@@ -11061,6 +11076,8 @@ impl Meter {
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
         crate::runreport::heap_buffers(frames, picked, picked_ms);
+        let [views_ms, textures_ms, past_ms] =
+            crate::draw::HEAP_SIDES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -11170,7 +11187,9 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms (the texture side \
+                 {textures_ms:.1}, {past_ms:.1} of it past the pass's time; the buffer views {views_ms:.1}, on the \
+                 thread beside with VICTORY_HEAP_PASS_ASIDE);                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
@@ -12917,7 +12936,7 @@ mod refresh_tests {
                 for c in &carded {
                     if c.shadow.writes_pending() {
                         let mut runs = usize::MAX;
-                        assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs), "round {round}");
+                        assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs, &mut 0), "round {round}");
                     }
                 }
                 let mut ranges = Vec::new();
@@ -13040,7 +13059,7 @@ mod refresh_tests {
             }
             let started = std::time::Instant::now();
             let mut runs = usize::MAX;
-            assert!(!copy.merge_under_writes(big, BIG, &mut runs));
+            assert!(!copy.merge_under_writes(big, BIG, &mut runs, &mut 0));
             best = best.min(started.elapsed().as_secs_f64() * 1e3);
             copy.take_dirty();
         }

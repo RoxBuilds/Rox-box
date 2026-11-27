@@ -30,6 +30,41 @@ the state before it):
 | AVX2 multi-threaded comparison of shader-written buffers | that step two to three times faster |
 | Filtering guarded writes before resetting protections | that step's CPU time about a tenth of what it was |
 
+## One run on a small card and a PC short of memory
+
+The log of one run at about 2 frames a second, in the world, said this of
+its frames (shares of a frame; not confirmed on any other PC):
+
+- **Waiting for flights.** About a quarter of every frame the submitting
+  thread stood for the card in settles for "title memory changed under
+  shader writes": under one a frame, each until nearly all the work in the
+  air had landed. Such settles came in seconds where the title's bytes under
+  the flights' writes had no changed run at all, so they were not runs over
+  what a submission sends up but ranges the merge could not look at: memory
+  that is neither write-watched nor guarded, of which nothing says which
+  pages the title wrote. `VICTORY_UNDER_UNWATCHED_MB=<n>` (off by default)
+  compares such ranges whole, page by page, up to n MiB a submission, and
+  puts in only what differs, as the pages the journal names are put in. The
+  log line "title bytes put in under flights' shader writes" now counts why
+  each range was left to a wait, in every build.
+- **"heap buffers ... ms".** With the pass over the buffer views beside
+  (`VICTORY_HEAP_PASS_ASIDE`), the figure is the texture side of the pass
+  (textures picked by index made and staged), which takes a share of the
+  time since the pass before (`VICTORY_TEXTURE_STAGE_SHARE`, a tenth; three
+  times that with a backlog). It was a tenth of the frame in most seconds: it
+  swings with the frame time, and shrinks with it. The frame line now gives
+  the texture side, the time its slots ran past the pass's own time, and the
+  buffer views' pass apart.
+- **Compares for shader writes.** Of the bytes compared on the CPU about a
+  quarter were on pages with a new byte; of the pieces compared on the card,
+  under one in fifty was fetched. A narrower written set (the root parameters
+  and table ranges a program can store through) would leave out only views no
+  store goes through: a root view's range is the rest of its buffer whatever
+  its shaders store. The line "shader writes declared by draws and
+  dispatches" now splits root views from views in tables, to tell whether it
+  is worth building; the compares run beside the submitting thread, and the
+  card's are a small part of its time.
+
 ## Faults found and resolved
 
 - **Missing compute texture read-back.** Textures written by compute shaders and

@@ -137,6 +137,19 @@ behaviour before it.
 - **Card-compare coalescing & TDR guards:** `VICTORY_CARD_JOIN=<k>`,
   `VICTORY_WAVE_GUARD`, and `VICTORY_WAVE_PAIR_ROUNDS=4096` reduce GPU hang risk
   and redundant card-side memory comparisons.
+- **Title bytes of memory nothing watches, under flights' writes**
+  (`VICTORY_UNDER_UNWATCHED_MB=<n>`, off by default; try 32 in an A/B run).
+  Ranges of such memory that flights' shaders may write, and that the next
+  submission refreshes, are compared whole up to n MiB a submission instead
+  of waiting for those flights ([findings](findings.md#one-run-on-a-small-card-and-a-pc-short-of-memory)).
+  If it does what it is for, the report's `[frame_time.waits.steady]`
+  `title_memory_changed_under_shader_writes` and `[frame_time.steady]`
+  `waiting_for_card_ms` fall by most of the former, the log's "left to a wait
+  for the flights" counts of memory not watched fall to near 0, and "compared
+  whole" shows the ranges and MB that took their place. Where that line
+  counts many ranges left for "more changed runs than a submission sends
+  up" instead, `VICTORY_UNDER_RUNS=<n>` raises that limit (4,096 with card
+  steps, as before when unset).
 
 ## Display, timing & pre-warming
 

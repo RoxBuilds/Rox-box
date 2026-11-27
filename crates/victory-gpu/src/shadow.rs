@@ -2070,6 +2070,7 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let d = DECLARED.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
@@ -2086,6 +2087,31 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    tracing::info!(
+        "shader writes declared by draws and dispatches per frame (each declaration, repeats counted): {:.0} through root \
+         views, {:.1} MB (a root view has no size: to the end of its buffer, VICTORY_ROOT_UAV_MB), {:.0} through views in \
+         tables, {:.1} MB",
+        d[0],
+        mb(d[1]),
+        d[2],
+        mb(d[3]),
+    );
+}
+
+/// Since the last frame-rate line: shader writes declared through root
+/// views (count, bytes) and through unordered views in tables (count,
+/// bytes), as the draws and dispatches declare them (`crate::draw`). Whether
+/// a narrower declaration would pay depends on which of them holds the
+/// bytes compared for nothing: a root view's range is the rest of its
+/// buffer whatever its shaders write, a table's view its own range.
+static DECLARED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A draw or dispatch declares `len` bytes written through a root view
+/// (`root`) or a view in a table.
+pub(crate) fn declared(root: bool, len: u64) {
+    let at = if root { 0 } else { 2 };
+    DECLARED[at].fetch_add(1, Ordering::Relaxed);
+    DECLARED[at + 1].fetch_add(len, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -2366,8 +2392,50 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Since the last frame-rate line: how often [`Shadow::merge_under_writes`]
+/// left the caller to wait, by why (the places of [`stale_why`]); then the
+/// ranges and bytes of memory nothing watches that it compared whole
+/// instead ([`under_unwatched_bytes`]). In every build: the log of a run
+/// without diagnostics said how long the submitting thread waited for
+/// "title memory changed under shader writes", and nothing of why.
+static STALE_LEFT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 fn note_stale(why: usize) {
     STALE_WHY.store(why, Ordering::Relaxed);
+    STALE_LEFT[why.min(3)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`STALE_LEFT`], taken.
+pub(crate) fn stale_left() -> [u64; 6] {
+    std::array::from_fn(|i| STALE_LEFT[i].swap(0, Ordering::Relaxed))
+}
+
+/// The bytes of memory that is not write-watched (nor guarded) that one
+/// submission's [`Shadow::merge_under_writes`] compares whole, page by
+/// page, where flights' shaders may write it and the submission refreshes
+/// it (`VICTORY_UNDER_UNWATCHED_MB`, MiB; 0, the default: none, the
+/// flights are waited for as before).
+///
+/// Of such memory nothing says which pages the title wrote, so a range of
+/// it under a flight's declared writes was always left to a wait: the
+/// submitting thread stood until the flights that declared it had landed,
+/// most of the card's work of a frame each time. The refresh of that
+/// memory copies all of it outside the declared ranges anyway; inside
+/// them each page is compared with the copy's reference (its CPU side, or
+/// the snapshot), as a page the journal names is, and only the bytes that
+/// differ go in. Within the budget; a range past what is left of it waits
+/// as before.
+///
+/// What changes when it is on: as with the pages the journal names
+/// (`crate::host::late_exact`), the title's bytes of such memory reach a
+/// copy in the PC's memory while a flight's shaders may read it there (a
+/// copy in the card's memory takes them in the next submission's sends, behind the
+/// flight), and a byte both wrote is the title's if the shader wrote it
+/// first. Off by default until a run has compared both.
+pub(crate) fn under_unwatched_bytes() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_UNDER_UNWATCHED_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+        << 20
 }
 
 /// [`STALE_WHY`] in words (diagnostics).
@@ -4102,10 +4170,21 @@ impl Shadow {
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
+    /// Where nothing says which pages the title wrote (memory that is not
+    /// watched), up to `whole_left` bytes are compared whole, every page
+    /// ([`under_unwatched_bytes`]), and what they take is taken off it.
+    ///
     /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// cannot say what was written (and `whole_left` is too little), a
+    /// snapshot is missing, or `runs_left` ran out. Pages done before that
+    /// stay done.
+    pub(crate) fn merge_under_writes(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+        whole_left: &mut usize,
+    ) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4122,7 +4201,8 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        let unwatched = self.watched.load(Ordering::Relaxed) == NOT_WATCHED;
+        if unwatched && *whole_left == 0 {
             note_stale(0);
             return true;
         }
@@ -4130,7 +4210,7 @@ impl Shadow {
         // dozens of offsets): as one range each page is asked about and
         // compared once. Every byte of it is in a declared range, and of a
         // copy in the PC's memory in the snapshot.
-        let busy = if crate::watch::light() { joined(busy) } else { busy };
+        let busy = if unwatched || crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -4139,13 +4219,24 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all the cases seen: the flights were settled
             // several times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+            let known = if unwatched { None } else { crate::watch::writes(a, e, true) };
+            // The asking whose answer the pages taken are noted with; none
+            // for memory nothing watches, every page of which is compared.
+            let (now, stale): (Option<u64>, Vec<usize>) = match known {
+                Some((now, written)) => {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    (Some(now), stale_pages_in(base, &copied, a, e, &written))
+                }
+                None if e - a <= *whole_left => {
+                    *whole_left -= e - a;
+                    STALE_LEFT[4].fetch_add(1, Ordering::Relaxed);
+                    STALE_LEFT[5].fetch_add((e - a) as u64, Ordering::Relaxed);
+                    (None, (a / PAGE..e.div_ceil(PAGE)).collect())
+                }
+                None => {
+                    note_stale(if unwatched { 0 } else { 1 });
+                    return true;
+                }
             };
             if stale.is_empty() {
                 continue;
@@ -4217,7 +4308,7 @@ impl Shadow {
             }
             drop(before);
             drop(merging);
-            {
+            if let Some(now) = now {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
@@ -5419,7 +5510,7 @@ mod land_tests {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
                     let mut runs = usize::MAX;
-                    assert!(!shadow.merge_under_writes(title, LEN, &mut runs));
+                    assert!(!shadow.merge_under_writes(title, LEN, &mut runs, &mut 0));
                     // Sent up, as the preparing of a submission would: noted
                     // with a number behind the fetches'.
                     let card = shadow.card.as_ref().expect("made with one");
@@ -5452,6 +5543,80 @@ mod land_tests {
             let last = writer.join().expect("nothing undone");
             assert!((1..LEN / 4).step_by(4 * 331).all(|i| dword(i).load(Ordering::Relaxed) == last));
         });
+    }
+
+    /// Memory nothing watches (private, not write-watched), under a
+    /// flight's declared writes, which the title wrote in and beside:
+    /// without a budget ([`under_unwatched_bytes`]) the caller waits, as
+    /// before, and past it too; within it the title's changed bytes in the
+    /// declared range go into the copy's reference (the CPU's side of a
+    /// copy in the card's memory, which sends them up; the snapshot and the
+    /// copy itself of one in the PC's memory), and nothing else does.
+    #[test]
+    fn title_bytes_of_unwatched_memory_go_in_under_writes_within_a_budget() {
+        let _views = crate::test_views_lock();
+        assert!(crate::safecopy::on());
+        const LEN: usize = 4 * PIECE;
+        // (offset, bytes) the title writes: two in the declared range, one
+        // below it, which is the refresh's.
+        const WRITES: [(usize, usize); 3] = [(PIECE + 100, 4), (2 * PIECE + 4000, 8), (40, 4)];
+        let declared = (PIECE, 3 * PIECE);
+        // SAFETY: memory of `LEN` bytes of the test's own.
+        let bytes = |at: usize| unsafe { std::slice::from_raw_parts_mut(at as *mut u8, LEN) };
+        for (card, watched) in [(true, super::NOT_WATCHED), (true, 0), (false, super::NOT_WATCHED)] {
+            let title = memory(LEN, false);
+            let shadow = if card {
+                match copy_of(title, LEN) {
+                    Some(shadow) => shadow,
+                    None => return, // no host GPU
+                }
+            } else {
+                let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(LEN as u64)) else {
+                    return;
+                };
+                Shadow::new(buffer, data, 0, title as u64, LEN as u64)
+            };
+            // Not asked about yet (0: the kernel and the guards then say
+            // nothing), or known not to be watched.
+            shadow.watched.store(watched, Ordering::Relaxed);
+            let base: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+            bytes(title).copy_from_slice(&base);
+            bytes(shadow.data as usize).copy_from_slice(&base);
+            if !card {
+                *shadow.before.lock().unwrap() = Some(base.clone());
+            }
+            shadow.pending.lock().unwrap().push((title + declared.0, title + declared.1));
+            for (at, n) in WRITES {
+                bytes(title)[at..at + n].iter_mut().for_each(|b| *b = !*b);
+            }
+            let mut runs = usize::MAX;
+            assert!(shadow.merge_under_writes(title, LEN, &mut runs, &mut 0), "no budget: the flights are waited for");
+            let mut whole = PIECE;
+            assert!(shadow.merge_under_writes(title, LEN, &mut runs, &mut whole), "past the budget");
+            assert_eq!(whole, PIECE, "nothing of the budget taken by a range past it");
+            assert_eq!(bytes(shadow.data as usize), &base[..], "nothing put in while waiting");
+            let mut whole = LEN;
+            assert!(!shadow.merge_under_writes(title, LEN, &mut runs, &mut whole), "within the budget");
+            assert_eq!(whole, LEN - (declared.1 - declared.0));
+            let mut expect = base.clone();
+            for (at, n) in WRITES.into_iter().filter(|&(at, _)| at >= declared.0 && at < declared.1) {
+                expect[at..at + n].copy_from_slice(&bytes(title)[at..at + n]);
+            }
+            assert!(bytes(shadow.data as usize) == &expect[..], "the declared range's changed bytes, and only those");
+            if let Some(card) = &shadow.card {
+                let dirty = card.dirty.lock().unwrap().clone();
+                let inside = |&(from, to): &(usize, usize)| {
+                    WRITES[..2].iter().any(|&(at, n)| from >= at / 4 * 4 && to <= (at + n).div_ceil(4) * 4)
+                };
+                assert!(!dirty.is_empty() && dirty.iter().all(inside), "sent up: the changed words alone ({dirty:?})");
+            } else {
+                assert!(shadow.before.lock().unwrap().as_deref() == Some(&expect[..]), "the snapshot takes them too");
+            }
+            // Nothing changed since: compared again, nothing more goes in.
+            let mut whole = LEN;
+            assert!(!shadow.merge_under_writes(title, LEN, &mut runs, &mut whole));
+            assert!(bytes(shadow.data as usize) == &expect[..]);
+        }
     }
 }
 

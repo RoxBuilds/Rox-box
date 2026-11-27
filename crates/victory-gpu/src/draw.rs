@@ -551,6 +551,16 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of the passes, microseconds since the last frame line, in every build:
+/// the pass over the buffer views ([`heap_buffer_pass`], on the thread
+/// beside with `VICTORY_HEAP_PASS_ASIDE`, where [`HEAP_BUFFER_MICROS`] does not
+/// see it); the texture side ([`State::heap_textures`], on the recording
+/// thread, inside [`HEAP_BUFFER_MICROS`]); of that, the time its slots
+/// took past the pass's own time (a slot begun just before the end runs to
+/// its end: making a host texture, waiting for its memory, reading title
+/// memory the PC had paged out). With the buffer views' pass beside, the
+/// frame line's "heap buffers ... ms" was nearly all the texture side.
+pub(crate) static HEAP_SIDES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
 /// the spans and refreshes of their copies, the texture side.
 #[cfg(feature = "diagnostics")]
@@ -1103,6 +1113,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             "buffer views of the heap made ready for shaders that pick them by index"
         );
     }
+    HEAP_SIDES[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     found
 }
 
@@ -1988,6 +1999,7 @@ impl State {
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, self.pipeline);
+                crate::shadow::declared(true, len);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2202,7 +2214,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
+        let textures = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_SIDES[1].fetch_add(textures.elapsed().as_micros() as u64, Ordering::Relaxed);
         stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3026,6 +3040,11 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        // (A run made early has a budget of its own, and is not the pass's.)
+        if PASS_BUDGET.get().is_none() {
+            let past = began.elapsed().saturating_sub(span);
+            HEAP_SIDES[2].fetch_add(past.as_micros() as u64, Ordering::Relaxed);
         }
         if baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
@@ -4644,6 +4663,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
+                crate::shadow::declared(false, len);
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
