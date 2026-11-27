@@ -6,12 +6,15 @@
 //! those counters into the report just before one is written, so nothing is
 //! added to a frame's path for them. What is fed as it happens is cheap: a
 //! present, a draw or dispatch left out (with its reason), the host device's
-//! facts once.
+//! facts once. The meters of the once-a-second frame line are taken with
+//! `swap(0)` by the line itself, so the line gives them here as it takes them
+//! ([`frame_line`] and the functions after it), once a second; the budget
+//! governor gives its looks.
 
 use std::cell::Cell;
 use std::sync::atomic::Ordering::Relaxed;
 
-use victory_pipeline::report::{self, GpuFacts, HostText, LeftOut, Stat};
+use victory_pipeline::report::{self, Figure, GpuFacts, HostText, LeftOut, Stat};
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
     D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2,
@@ -59,6 +62,106 @@ pub(crate) fn presented() {
 /// the card's own memory and of the PC's shared with it).
 pub(crate) fn video_memory(card: [u64; 2], shared: [u64; 2]) {
     report::video_memory(card, shared);
+}
+
+/// Free physical memory and commit headroom now (bytes; `u64::MAX` not
+/// known), as the budget governor asked the system.
+pub(crate) fn system_memory(free_ram: u64, commit_headroom: u64) {
+    report::memory_seen(free_ram, commit_headroom);
+}
+
+/// A look of the budget governor (about once a second): its level, and
+/// whether the card's own memory is past its budget.
+pub(crate) fn governor_look(s: &crate::host::budget::Sample, level: crate::host::budget::Level) {
+    use crate::host::budget::Level;
+    let level = match level {
+        Level::Green => 1,
+        Level::Yellow => 2,
+        Level::Red => 3,
+    };
+    report::memory_look(level, s.card);
+}
+
+// The frame line's figures. It takes its meters with `swap(0)` and says them
+// per frame, so they are given here as it has them (ms and MB of 10^6 bytes
+// per frame over `frames` frames) and made totals again; once a second.
+
+/// A total from `per_frame` over `frames` (`as` makes a negative or NaN 0).
+fn total(per_frame: f64, frames: f64) -> u64 {
+    (per_frame * frames).round() as u64
+}
+
+fn us(ms: f64, frames: f64) -> u64 {
+    total(ms * 1e3, frames)
+}
+
+/// The frame line's own figures (`host`, `Meter::frame`): the meter's
+/// `frames` and `elapsed`; per frame, ms preparing submissions, of it copies
+/// (ms, MB) and textures (ms, MB), ms waiting for the GPU, and copying back
+/// (ms, MB). With the queue of textures picked by index, as it stands.
+pub(crate) fn frame_line(frames: f64, elapsed: std::time::Duration, figures: [f64; 8]) {
+    let [cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb] = figures;
+    report::figures(&[
+        (Figure::Frames, frames as u64),
+        (Figure::MeterUs, elapsed.as_micros() as u64),
+        (Figure::PreparingUs, us(cpu, frames)),
+        (Figure::CopiesUpUs, us(copy_ms, frames)),
+        (Figure::CopiesUpBytes, total(copy_mb * 1e6, frames)),
+        (Figure::TextureRefreshUs, us(texture_ms, frames)),
+        (Figure::TextureRefreshBytes, total(texture_mb * 1e6, frames)),
+        (Figure::CardWaitUs, us(gpu, frames)),
+        (Figure::CopyBackUs, us(back_ms, frames)),
+        (Figure::CopyBackBytes, total(back_mb * 1e6, frames)),
+    ]);
+    report::max(
+        Stat::PickedWaitingMost,
+        crate::draw::HEAP_TEXTURES_QUEUE[2].load(Relaxed),
+    );
+}
+
+/// The card's clock per frame (`host::card_clock_line`): ms with nothing of
+/// ours queued, of that while the submitting thread worked, and ms that
+/// thread stood waiting for the card.
+pub(crate) fn card_clock(frames: f64, [idle, behind, stood]: [f64; 3]) {
+    report::figures(&[
+        (Figure::CardIdleUs, us(idle, frames)),
+        (Figure::CardIdleBehindUs, us(behind, frames)),
+        (Figure::StoodUs, us(stood, frames)),
+    ]);
+}
+
+/// The waiting for the card in settles per frame, ms, by what settled, in the
+/// order of the log line (`host::late_line`): a synchronous submission or
+/// present, the card had run them, a wait for a memory value, title memory
+/// changed under shader writes, title memory read, a step of ours, lists in
+/// the air, bottom-of-pipe writes, a blocking fence wait.
+pub(crate) fn settle_waits(frames: f64, ms: [f64; 9]) {
+    let causes = [
+        Figure::SettledSync,
+        Figure::SettledCardDone,
+        Figure::SettledValue,
+        Figure::SettledStale,
+        Figure::SettledRead,
+        Figure::SettledStep,
+        Figure::SettledMost,
+        Figure::SettledWrites,
+        Figure::SettledFence,
+    ];
+    let values: [(Figure, u64); 9] = std::array::from_fn(|i| (causes[i], us(ms[i], frames)));
+    report::figures(&values);
+}
+
+/// Passes over the heap's buffer views per frame, and their ms.
+pub(crate) fn heap_buffers(frames: f64, passes: f64, ms: f64) {
+    report::figures(&[
+        (Figure::HeapBufferPasses, total(passes, frames)),
+        (Figure::HeapBufferUs, us(ms, frames)),
+    ]);
+}
+
+/// Texture refreshes on all threads per frame, ms.
+pub(crate) fn texture_refreshes(frames: f64, ms: f64) {
+    report::figures(&[(Figure::RefreshAllUs, us(ms, frames))]);
 }
 
 /// The host GPU failed for good (`crate::host::fail`): the report says so,
@@ -196,6 +299,35 @@ pub fn sample() {
     if limit > 0 {
         report::set(Stat::ViewHeapViews, u64::from(limit) + 1);
     }
+    let [critical, held, refused] = crate::host::commit::counts();
+    report::set(Stat::CommitCritical, critical);
+    report::set(Stat::CommitHeldBack, held);
+    report::set(Stat::CommitRefusals, refused);
+    for (waits, [times, us, longest]) in [
+        (&crate::host::RESIDENT, [Stat::ResidentWaits, Stat::ResidentUs, Stat::ResidentLongestUs]),
+        (&crate::host::MAPPED, [Stat::MappedWaits, Stat::MappedUs, Stat::MappedLongestUs]),
+    ] {
+        report::set(times, waits[0].load(Relaxed));
+        report::set(us, waits[1].load(Relaxed));
+        report::set(longest, waits[2].load(Relaxed));
+    }
+    use crate::draw::{
+        HEAP_TEXTURE_BYTES, HEAP_TEXTURES, HEAP_TEXTURES_FULL, HEAP_TEXTURES_QUEUE,
+        HEAP_TEXTURES_RECHECKED, HEAP_TEXTURES_REUPLOADED_FULL,
+    };
+    report::set(Stat::PickedUploaded, HEAP_TEXTURES.load(Relaxed));
+    report::set(Stat::PickedBytes, HEAP_TEXTURE_BYTES.load(Relaxed));
+    let waiting = HEAP_TEXTURES_QUEUE[2].load(Relaxed);
+    report::set(Stat::PickedWaitingLast, waiting);
+    report::max(Stat::PickedWaitingMost, waiting);
+    report::set(Stat::PickedNoRoom, HEAP_TEXTURES_FULL.load(Relaxed));
+    report::set(Stat::PickedChangedUnseen, HEAP_TEXTURES_RECHECKED[1].load(Relaxed));
+    report::set(
+        Stat::PickedReuploadedFull,
+        HEAP_TEXTURES_REUPLOADED_FULL.load(Relaxed),
+    );
+    report::set(Stat::TailCopies, crate::resource::TAILS[0].load(Relaxed));
+    report::set(Stat::TailBytes, crate::resource::TAILS[1].load(Relaxed));
     // One more look at video memory (at most every 32 ms, and it feeds the
     // peaks), in case nothing else asked lately.
     let _ = crate::host::budget::sample();
@@ -245,5 +377,24 @@ mod tests {
     #[test]
     fn the_sampler_runs_without_a_run() {
         sample();
+    }
+
+    /// The frame line's per-frame figures are made totals again, whatever
+    /// they hold; the feeds run with or without a report being kept.
+    #[test]
+    fn per_frame_figures_are_made_totals_again() {
+        assert_eq!(us(6.2, 30.0), 186_000);
+        assert_eq!(total(4.1 * 1e6, 30.0), 123_000_000);
+        assert_eq!(total(-1.0, 30.0), 0);
+        assert_eq!(total(f64::NAN, 30.0), 0);
+        assert_eq!(total(f64::INFINITY, 1.0), u64::MAX);
+        frame_line(30.0, std::time::Duration::from_secs(1), [6.2, 1.0, 4.1, 2.0, 12.0, 7.5, 1.2, 0.9]);
+        card_clock(30.0, [6.1, 4.0, 7.0]);
+        settle_waits(30.0, [2.0, 0.5, 0.0, 1.5, 1.2, 0.3, 0.0, 0.8, 0.2]);
+        heap_buffers(30.0, 2.0, 0.4);
+        texture_refreshes(30.0, 4.5);
+        system_memory(u64::MAX, u64::MAX);
+        let s = crate::host::budget::Sample::UNKNOWN;
+        governor_look(&s, crate::host::budget::Level::Green);
     }
 }

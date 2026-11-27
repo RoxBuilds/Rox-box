@@ -39,8 +39,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ord
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The report format's version, the first key of every report.
-pub const FORMAT: u32 = 1;
+/// The report format's version, the first key of every report. 2 added the
+/// frame line's figures (`[frame_time]`), memory pressure, textures picked by
+/// index and pipelines the title went without.
+pub const FORMAT: u32 = 2;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -317,9 +319,43 @@ pub enum Stat {
     DisplayHeight,
     /// Panics of ours.
     Panics,
+    /// Calls of a pipeline creation method that is not implemented (each a
+    /// pipeline the title went without).
+    PipelinesGoneWithout,
+    /// Times the commit guard found commit critical (crossing its line), its
+    /// stagings held back, and the allocations refused it saw, so far.
+    CommitCritical,
+    CommitHeldBack,
+    CommitRefusals,
+    /// Waits for new memory to be made resident, and for new card memory to
+    /// be mapped: times, microseconds in all, the longest (microseconds).
+    ResidentWaits,
+    ResidentUs,
+    ResidentLongestUs,
+    MappedWaits,
+    MappedUs,
+    MappedLongestUs,
+    /// Looks of the budget governor that found the card's own memory in use
+    /// past its budget.
+    CardOverBudgetLooks,
+    /// Textures picked by index: uploaded so far and their bytes; slots
+    /// waiting for their memory, the most and the last seen; passes that
+    /// found the card with no room; uploads again of a texture that changed
+    /// with nothing to tell of it; uploads of textures on the card made while
+    /// it had no room; host copies of only the smallest levels and their
+    /// bytes.
+    PickedUploaded,
+    PickedBytes,
+    PickedWaitingMost,
+    PickedWaitingLast,
+    PickedNoRoom,
+    PickedChangedUnseen,
+    PickedReuploadedFull,
+    TailCopies,
+    TailBytes,
 }
 
-const STATS: usize = Stat::Panics as usize + 1;
+const STATS: usize = Stat::TailBytes as usize + 1;
 static STAT: [AtomicU64; STATS] = [const { AtomicU64::new(0) }; STATS];
 
 /// One more of `stat`.
@@ -419,6 +455,45 @@ pub fn video_memory(local: [u64; 2], shared: [u64; 2]) {
 pub fn display_mode(width: u32, height: u32) {
     set(Stat::DisplayWidth, u64::from(width));
     set(Stat::DisplayHeight, u64::from(height));
+}
+
+/// The lowest free physical memory and commit headroom seen, in bytes
+/// (`u64::MAX`: never seen).
+static LOWEST: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
+
+/// Free physical memory and commit headroom now, in bytes, as the budget
+/// governor asks the system (at most every 32 ms): keeps the lowest.
+/// `u64::MAX` (not known) changes nothing.
+pub fn memory_seen(free_ram: u64, commit_headroom: u64) {
+    LOWEST[0].fetch_min(free_ram, Relaxed);
+    LOWEST[1].fetch_min(commit_headroom, Relaxed);
+}
+
+/// Microseconds at each level of the budget governor (green, yellow, red),
+/// the time of its last look and the level it found then (1 green, 2
+/// yellow, 3 red; 0 none yet).
+static GOVERNOR_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAST_LOOK_US: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_LEVEL: AtomicU64 = AtomicU64::new(0);
+
+/// A look of the budget governor (about once a second) that found `level`
+/// (1 green, 2 yellow, 3 red) and the card's own memory at `card` (`[budget,
+/// used]` bytes): the time since the last look is the last level's, and a
+/// look with the card past its budget is counted.
+pub fn memory_look(level: u64, card: [u64; 2]) {
+    if !ACTIVE.load(Relaxed) {
+        return;
+    }
+    let now = now_us();
+    let last = LAST_LOOK_US.swap(now, Relaxed);
+    let was = LAST_LEVEL.swap(level.min(3), Relaxed);
+    if last != u64::MAX && (1..=3).contains(&was) {
+        GOVERNOR_US[was as usize - 1].fetch_add(now.saturating_sub(last), Relaxed);
+    }
+    let [budget, used] = card;
+    if budget > 0 && used > budget {
+        bump(Stat::CardOverBudgetLooks);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,9 +681,17 @@ static WINDOW_WORST_MS: [AtomicU32; WINDOWS] = [const { AtomicU32::new(0) }; WIN
 const SHOWN_WINDOWS: usize = 180;
 
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
-/// Microseconds since the start of the run at the last present.
+/// Microseconds since the start of the run at the last present, at the
+/// first, and at the first that had draws run on the host before it.
 static LAST_PRESENT_US: AtomicU64 = AtomicU64::new(u64::MAX);
 static FIRST_PRESENT_US: AtomicU64 = AtomicU64::new(u64::MAX);
+static FIRST_DRAW_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The timeline's window of `us` since the start (a longer run adds to the
+/// last).
+fn window_of(us: u64) -> usize {
+    ((us / 1_000_000 / WINDOW_S) as usize).min(WINDOWS - 1)
+}
 /// Frame intervals counted, their sum and the longest, in microseconds.
 static INTERVALS: AtomicU64 = AtomicU64::new(0);
 static INTERVAL_SUM_US: AtomicU64 = AtomicU64::new(0);
@@ -631,8 +714,11 @@ pub fn present(drawn: u64, dispatched: u64) {
     let now = now_us();
     PRESENTS.fetch_add(1, Relaxed);
     let _ = FIRST_PRESENT_US.compare_exchange(u64::MAX, now, Relaxed, Relaxed);
+    if drawn > 0 && FIRST_DRAW_US.load(Relaxed) == u64::MAX {
+        let _ = FIRST_DRAW_US.compare_exchange(u64::MAX, now, Relaxed, Relaxed);
+    }
     let last = LAST_PRESENT_US.swap(now, Relaxed);
-    let window = ((now / 1_000_000 / WINDOW_S) as usize).min(WINDOWS - 1);
+    let window = window_of(now);
     WINDOW_PRESENTS[window].fetch_add(1, Relaxed);
     let totals = [
         STAT[Stat::Submissions as usize].load(Relaxed),
@@ -648,7 +734,13 @@ pub fn present(drawn: u64, dispatched: u64) {
         if !first {
             WORK_SUM[i].fetch_add(delta, Relaxed);
             WORK_MAX[i].fetch_max(delta, Relaxed);
+            if i == 3 {
+                FIGURES[window][Figure::LeftOut as usize].fetch_add(delta, Relaxed);
+            }
         }
+    }
+    if !first {
+        FIGURES[window][Figure::Intervals as usize].fetch_add(1, Relaxed);
     }
     if first || now < last {
         return;
@@ -660,6 +752,121 @@ pub fn present(drawn: u64, dispatched: u64) {
     FINE_FRAMES[fine_bucket(us)].fetch_add(1, Relaxed);
     BUCKETS[EDGES_US.iter().take_while(|&&e| us >= e).count()].fetch_add(1, Relaxed);
     WINDOW_WORST_MS[window].fetch_max(u32::try_from(us / 1000).unwrap_or(u32::MAX), Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// The frame line's figures.
+
+/// What the GPU side's once-a-second frame line says of the frames since its
+/// last one: microseconds, bytes or counts in all over those frames. The line
+/// takes its meters with `swap(0)`, so they cannot be read a second time:
+/// they are given here where the line takes them, and added up per
+/// [`WINDOW_S`] window of the run so that the steady state
+/// ([`steady_from_us`]) can be told from the loading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Figure {
+    /// Frames the frame meter counted (presents the swap chain took), and
+    /// the microseconds its windows lasted.
+    Frames,
+    MeterUs,
+    /// Preparing submissions on the CPU; of it, copying title buffers up
+    /// (microseconds, bytes) and refreshing textures (microseconds, bytes).
+    PreparingUs,
+    CopiesUpUs,
+    CopiesUpBytes,
+    TextureRefreshUs,
+    TextureRefreshBytes,
+    /// The waits for the card in submissions (the line's "on the GPU").
+    CardWaitUs,
+    /// Copying what shaders wrote back into title memory: microseconds,
+    /// bytes.
+    CopyBackUs,
+    CopyBackBytes,
+    /// The card's clock: nothing of ours queued; of that, while the
+    /// submitting thread was working; the submitting thread stood waiting
+    /// for the card.
+    CardIdleUs,
+    CardIdleBehindUs,
+    StoodUs,
+    /// Passes over the heap's buffer views for shaders that pick them by
+    /// index, and their microseconds.
+    HeapBufferPasses,
+    HeapBufferUs,
+    /// Texture refreshes on all threads, microseconds.
+    RefreshAllUs,
+    /// The waiting for the card in settles of submissions sent ahead, by
+    /// what settled them, microseconds.
+    SettledSync,
+    SettledCardDone,
+    SettledValue,
+    SettledStale,
+    SettledRead,
+    SettledStep,
+    SettledMost,
+    SettledWrites,
+    SettledFence,
+    /// Fed by [`present`]: frames between two presents, and the draws and
+    /// dispatches left out in them.
+    Intervals,
+    LeftOut,
+}
+
+const FIGS: usize = Figure::LeftOut as usize + 1;
+/// Per window of the timeline, every [`Figure`]. (Zeroed memory that is only
+/// touched as the run reaches each window.)
+static FIGURES: [[AtomicU64; FIGS]; WINDOWS] = [const { [const { AtomicU64::new(0) }; FIGS] }; WINDOWS];
+
+/// The settles' causes as the frame line words them, under our keys.
+const SETTLED: [(Figure, &str); 9] = [
+    (Figure::SettledSync, "sync_submission_or_present"),
+    (Figure::SettledCardDone, "card_had_run_them"),
+    (Figure::SettledValue, "wait_for_memory_value"),
+    (Figure::SettledStale, "title_memory_changed_under_shader_writes"),
+    (Figure::SettledRead, "title_memory_read"),
+    (Figure::SettledStep, "step_of_ours"),
+    (Figure::SettledMost, "lists_in_the_air"),
+    (Figure::SettledWrites, "bottom_of_pipe_writes"),
+    (Figure::SettledFence, "blocking_fence_wait"),
+];
+
+/// Figures of the frame line, added to the window of now (once a second).
+pub fn figures(values: &[(Figure, u64)]) {
+    if !ACTIVE.load(Relaxed) {
+        return;
+    }
+    let window = &FIGURES[window_of(now_us())];
+    for &(figure, value) in values {
+        window[figure as usize].fetch_add(value, Relaxed);
+    }
+}
+
+const WINDOW_US: u64 = WINDOW_S * 1_000_000;
+
+/// Where the steady state begins: at the first window's start at or after a
+/// third of the time from the first present to `duration_us`. Loading and
+/// warm-up (shaders, pipelines and textures made for the first time) come
+/// in the first third; what a frame costs once they are done is the rest.
+/// shortcut: by time, not by what was drawn, so a run that ends in a long
+/// loading screen has some of it in its steady state.
+fn steady_from_us(first_present_us: u64, duration_us: u64) -> u64 {
+    let cut = first_present_us + duration_us.saturating_sub(first_present_us) / 3;
+    cut.div_ceil(WINDOW_US) * WINDOW_US
+}
+
+/// The figures summed over all `windows`, and over those from `from_us` on.
+fn split_figures(windows: &[[u64; FIGS]], from_us: Option<u64>) -> ([u64; FIGS], [u64; FIGS]) {
+    let (mut whole, mut steady) = ([0u64; FIGS], [0u64; FIGS]);
+    let first = from_us.map_or(usize::MAX, |us| (us / WINDOW_US) as usize);
+    for (i, w) in windows.iter().enumerate() {
+        for (f, &value) in w.iter().enumerate() {
+            whole[f] = whole[f].saturating_add(value);
+            if i >= first {
+                steady[f] = steady[f].saturating_add(value);
+            }
+        }
+    }
+    (whole, steady)
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1469,16 @@ struct Snapshot {
     timeline: Vec<(u32, u32)>,
     work_sum: [u64; WORK],
     work_max: [u64; WORK],
+    first_draw_us: Option<u64>,
+    /// The frame line's figures over the whole run and over the steady
+    /// state, which begins at `steady_from_us` (`None`: no present yet).
+    figures: [u64; FIGS],
+    figures_steady: [u64; FIGS],
+    steady_from_us: Option<u64>,
+    /// The lowest free memory and commit headroom seen (bytes; `u64::MAX`
+    /// not seen), and the microseconds at each governor level.
+    lowest: [u64; 2],
+    governor_us: [u64; 3],
     methods: Vec<KeyedEntry>,
     methods_lost: u64,
     shader_failures: Vec<KeyedEntry>,
@@ -1277,6 +1494,20 @@ impl Snapshot {
         let load = |a: &AtomicU64| a.load(Relaxed);
         let duration_us = now_us();
         let windows_used = ((duration_us / 1_000_000 / WINDOW_S) as usize + 1).min(WINDOWS);
+        let first_present_us = Some(load(&FIRST_PRESENT_US)).filter(|&t| t != u64::MAX);
+        let steady_from = first_present_us.map(|first| steady_from_us(first, duration_us));
+        let windows: Vec<[u64; FIGS]> = FIGURES[..windows_used]
+            .iter()
+            .map(|w| std::array::from_fn(|f| load(&w[f])))
+            .collect();
+        let (figures, figures_steady) = split_figures(&windows, steady_from);
+        // The time since the governor's last look is the level it found.
+        let mut governor_us: [u64; 3] = std::array::from_fn(|i| load(&GOVERNOR_US[i]));
+        let (last_look, last_level) = (load(&LAST_LOOK_US), load(&LAST_LEVEL));
+        if last_look != u64::MAX && (1..=3).contains(&last_level) {
+            let i = last_level as usize - 1;
+            governor_us[i] = governor_us[i].saturating_add(duration_us.saturating_sub(last_look));
+        }
         let state = state();
         let (imports, other_imports) = called_imports(&state.imports, state.platform_dll);
         Snapshot {
@@ -1291,7 +1522,7 @@ impl Snapshot {
             stats: std::array::from_fn(|i| load(&STAT[i])),
             left_out: std::array::from_fn(|i| load(&LEFT_OUT[i])),
             presents: load(&PRESENTS),
-            first_present_us: Some(load(&FIRST_PRESENT_US)).filter(|&t| t != u64::MAX),
+            first_present_us,
             intervals: load(&INTERVALS),
             interval_sum_us: load(&INTERVAL_SUM_US),
             interval_max_us: load(&INTERVAL_MAX_US),
@@ -1307,6 +1538,12 @@ impl Snapshot {
                 .collect(),
             work_sum: std::array::from_fn(|i| load(&WORK_SUM[i])),
             work_max: std::array::from_fn(|i| load(&WORK_MAX[i])),
+            first_draw_us: Some(load(&FIRST_DRAW_US)).filter(|&t| t != u64::MAX),
+            figures,
+            figures_steady,
+            steady_from_us: steady_from,
+            lowest: std::array::from_fn(|i| load(&LOWEST[i])),
+            governor_us,
             methods: METHODS.entries(),
             methods_lost: load(&METHODS.lost),
             shader_failures: SHADER_FAILURES.entries(),
@@ -1583,6 +1820,10 @@ fn render(s: &Snapshot) -> String {
         (w, h) => d.formatted("display_mode", format_args!("{w}x{h}")),
     }
     d.float("duration_s", s.duration_us as f64 / 1e6);
+    match s.first_draw_us {
+        Some(us) => d.float("first_draw_s", us as f64 / 1e6),
+        None => d.comment("first draw: none run on the host yet"),
+    }
     match s.end {
         None => {
             d.word("ended", Ours("killed_or_unknown"));
@@ -1689,12 +1930,37 @@ fn render(s: &Snapshot) -> String {
         d.float(avg, s.work_sum[i] as f64 / frames);
         d.int(most, s.work_max[i]);
     }
+    d.comment("the same at steady state (see [frame_time])");
+    let steady = &s.figures_steady;
+    d.float(
+        "left_out_avg_steady",
+        steady[Figure::LeftOut as usize] as f64 / steady[Figure::Intervals as usize].max(1) as f64,
+    );
     d.int("submissions_total", s.stat(Stat::Submissions));
     d.table("gpu_work.left_out");
     d.comment("draws and dispatches not run on the host, whole run, by reason");
     for why in LeftOut::ALL {
         d.int(why.key(), s.left_out[why as usize]);
     }
+
+    d.table("frame_time");
+    d.comment("per frame, from the meters of the log's once-a-second frame line; ms, MB (10^6 bytes)");
+    d.comment("whole run here; [frame_time.steady]: the steady state, the frames from the first");
+    d.comment("10 s window at or after a third of the time from the first present to this report");
+    frame_time(&mut d, &s.figures);
+    d.table("frame_time.steady");
+    match s.steady_from_us {
+        Some(from) => {
+            d.float("from_s", from as f64 / 1e6);
+            frame_time(&mut d, &s.figures_steady);
+        }
+        None => d.comment("no present yet"),
+    }
+    d.table("frame_time.waits");
+    d.comment("ms per frame the waiting for the card in settles took, by what settled, whole run");
+    settle_waits(&mut d, &s.figures);
+    d.table("frame_time.waits.steady");
+    settle_waits(&mut d, &s.figures_steady);
 
     d.table("pipelines");
     d.int("created_by_title", s.stat(Stat::PipelinesCreated));
@@ -1747,9 +2013,61 @@ fn render(s: &Snapshot) -> String {
         }),
     );
 
+    d.table("memory.pressure");
+    d.comment("MiB; the lowest the budget governor saw (it asks at most every 32 ms)");
+    match s.lowest {
+        [u64::MAX, u64::MAX] => d.comment("free memory and commit headroom: not seen (the governor is off)"),
+        [ram, commit] => {
+            d.int("lowest_free_ram_mib", if ram == u64::MAX { 0 } else { ram >> 20 });
+            d.int("lowest_commit_headroom_mib", if commit == u64::MAX { 0 } else { commit >> 20 });
+        }
+    }
+    d.comment("seconds at each level of the budget governor (it looks about once a second)");
+    for (key, us) in ["governor_green_s", "governor_yellow_s", "governor_red_s"]
+        .into_iter()
+        .zip(s.governor_us)
+    {
+        d.float(key, us as f64 / 1e6);
+    }
+    let over = s.stat(Stat::CardOverBudgetLooks);
+    d.boolean("vram_over_budget", over > 0);
+    d.int("vram_over_budget_looks", over);
+    d.comment("the commit guard: times commit went critical, stagings it held back, refusals it saw");
+    d.int("commit_critical_times", s.stat(Stat::CommitCritical));
+    d.int("commit_uploads_held_back", s.stat(Stat::CommitHeldBack));
+    d.int("commit_allocations_refused", s.stat(Stat::CommitRefusals));
+    d.comment("waits for new memory to be made resident, and for new card memory to be mapped");
+    let ms = |stat: Stat| s.stat(stat) as f64 / 1e3;
+    d.int("resident_waits", s.stat(Stat::ResidentWaits));
+    d.float("resident_wait_ms", ms(Stat::ResidentUs));
+    d.float("resident_wait_longest_ms", ms(Stat::ResidentLongestUs));
+    d.int("mapped_waits", s.stat(Stat::MappedWaits));
+    d.float("mapped_wait_ms", ms(Stat::MappedUs));
+    d.float("mapped_wait_longest_ms", ms(Stat::MappedLongestUs));
+
+    d.table("textures");
+    d.comment("textures picked by index (from the view heap by shaders), since the start");
+    d.int("picked_uploaded", s.stat(Stat::PickedUploaded));
+    d.int("picked_uploaded_mib", s.stat(Stat::PickedBytes) >> 20);
+    d.int("waiting_for_memory_most", s.stat(Stat::PickedWaitingMost));
+    d.int("waiting_for_memory_last", s.stat(Stat::PickedWaitingLast));
+    d.int("no_room_passes", s.stat(Stat::PickedNoRoom));
+    d.int("uploaded_again_changed_unseen", s.stat(Stat::PickedChangedUnseen));
+    d.int("uploaded_again_while_full", s.stat(Stat::PickedReuploadedFull));
+    d.int("smallest_levels_only", s.stat(Stat::TailCopies));
+    d.int("smallest_levels_only_mib", s.stat(Stat::TailBytes) >> 20);
+    d.comment("texture refreshes on all threads, ms per frame (whole run, steady state)");
+    let refresh = |f: &[u64; FIGS]| {
+        f[Figure::RefreshAllUs as usize] as f64 / 1e3 / f[Figure::Frames as usize].max(1) as f64
+    };
+    d.float("refresh_ms", refresh(&s.figures));
+    d.float("refresh_ms_steady", refresh(&s.figures_steady));
+
     d.table("unimplemented");
     d.int("methods_called", s.methods.len() as u64);
     d.int("methods_lost", s.methods_lost);
+    d.comment("calls of a pipeline creation method not implemented: pipelines the title went without");
+    d.int("pipelines_gone_without", s.stat(Stat::PipelinesGoneWithout));
     d.int("imports_named", s.imports.len() as u64);
     d.comment("imports of DLLs that are not the platform's: only counted");
     d.int("imports_other", s.other_imports.0);
@@ -1767,6 +2085,47 @@ fn render(s: &Snapshot) -> String {
         d.int("calls", calls);
     }
     d.out
+}
+
+/// The frame line's figures `f` per frame of the frame meter.
+fn frame_time(d: &mut Doc, f: &[u64; FIGS]) {
+    let get = |figure: Figure| f[figure as usize] as f64;
+    let frames = get(Figure::Frames);
+    let per = |figure: Figure, scale: f64| get(figure) / scale / frames.max(1.0);
+    d.int("frames", f[Figure::Frames as usize]);
+    d.float("frame_ms", per(Figure::MeterUs, 1e3));
+    for (key, figure, scale) in [
+        ("preparing_ms", Figure::PreparingUs, 1e3),
+        ("copies_up_ms", Figure::CopiesUpUs, 1e3),
+        ("copies_up_mb", Figure::CopiesUpBytes, 1e6),
+        ("texture_refresh_ms", Figure::TextureRefreshUs, 1e3),
+        ("texture_refresh_mb", Figure::TextureRefreshBytes, 1e6),
+        ("waiting_for_card_ms", Figure::CardWaitUs, 1e3),
+        ("copying_back_ms", Figure::CopyBackUs, 1e3),
+        ("copying_back_mb", Figure::CopyBackBytes, 1e6),
+    ] {
+        d.float(key, per(figure, scale));
+    }
+    let meter = get(Figure::MeterUs);
+    let busy = if meter > 0.0 {
+        (100.0 * (1.0 - get(Figure::CardIdleUs) / meter)).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    d.float("card_busy_pct", busy);
+    d.float("card_idle_ms", per(Figure::CardIdleUs, 1e3));
+    d.float("card_idle_behind_us_ms", per(Figure::CardIdleBehindUs, 1e3));
+    d.float("submitting_thread_stood_ms", per(Figure::StoodUs, 1e3));
+    d.float("heap_buffer_passes", per(Figure::HeapBufferPasses, 1.0));
+    d.float("heap_buffer_ms", per(Figure::HeapBufferUs, 1e3));
+}
+
+/// The waiting in settles of `f`, ms per frame, by cause.
+fn settle_waits(d: &mut Doc, f: &[u64; FIGS]) {
+    let frames = f[Figure::Frames as usize].max(1) as f64;
+    for (figure, key) in SETTLED {
+        d.float(key, f[figure as usize] as f64 / 1e3 / frames);
+    }
 }
 
 #[cfg(test)]
@@ -1839,9 +2198,88 @@ mod tests {
             (Stat::ViewHeapViews, 1_000_000),
             (Stat::DisplayWidth, 3840),
             (Stat::DisplayHeight, 2160),
+            (Stat::PipelinesGoneWithout, 36),
+            (Stat::CommitCritical, 1),
+            (Stat::CommitHeldBack, 14),
+            (Stat::ResidentWaits, 52_000),
+            (Stat::ResidentUs, 3_400_000),
+            (Stat::ResidentLongestUs, 41_000),
+            (Stat::MappedWaits, 2_400),
+            (Stat::MappedUs, 900_000),
+            (Stat::MappedLongestUs, 12_500),
+            (Stat::CardOverBudgetLooks, 3),
+            (Stat::PickedUploaded, 18_400),
+            (Stat::PickedBytes, 5_200 << 20),
+            (Stat::PickedWaitingMost, 950),
+            (Stat::PickedWaitingLast, 12),
+            (Stat::PickedNoRoom, 210),
+            (Stat::PickedChangedUnseen, 7),
+            (Stat::TailCopies, 330),
+            (Stat::TailBytes, 21 << 20),
         ] {
             stats[stat as usize] = v;
         }
+        let figures = |values: &[(Figure, u64)]| {
+            let mut f = [0; FIGS];
+            for &(figure, v) in values {
+                f[figure as usize] = v;
+            }
+            f
+        };
+        use Figure as F;
+        let whole = figures(&[
+            (F::Frames, 1_000),
+            (F::MeterUs, 20_400_000),
+            (F::PreparingUs, 6_200_000),
+            (F::CopiesUpUs, 2_100_000),
+            (F::CopiesUpBytes, 4_100_000_000),
+            (F::TextureRefreshUs, 3_000_000),
+            (F::TextureRefreshBytes, 12_000_000_000),
+            (F::CardWaitUs, 7_500_000),
+            (F::CopyBackUs, 1_200_000),
+            (F::CopyBackBytes, 900_000_000),
+            (F::CardIdleUs, 6_100_000),
+            (F::CardIdleBehindUs, 4_000_000),
+            (F::StoodUs, 7_000_000),
+            (F::HeapBufferPasses, 2_000),
+            (F::HeapBufferUs, 400_000),
+            (F::RefreshAllUs, 4_500_000),
+            (F::SettledSync, 2_000_000),
+            (F::SettledCardDone, 500_000),
+            (F::SettledStale, 1_500_000),
+            (F::SettledRead, 1_200_000),
+            (F::SettledStep, 300_000),
+            (F::SettledWrites, 800_000),
+            (F::SettledFence, 200_000),
+            (F::Intervals, 1_000),
+            (F::LeftOut, 1_880),
+        ]);
+        let steady = figures(&[
+            (F::Frames, 370),
+            (F::MeterUs, 6_200_000),
+            (F::PreparingUs, 1_700_000),
+            (F::CopiesUpUs, 520_000),
+            (F::CopiesUpBytes, 900_000_000),
+            (F::TextureRefreshUs, 400_000),
+            (F::TextureRefreshBytes, 1_500_000_000),
+            (F::CardWaitUs, 2_900_000),
+            (F::CopyBackUs, 300_000),
+            (F::CopyBackBytes, 210_000_000),
+            (F::CardIdleUs, 900_000),
+            (F::CardIdleBehindUs, 600_000),
+            (F::StoodUs, 2_700_000),
+            (F::HeapBufferPasses, 740),
+            (F::HeapBufferUs, 110_000),
+            (F::RefreshAllUs, 600_000),
+            (F::SettledSync, 700_000),
+            (F::SettledCardDone, 200_000),
+            (F::SettledStale, 900_000),
+            (F::SettledRead, 500_000),
+            (F::SettledWrites, 300_000),
+            (F::SettledFence, 100_000),
+            (F::Intervals, 370),
+            (F::LeftOut, 30),
+        ]);
         let mut left_out = [0; LeftOut::ALL.len()];
         left_out[LeftOut::PipelineNotReady as usize] = 1_830;
         left_out[LeftOut::ShaderNotTranslated as usize] = 44;
@@ -1890,7 +2328,16 @@ mod tests {
             ],
             work_sum: [9_000, 2_100_000, 640_000, 1_880],
             work_max: [14, 3_950, 1_210, 260],
-            methods: vec![(Ours("command list"), Ours(""), 0x1a8, 3)],
+            first_draw_us: Some(20_900_000),
+            figures: whole,
+            figures_steady: steady,
+            steady_from_us: Some(steady_from_us(21_300_000, 62_400_000)),
+            lowest: [612 << 20, 2_100 << 20],
+            governor_us: [41_000_000, 18_500_000, 2_900_000],
+            methods: vec![
+                (Ours("device"), Ours(""), 0x218, 36),
+                (Ours("command list"), Ours(""), 0x1a8, 3),
+            ],
             methods_lost: 0,
             shader_failures: vec![(Ours("unsupported"), Ours("an instruction"), 0, 3)],
             shader_failures_lost: 0,
@@ -1910,13 +2357,57 @@ mod tests {
             "frames",
             "timeline",
             "gpu_work",
+            "frame_time",
             "pipelines",
             "shaders",
             "memory",
+            "textures",
             "unimplemented",
         ] {
             assert!(parsed.contains_key(section), "no [{section}]");
         }
+        let frame_time = &parsed["frame_time"];
+        for key in [
+            "frames",
+            "frame_ms",
+            "preparing_ms",
+            "copies_up_ms",
+            "copies_up_mb",
+            "texture_refresh_ms",
+            "texture_refresh_mb",
+            "waiting_for_card_ms",
+            "copying_back_ms",
+            "copying_back_mb",
+            "card_busy_pct",
+            "card_idle_ms",
+            "card_idle_behind_us_ms",
+            "submitting_thread_stood_ms",
+            "heap_buffer_passes",
+            "heap_buffer_ms",
+        ] {
+            assert!(frame_time.get(key).is_some(), "no frame_time.{key}");
+            assert!(frame_time["steady"].get(key).is_some(), "no frame_time.steady.{key}");
+        }
+        for (_, key) in SETTLED {
+            assert!(frame_time["waits"].get(key).is_some(), "no frame_time.waits.{key}");
+            assert!(frame_time["waits"]["steady"].get(key).is_some(), "no steady {key}");
+        }
+        assert_eq!(frame_time["preparing_ms"].as_float(), Some(6.2));
+        assert_eq!(frame_time["card_busy_pct"].as_float(), Some(70.1));
+        assert_eq!(frame_time["steady"]["from_s"].as_float(), Some(40.0));
+        assert_eq!(frame_time["waits"]["sync_submission_or_present"].as_float(), Some(2.0));
+        assert_eq!(parsed["gpu_work"]["left_out_avg_steady"].as_float(), Some(0.08));
+        assert_eq!(parsed["run"]["first_draw_s"].as_float(), Some(20.9));
+        let pressure = &parsed["memory"]["pressure"];
+        assert_eq!(pressure["lowest_free_ram_mib"].as_integer(), Some(612));
+        assert_eq!(pressure["lowest_commit_headroom_mib"].as_integer(), Some(2_100));
+        assert_eq!(pressure["governor_red_s"].as_float(), Some(2.9));
+        assert_eq!(pressure["vram_over_budget"].as_bool(), Some(true));
+        assert_eq!(pressure["resident_wait_ms"].as_float(), Some(3_400.0));
+        assert_eq!(parsed["textures"]["waiting_for_memory_most"].as_integer(), Some(950));
+        assert_eq!(parsed["textures"]["picked_uploaded_mib"].as_integer(), Some(5_200));
+        assert_eq!(parsed["textures"]["refresh_ms"].as_float(), Some(4.5));
+        assert_eq!(parsed["unimplemented"]["pipelines_gone_without"].as_integer(), Some(36));
         assert_eq!(parsed["format"].as_integer(), Some(i64::from(FORMAT)));
         assert_eq!(parsed["run"]["ended"].as_str(), Some("title_exited"));
         assert_eq!(
@@ -1933,6 +2424,10 @@ mod tests {
         );
         assert_eq!(
             parsed["unimplemented"]["method"][0]["offset"].as_integer(),
+            Some(0x218)
+        );
+        assert_eq!(
+            parsed["unimplemented"]["method"][1]["offset"].as_integer(),
             Some(0x1a8)
         );
         assert!(text.starts_with("# Rox-box run report\n#\n"), "{text}");
@@ -2139,12 +2634,40 @@ mod tests {
             import_site("kernel32.dll", word, calls);
             import_site(word, word, calls);
         }
+        // The entry points of numbers alone, fed what an address looks like:
+        // what comes out of them is numbers, in decimal.
+        ACTIVE.store(true, Relaxed);
+        let address = 0x7ff6_a1b2_c3d4u64;
+        figures(&[
+            (Figure::Frames, 1),
+            (Figure::MeterUs, address),
+            (Figure::CopiesUpBytes, address),
+            (Figure::SettledFence, address),
+            (Figure::RefreshAllUs, address),
+        ]);
+        memory_seen(address, address);
+        memory_look(address, [address, address + 1]);
+        for stat in [Stat::PickedBytes, Stat::TailBytes, Stat::ResidentUs, Stat::PipelinesGoneWithout] {
+            max(stat, address);
+        }
         // A DLL test that would let anything through: the names' own rule
         // still holds.
         set_platform_dll(|_| true);
         let text = render(&Snapshot::take());
         must_not_appear(&text);
-        assert!(toml::from_str::<toml::Table>(&text).is_ok(), "{text}");
+        assert!(!text.contains("7ff6"), "{text}");
+        let parsed = toml::from_str::<toml::Table>(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        fn numbers_only(v: &toml::Value) -> bool {
+            match v {
+                toml::Value::Table(t) => t.values().all(numbers_only),
+                toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Boolean(_) => true,
+                _ => false,
+            }
+        }
+        for section in [&parsed["frame_time"], &parsed["memory"]["pressure"], &parsed["textures"]] {
+            assert!(numbers_only(section), "{section}");
+        }
+        assert!(parsed["unimplemented"]["pipelines_gone_without"].is_integer());
         for bad in smuggled() {
             assert!(!guarded(&bad, false) && !guarded(&bad, true), "{bad}");
         }
@@ -2185,6 +2708,50 @@ mod tests {
         assert_eq!(entries[0], (Ours("device"), Ours(""), 0x40, 3));
         assert_eq!(entries.len(), 4);
         assert_eq!(table.lost.load(Relaxed), 1);
+    }
+
+    /// The steady state begins at the first window at or after a third of
+    /// the time from the first present; the whole run is every window.
+    #[test]
+    fn the_steady_state_is_the_last_two_thirds_after_the_first_present() {
+        assert_eq!(steady_from_us(21_300_000, 62_400_000), 40_000_000);
+        assert_eq!(steady_from_us(0, 30_000_000), 10_000_000);
+        assert_eq!(steady_from_us(0, 0), 0);
+        assert_eq!(steady_from_us(5_000_000, 5_000_000), 10_000_000);
+        assert_eq!(steady_from_us(5_000_000, 1_000_000), 10_000_000);
+        let mut windows = vec![[0u64; FIGS]; 6];
+        for (i, w) in windows.iter_mut().enumerate() {
+            w[Figure::Frames as usize] = 10 * (i as u64 + 1);
+            w[Figure::LeftOut as usize] = u64::MAX / 4;
+        }
+        let (whole, steady) = split_figures(&windows, Some(40_000_000));
+        assert_eq!(whole[Figure::Frames as usize], 210);
+        assert_eq!(steady[Figure::Frames as usize], 50 + 60);
+        assert_eq!(whole[Figure::LeftOut as usize], u64::MAX);
+        let (_, none) = split_figures(&windows, None);
+        assert_eq!(none, [0; FIGS]);
+    }
+
+    /// The frame line's figures go to the window of now, and the governor's
+    /// looks give their time to the level found before.
+    #[test]
+    fn the_frame_line_and_the_governor_feed_the_report() {
+        ACTIVE.store(true, Relaxed);
+        let before = Snapshot::take();
+        figures(&[(Figure::SettledMost, 1_234), (Figure::HeapBufferPasses, 5)]);
+        memory_look(2, [100, 50]);
+        std::thread::sleep(Duration::from_millis(5));
+        memory_look(1, [100, 150]);
+        memory_seen(1 << 20, 3 << 20);
+        memory_seen(u64::MAX, u64::MAX);
+        let after = Snapshot::take();
+        let grew = |f: Figure| after.figures[f as usize] - before.figures[f as usize];
+        assert!(grew(Figure::SettledMost) >= 1_234);
+        assert!(grew(Figure::HeapBufferPasses) >= 5);
+        let total = |s: &Snapshot| s.governor_us.iter().sum::<u64>();
+        assert!(total(&after) - total(&before) >= 5_000);
+        assert!(after.stat(Stat::CardOverBudgetLooks) > before.stat(Stat::CardOverBudgetLooks));
+        assert!(after.lowest[0] <= 1 << 20 && after.lowest[1] <= 3 << 20);
     }
 
     #[test]

@@ -110,6 +110,7 @@ fn ask() -> Sample {
         s.ram = m.ullAvailPhys;
         s.commit = m.ullAvailPageFile;
     }
+    crate::runreport::system_memory(s.ram, s.commit);
     s
 }
 
@@ -304,6 +305,7 @@ pub(crate) fn look() {
         tend(need);
     }
     let now = level_of(&s, &lines());
+    crate::runreport::governor_look(&s, now);
     use victory_pipeline::report::{Stat, max, set};
     max(Stat::GovernorWorst, now as u64 + 1);
     let was = LOOKED.swap(now as u8, Ordering::Relaxed);

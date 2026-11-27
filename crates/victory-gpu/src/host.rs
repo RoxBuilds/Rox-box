@@ -339,7 +339,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 }
 
 /// Times, microseconds and the longest of [`mapped`].
-static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
@@ -368,7 +368,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
 }
 
 /// Times, microseconds and the longest of [`resident`].
-static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether memory the card was given stays with it while there is room (on
 /// by default; `VICTORY_KEEP_FREED=0`: it is given back as before). A shader
@@ -1252,6 +1252,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    crate::runreport::card_clock(frames, [idle, behind, stood]);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -5037,6 +5038,10 @@ fn late_line(frames: f64) {
     );
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        crate::runreport::settle_waits(
+            frames,
+            [WHY_SYNC, WHY_CARD_DONE, WHY_VALUE, WHY_STALE, WHY_READ, WHY_RUN, WHY_MOST, WHY_WRITES, WHY_FENCE].map(|i| w[i]),
+        );
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
@@ -10862,6 +10867,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        crate::runreport::frame_line(frames, elapsed, [cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb]);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -10896,6 +10902,7 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            crate::runreport::texture_refreshes(frames, all);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -10928,6 +10935,7 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        crate::runreport::heap_buffers(frames, picked, picked_ms);
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

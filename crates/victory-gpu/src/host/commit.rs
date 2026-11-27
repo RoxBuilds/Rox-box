@@ -116,6 +116,15 @@ static RAM: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Allocations refused, and stagings held back, so far (for the log lines).
 static REFUSALS: AtomicU64 = AtomicU64::new(0);
 static DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// Times commit went critical (crossed under [`CRITICAL`]), for the run
+/// report.
+static CRITICAL_TIMES: AtomicU64 = AtomicU64::new(0);
+
+/// For the run report, since the start: times commit went critical,
+/// stagings held back, allocations refused.
+pub(crate) fn counts() -> [u64; 3] {
+    [&CRITICAL_TIMES, &DEFERRED, &REFUSALS].map(|n| n.load(Ordering::Relaxed))
+}
 
 thread_local! {
     static STAGING_DEFERRED: Cell<bool> = const { Cell::new(false) };
@@ -155,6 +164,9 @@ fn sample(now: u64) -> Sample {
         let was = COMMIT.swap(s.commit, Ordering::Relaxed);
         RAM.store(s.ram, Ordering::Relaxed);
         let (before, after) = (was < CRITICAL, s.commit < CRITICAL);
+        if after && !before {
+            CRITICAL_TIMES.fetch_add(1, Ordering::Relaxed);
+        }
         if before != after {
             tracing::warn!(
                 commit_headroom_mib = s.commit / MIB,

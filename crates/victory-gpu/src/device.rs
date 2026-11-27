@@ -369,6 +369,11 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let compute = SLOT == 0x218;
     let calls = CALLS[usize::from(compute)].fetch_add(1, Ordering::Relaxed) + 1;
+    // In the run report as a device method not written yet (under our name of
+    // the interface, as `object::missing` counts them), and as a pipeline the
+    // title went without.
+    victory_pipeline::report::method_missing("device", SLOT as u32);
+    victory_pipeline::report::bump(victory_pipeline::report::Stat::PipelinesGoneWithout);
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
