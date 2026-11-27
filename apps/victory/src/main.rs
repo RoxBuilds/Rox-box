@@ -206,6 +206,17 @@ enum Command {
         /// Print only the newest report's path.
         #[arg(long)]
         path: bool,
+        /// Compare two reports (older, then newer; each a file or a number
+        /// from `--list`, 1 = newest); none: the two newest. Needs no game
+        /// folder, and no config file when given two paths.
+        #[arg(long, num_args = 0..=2, value_names = ["A", "B"], conflicts_with_all = ["list", "path"])]
+        diff: Option<Vec<String>>,
+        /// With --diff: the percent a key must change by to be shown.
+        #[arg(long, requires = "diff", default_value_t = report::DEFAULT_THRESHOLD)]
+        threshold: f64,
+        /// With --diff: show every key, changed or not.
+        #[arg(long, requires = "diff")]
+        all: bool,
     },
 }
 
@@ -278,7 +289,8 @@ fn real_main() -> Result<()> {
     let reads_no_config = matches!(
         cli.command,
         Command::Config | Command::Check { .. } | Command::Inspect { .. } | Command::LibExports { .. }
-    ) || matches!(cli.command, Command::Selftest { .. });
+    ) || matches!(cli.command, Command::Selftest { .. })
+        || matches!(cli.command, Command::Report { diff: Some(_), .. });
     match victory_core::Config::load() {
         Ok(cfg) => publish_external_paths(&cfg),
         Err(_) if reads_no_config => {}
@@ -343,7 +355,13 @@ fn real_main() -> Result<()> {
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
         Command::Check { exe } => preflight::check(exe.as_deref()),
-        Command::Report { list, path } => report::run(list, path),
+        Command::Report {
+            diff: Some(args),
+            threshold,
+            all,
+            ..
+        } => report::diff(&args, threshold, all),
+        Command::Report { list, path, .. } => report::run(list, path),
         Command::Selftest { warp, frames, bench } => selftest::run(warp, frames, bench),
     }
 }

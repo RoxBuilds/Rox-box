@@ -42,6 +42,37 @@ At the end of a run one line names the file and says it is safe to share.
 | `victory report --list` | Every report kept, newest first, with how the run ended, how long it ran and its average frame rate |
 | `victory report --path` | The newest report's path only |
 
+## Comparing two reports
+
+`victory report --diff` compares the two newest reports (older = A, newer =
+B); `victory report --diff <a> <b>` compares two named ones, each a path to a
+report file or a number from `victory report --list` (1 = newest). It needs
+no game folder, and with two paths no config file. It is for an A/B run: the
+same thing run twice with one switch changed. It prints, in plain text meant
+for an issue:
+
+1. the formats (said first when they differ), then for A and B the Rox-box
+   version, console, display mode, duration and how the run ended; whether
+   `[host]` and `[host.gpu]` are the same, and the differing keys if not;
+2. `[run.switches]` only in A, only in B, and with different values;
+3. every numeric key whose change is over 5 % and over 0.005 (`--threshold
+   <percent>` changes the 5; `--all` prints every key), as
+   `key  A  B  delta  percent`, grouped by section: the steady state first
+   (`[frame_time.steady]`, `[frame_time.waits.steady]`, the `*_steady` keys,
+   when both reports have them), then the whole run. Arrays (`[timeline]`) are
+   shown as `[len]`, `[mean]`, `[min]` and `[max]`; the count tables
+   (`[gpu_work.left_out]`, `[shaders.failures]`, `[frames.histogram]`, the
+   unimplemented methods and imports) key by key. A key only one report has
+   prints `-` for the other; a key an older format lacks is such a key;
+4. one `verdict:` line of figures only: steady-state frame time, average
+   frame rate, draws left out per frame.
+
+Only keys and values that are in the two reports are printed, so the output
+holds what a report holds. The two paths go to stderr, like the one `victory
+report` prints. Input that is not a report, or cannot be read, is an error
+naming the argument (exit code 1), as is a `--diff` with fewer than two
+reports kept.
+
 ## What it may hold: an allowlist
 
 A report holds only

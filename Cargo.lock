@@ -636,6 +636,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "toml",
  "victory-core",
  "victory-formats",
  "victory-game",
