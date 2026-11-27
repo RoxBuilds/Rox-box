@@ -1219,6 +1219,11 @@ static STARTS: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
 /// One write at a time.
 static WRITING: Mutex<()> = Mutex::new(());
+/// A report that names how the run ended is written: the last one. A write
+/// that comes after it (the helper thread's first, when the run ended before
+/// that thread got to it, or its next turn) would only be cut off by the
+/// process ending, and leave its `.part` file behind.
+static LAST_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// The helper thread: a report now, then every [`EVERY`] and whenever asked.
 fn writer() {
@@ -1254,6 +1259,15 @@ fn lower_priority() {
 fn write() -> Option<PathBuf> {
     let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let begun = STARTS.fetch_add(1, SeqCst);
+    if LAST_WRITTEN.load(SeqCst) {
+        // (Counted as done all the same: whoever waits for a write begun
+        // after their ask has the report they wait for.)
+        DONE.fetch_max(begun + 1, SeqCst);
+        return None;
+    }
+    // Read before the numbers are taken: an end stored from here on is in a
+    // later write, which is then the last.
+    let ended = END.load(SeqCst) != 0;
     let samplers = state().samplers.clone();
     for sample in samplers {
         sample();
@@ -1272,6 +1286,9 @@ fn write() -> Option<PathBuf> {
     });
     if let Some(path) = &written {
         say(path);
+        if ended {
+            LAST_WRITTEN.store(true, SeqCst);
+        }
     }
     DONE.fetch_max(begun + 1, SeqCst);
     written
