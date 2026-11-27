@@ -66,6 +66,34 @@ jobs:
           .\victory.exe selftest --warp --bench
           if ($LASTEXITCODE -ne 0) { Write-Host "selftest exit code: $LASTEXITCODE"; exit 1 }
           exit 0
+      # The self-test's rates (median, minimum, maximum of five runs) and one run
+      # of the open demo title, from the packaged binary, kept as numbers: a
+      # person comparing two runs' `bench` artifacts sees a slowdown that the
+      # pass/fail steps do not. It records and never fails on a figure (shared
+      # runners are too noisy for a limit); it fails only when a run itself
+      # fails. Comparing with the base commit's artifact needs a cross-run
+      # download with a token, which is not built yet (docs/selftest.md).
+      - name: Record the benchmark
+        shell: pwsh
+        run: |
+          cargo build --locked --manifest-path tests\fixtures\demo-title\Cargo.toml --target-dir target\demo-title
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The script's own tests first: its parsing and comparison need no victory.exe.
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\bench-record.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $unzipped = (Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'unzipped') -Directory)[0].FullName
+          $out = Join-Path $env:RUNNER_TEMP 'bench'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\bench-record.ps1 -Victory (Join-Path $unzipped 'victory.exe') -Out $out -DemoTitle (Resolve-Path target\demo-title\debug\demo-title.exe).Path
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Content -LiteralPath (Join-Path $out 'bench.md') -Raw | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+      # The two files, for comparing with another run's by hand.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench
+          path: |
+            ${{ runner.temp }}/bench/bench.json
+            ${{ runner.temp }}/bench/bench.md
+          if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Rox-box-windows-x64

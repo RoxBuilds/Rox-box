@@ -191,6 +191,52 @@ percent. Debug builds are many times slower; compare release builds.
 A rate that cannot be measured on the PC (no AVX2, no shader model 6.6) is
 left out.
 
+## The benchmark in CI
+
+The Build workflow (`.github/workflows/build.yml`) records the benchmark on
+every push and pull request, with the packaged `victory.exe` on the hosted
+runner's software adapter, through `scripts/bench-record.ps1`. It records
+and warns; it does not gate, because hosted runners are shared machines on
+which the same build moves by tens of percent from one run to the next, and
+a hard limit on a number would fail builds at random. The job fails only
+when a run itself fails: a stage that says FAIL, a non-zero exit code, or a
+demo title run whose report does not say `title_exited` with code 0.
+
+What is recorded:
+
+- The eight rates above, from five `selftest --warp --bench` runs: per rate
+  the median, the minimum and the maximum.
+- One run of the open demo title ([demo-title.md](demo-title.md), 600
+  frames, in temporary folders, on the software adapter), from its run
+  report ([run-report.md](run-report.md)): `average_fps`, `frame_ms_p50`,
+  `frame_ms_p99`, `preparing_ms` and `waiting_for_card_ms` of the whole run,
+  and how it ended.
+- The Rox-box version and the adapter's name.
+
+Where to find it: the Build run's job summary shows the table (`bench.md`),
+and the run's `bench` artifact holds `bench.md` and `bench.json` (flat, sorted
+by figure name, the same keys every time).
+
+Comparing with the base commit's run needs a download of another run's
+artifact, which needs a token and API calls; that is not built. Compare two
+`bench.json` files by hand, from two runs' artifacts or two local runs:
+
+```powershell
+$old = Join-Path $env:TEMP "bench-old"
+$new = Join-Path $env:TEMP "bench-new"
+scripts\bench-record.ps1 -Victory target\release\victory.exe -Out $old
+scripts\bench-record.ps1 -Victory target\release\victory.exe -Out $new -Compare "$old\bench.json"
+```
+
+`-Compare` prints per figure the old median, the new median and the change
+in percent, marks a change beyond `-Threshold` percent (default 30) with a
+`!` and a `::warning::` line (an annotation on a GitHub Actions run), and
+exits 0 all the same. `-DemoTitle <demo-title.exe>` and `-DemoFrames <n>`
+add the demo title as the workflow does, `-Runs <n>` changes the five, and
+`-SelfTest` tests the script's own parsing, median and comparison functions
+on text written in it. A figure of one run is a point in a trend, not a
+verdict: look at several runs before believing a change.
+
 ## Tests
 
 `apps/victory/tests/selftest.rs` runs the built binary with
