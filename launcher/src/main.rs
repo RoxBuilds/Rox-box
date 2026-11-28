@@ -11,6 +11,7 @@
 
 mod backup;
 mod config;
+mod export;
 mod paths;
 mod runner;
 mod switches;
@@ -784,6 +785,22 @@ impl App {
         self.picking = Some((what, rx));
     }
 
+    /// One zip to attach to a bug report ([`export_logs`]); Explorer is opened on it.
+    fn export_logs(&mut self) {
+        let Some(exe) = self.victory_exe() else {
+            self.toast(Mark::Err, "The engine is not there: nothing to export.");
+            return;
+        };
+        match export_logs(&exe, self.lib.active.as_deref()) {
+            Ok((zip, written)) => {
+                self.say(format!("[export: {} with {}]", zip.display(), written.join(", ")));
+                self.toast(Mark::Ok, "Logs exported, with your user, PC and game folder names taken out. Read them before you share them.");
+                let _ = std::process::Command::new(update::system_tool("..\\explorer.exe")).arg(format!("/select,{}", zip.display())).spawn();
+            }
+            Err(e) => self.toast(Mark::Err, format!("The logs were not exported: {e}")),
+        }
+    }
+
     /// Opens a folder or a file with what Windows opens it with.
     fn open(&mut self, path: &Path) {
         if !path.exists() {
@@ -1436,6 +1453,9 @@ impl App {
             if tool(ui, "Run report", None, "The newest run's report, to the clipboard. Numbers and Rox-Box's own words only: safe for a public issue.  victory report", "Copy", idle) {
                 self.enqueue_victory(Kind::Report, &["report"]);
             }
+            if tool(ui, "Export logs", None, "One zip for a bug report: the newest run report, self-test report and run log, and the preflight check, with your user, PC and game folder names taken out. Saved in the logs folder.", "Export", idle) {
+                self.export_logs();
+            }
             if !self.confirm_reset {
                 if tool(ui, "Reset pipeline cache", None, "For a cache gone stale after a driver or version change. Removes the pipeline library and the warm-up's marks; what runs recorded stays.", "Reset", idle) {
                     self.confirm_reset = true;
@@ -1884,6 +1904,52 @@ impl App {
 }
 
 /// `--probe`: what the launcher found, as text, and no window.
+/// The export (export.rs): the newest reports and run log and the preflight
+/// check, with this PC's personal details taken out, zipped into the logs
+/// folder. The zip and the files in it.
+fn export_logs(exe: &Path, active: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
+    let run = |args: &[&str]| {
+        let mut c = std::process::Command::new(exe);
+        c.args(args).creation_flags(CREATE_NO_WINDOW);
+        if let Some(title) = active {
+            c.env("VICTORY_GAME_DIR", title);
+        }
+        c.output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)).unwrap_or_else(|e| format!("could not be started: {e}"))
+    };
+    let data = config_value(&run(&["config"]), "data_dir").ok_or("victory config names no data folder")?;
+    let logs = std::env::var_os("LOCALAPPDATA").map_or_else(|| data.join("logs"), |l| PathBuf::from(l).join("victory").join("logs"));
+    let check = run(&["check"]);
+    let about = format!("Rox-box launcher {}\n{}\n", env!("CARGO_PKG_VERSION"), run(&["--version"]).trim());
+    let name = format!("rox-box-logs-{}", config::now_stamp());
+    let folder = logs.join(&name);
+    let zip = logs.join(format!("{name}.zip"));
+    let private = export::Private::of_this_pc(active);
+    let written = export::gather(&folder, &data.join("reports"), &logs, &check, &about, &private).map_err(|e| e.to_string())?;
+    let packed = std::process::Command::new(update::system_tool("tar.exe"))
+        .args(["-a", "-c", "-f"])
+        .arg(&zip)
+        .arg("-C")
+        .arg(&folder)
+        .args(&written)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = std::fs::remove_dir_all(&folder);
+    if !packed {
+        return Err("tar.exe could not pack them".to_string());
+    }
+    Ok((zip, written))
+}
+
+/// A message box of Windows' own, for when the launcher's window cannot open.
+fn alert(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (text, caption) = (wide(text), wide("Rox-box"));
+    // SAFETY: two NUL-terminated UTF-16 strings that outlive the call, and no owner window.
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR) };
+}
+
 fn probe() {
     let home = Home::find();
     println!("launcher {}", env!("CARGO_PKG_VERSION"));
@@ -1914,6 +1980,20 @@ fn main() -> eframe::Result {
         probe();
         return Ok(());
     }
+    // The export without the window: for a PC on which the window does not open.
+    if std::env::args().any(|a| a == "--export-logs") {
+        let home = Home::find();
+        let exe = home.as_ref().and_then(|h| h.victory(""));
+        let active = home.as_ref().and_then(|h| Library::load(&h.library_file()).active);
+        match exe.ok_or_else(|| "the engine (victory.exe) was not found beside the launcher".to_string()).and_then(|exe| export_logs(&exe, active.as_deref())) {
+            Ok((zip, _)) => println!("{}", zip.display()),
+            Err(e) => {
+                eprintln!("the logs were not exported: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rox-Box")
@@ -1925,7 +2005,16 @@ fn main() -> eframe::Result {
             .with_icon(theme::icon()),
         ..Default::default()
     };
-    eframe::run_native("Rox-Box", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
+    let shown = eframe::run_native("Rox-Box", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))));
+    if let Err(e) = &shown {
+        // A windowed program has no console: without this, a PC whose graphics driver cannot
+        // draw the window would see nothing at all.
+        alert(&format!(
+            "The Rox-box window could not be opened: {e}\n\nUpdating the graphics driver usually fixes this. Until then you can still play: \
+             double-click play.cmd in the Rox-box folder. To collect logs for a bug report, run\n    roxbox-launcher.exe --export-logs"
+        ));
+    }
+    shown
 }
 
 #[cfg(test)]

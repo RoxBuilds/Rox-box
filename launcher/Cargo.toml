@@ -23,7 +23,7 @@ path = "src/main.rs"
 eframe = { version = "=0.29.1", default-features = false, features = ["accesskit", "glow", "default_fonts"] }
 rfd = { version = "0.15", default-features = false }
 winreg = "0.52"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = "s"
