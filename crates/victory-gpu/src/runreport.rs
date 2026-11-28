@@ -294,6 +294,15 @@ pub(crate) fn moved(frames: f64, ms: [f64; 4]) {
     ]);
 }
 
+/// Microseconds the submitting thread spent making memory for submissions'
+/// sends since the frame line's last second (`host::send`; not per frame).
+/// shortcut: the run's last part of a second ([`last_meters`]) is left out.
+pub(crate) fn send_memory_made(us: u64) {
+    if us > 0 {
+        report::figures(&[(Figure::SendMemoryMadeUs, us)]);
+    }
+}
+
 /// Passes over the heap's buffer views per frame, and their ms.
 pub(crate) fn heap_buffers(frames: f64, passes: f64, ms: f64) {
     report::figures(&[

@@ -931,6 +931,9 @@ pub enum Figure {
     MovedTableUs,
     MovedSnapshotsUs,
     SnapshotsWaitedUs,
+    /// Memory for submissions' sends made new on the submitting thread (none
+    /// spare fitted), with its wait until resident, microseconds.
+    SendMemoryMadeUs,
     /// Fed by [`present`]: frames between two presents, and the draws and
     /// dispatches left out in them.
     Intervals,
@@ -3463,6 +3466,7 @@ fn frame_time(d: &mut Doc, f: &[u64; FIGS]) {
     d.float("submitting_thread_stood_ms", per(Figure::StoodUs, 1e3));
     d.float("heap_buffer_passes", per(Figure::HeapBufferPasses, 1.0));
     d.float("heap_buffer_ms", per(Figure::HeapBufferUs, 1e3));
+    d.float("send_memory_made_ms", per(Figure::SendMemoryMadeUs, 1e3));
 }
 
 /// The work spared of `f`, per frame.
@@ -4110,6 +4114,7 @@ mod tests {
             "submitting_thread_stood_ms",
             "heap_buffer_passes",
             "heap_buffer_ms",
+            "send_memory_made_ms",
         ] {
             assert!(frame_time.get(key).is_some(), "no frame_time.{key}");
             assert!(frame_time["steady"].get(key).is_some(), "no frame_time.steady.{key}");

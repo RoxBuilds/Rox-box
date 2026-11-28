@@ -115,15 +115,105 @@ pub(super) struct Memory {
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
 unsafe impl Send for Memory {}
 
+impl Drop for Memory {
+    fn drop(&mut self) {
+        ALIVE.fetch_sub(self.size, Ordering::Relaxed);
+    }
+}
+
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept ([`keep_for`]), read once.
+/// The bytes of all sends' memory there is: held by submissions, or spare.
+static ALIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With [`keep_peak`]: the most bytes submissions held at once in this window
+/// of [`PEAK_WINDOW_MS`] and in the one before, and when this one began
+/// ([`now_ms`]). Changed with [`SPARE`]'s lock held.
+static PEAK: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// How long a window of [`PEAK`] lasts: what submissions held in the last two
+/// to four seconds is kept.
+const PEAK_WINDOW_MS: u64 = 2000;
+
+/// Since the last frame-rate line: sends' memory made new (no spare one
+/// fitted), the microseconds the making took (with its wait until the memory
+/// was resident), and its bytes.
+pub(super) static MADE_NEW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether the spare memory of sends keeps as much as submissions held at once
+/// lately and do not now (`VICTORY_SEND_KEEP_PEAK`, on unless `0`; `0`:
+/// [`kept`] at most, as before), up to a 32nd of the PC's memory and never
+/// less than [`kept`]. With `VICTORY_SEND_KEEP_MB` set, what it says, as
+/// before.
+///
+/// A frame's sixteen-odd submissions each take a buffer of 8 MiB or more and
+/// hold it until the card has run them, with two frames of them in the air:
+/// more than [`kept`] on a PC of 24 GiB or less. What came back past it was
+/// let go of, the biggest first, and made again a frame later, each made
+/// resident before it is written: in a profile of a run on a PC short of
+/// memory, 9 ms a frame of the submitting thread's time, which is the frame's.
+/// What is kept was held by submissions a moment before, and goes, as before,
+/// when memory runs out (`super::budget::relieve`).
+fn keep_peak() -> bool {
+    crate::toggled!("VICTORY_SEND_KEEP_PEAK")
+}
+
+/// The most of sends' memory kept spare while submissions hold `in_use`:
+/// [`spare_most_of`] for this PC.
+fn spare_most(in_use: u64) -> u64 {
+    static CEILING: OnceLock<Option<u64>> = OnceLock::new();
+    let ceiling = *CEILING.get_or_init(|| {
+        (keep_peak() && !kept_and_set().1).then(|| total_physical_ram().map_or(kept(), |ram| ram / 32))
+    });
+    // While the PC's memory is short, no more than before is kept: what is
+    // spare here is memory the PC then lacks (a run on a 16 GB PC spent most
+    // of its time with less than 1 GB free).
+    let ceiling = ceiling.filter(|_| !super::budget::pc_short());
+    let recent = PEAK[0].load(Ordering::Relaxed).max(PEAK[1].load(Ordering::Relaxed));
+    spare_most_of(kept(), ceiling, recent, in_use)
+}
+
+/// The most bytes of sends' memory kept spare, while submissions hold
+/// `in_use` and held `recent` at most lately: `floor` ([`kept`]) without a
+/// `ceiling` ([`keep_peak`] off, or `VICTORY_SEND_KEEP_MB` set); else what the
+/// submissions held lately and do not now, between `floor` and `ceiling`.
+fn spare_most_of(floor: u64, ceiling: Option<u64>, recent: u64, in_use: u64) -> u64 {
+    match ceiling {
+        None => floor,
+        Some(ceiling) => recent.saturating_sub(in_use).min(ceiling).max(floor),
+    }
+}
+
+/// With [`SPARE`]'s lock held (its list `spare`): what submissions hold now,
+/// noted in [`PEAK`].
+fn note_in_use(spare: &[Memory]) -> u64 {
+    let in_use = ALIVE.load(Ordering::Relaxed).saturating_sub(spare.iter().map(|m| m.size).sum());
+    if keep_peak() {
+        let now = now_ms();
+        if now.saturating_sub(PEAK[2].load(Ordering::Relaxed)) >= PEAK_WINDOW_MS {
+            PEAK[1].store(PEAK[0].load(Ordering::Relaxed), Ordering::Relaxed);
+            PEAK[0].store(in_use, Ordering::Relaxed);
+            PEAK[2].store(now, Ordering::Relaxed);
+        } else {
+            PEAK[0].fetch_max(in_use, Ordering::Relaxed);
+        }
+    }
+    in_use
+}
+
+/// [`kept_and_set`]'s bytes.
 fn kept() -> u64 {
-    static KEPT: OnceLock<u64> = OnceLock::new();
+    kept_and_set().0
+}
+
+/// At most this much is kept ([`keep_for`]), read once; and whether
+/// `VICTORY_SEND_KEEP_MB` says it.
+fn kept_and_set() -> (u64, bool) {
+    static KEPT: OnceLock<(u64, bool)> = OnceLock::new();
     *KEPT.get_or_init(|| {
         let mb = std::env::var("VICTORY_SEND_KEEP_MB").ok().and_then(|v| v.trim().parse().ok());
-        keep_for(mb, on_card(), total_physical_ram())
+        (keep_for(mb, on_card(), total_physical_ram()), mb.is_some())
     })
 }
 
@@ -197,23 +287,32 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+            let memory = spare.swap_remove(i);
+            note_in_use(&spare);
+            return Some(memory);
         }
     }
     // By doubles, so that the next of about this size finds it: what
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
+    let making = std::time::Instant::now();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
         None => host.upload_buffer(size)?,
     };
+    MADE_NEW[0].fetch_add(1, Ordering::Relaxed);
+    MADE_NEW[1].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+    MADE_NEW[2].fetch_add(size, Ordering::Relaxed);
     name(&buffer, || "bytes a submission sends up".into());
-    Some(Memory {
+    ALIVE.fetch_add(size, Ordering::Relaxed);
+    let memory = Memory {
         buffer,
         data: data as usize,
         size,
-    })
+    };
+    note_in_use(&SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+    Some(memory)
 }
 
 /// The submission has run.
@@ -221,9 +320,14 @@ pub(super) fn give_back(memory: Memory) {
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+    let most = spare_most(note_in_use(&spare));
+    let mut gone = Vec::new();
+    while spare.iter().map(|m| m.size).sum::<u64>() > most {
+        gone.push(spare.remove(0));
     }
+    // Let go of outside the lock.
+    drop(spare);
+    drop(gone);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
@@ -474,6 +578,21 @@ mod tests {
         assert_eq!(keep_for(None, true, Some(16 * gib)), 256 * mib);
         assert_eq!(keep_for(Some(768), false, Some(16 * gib)), 768 * mib);
         assert_eq!(keep_for(Some(0), true, None), 0);
+    }
+
+    /// The spare memory of sends keeps what submissions held lately and do
+    /// not now, never less than the floor nor more than the ceiling; without
+    /// a ceiling (the switch off, or the amount set) the floor, as before.
+    #[test]
+    fn sends_keep_what_submissions_held_lately() {
+        use super::spare_most_of;
+        let mib = 1u64 << 20;
+        assert_eq!(spare_most_of(128 * mib, None, 400 * mib, 0), 128 * mib, "as before");
+        assert_eq!(spare_most_of(128 * mib, Some(512 * mib), 300 * mib, 0), 300 * mib);
+        assert_eq!(spare_most_of(128 * mib, Some(512 * mib), 300 * mib, 100 * mib), 200 * mib);
+        assert_eq!(spare_most_of(128 * mib, Some(512 * mib), 300 * mib, 250 * mib), 128 * mib, "the floor");
+        assert_eq!(spare_most_of(128 * mib, Some(512 * mib), 2048 * mib, 0), 512 * mib, "the ceiling");
+        assert_eq!(spare_most_of(128 * mib, Some(512 * mib), 0, 400 * mib), 128 * mib);
     }
 
     /// The next of a sequence of numbers that look random (xorshift).

@@ -208,6 +208,12 @@ pub(crate) fn level() -> Level {
     level_of(&sample(), &lines())
 }
 
+/// Whether the PC's memory is short now ([`short_of`]; never with the
+/// governor off). Asked at most every 32 ms of the system ([`sample`]).
+pub(crate) fn pc_short() -> bool {
+    on() && short_of(&sample(), &lines()).pc
+}
+
 /// Which memory a sample says is short: the PC's (free memory under
 /// [`Lines::free_ram`], commit headroom under [`RED_COMMIT`], or the shared
 /// memory past [`Lines::shared_pct`] of its budget) and the card's own (past

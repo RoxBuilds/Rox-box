@@ -5530,13 +5530,19 @@ fn late_line(frames: f64) {
         }
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let made = send::MADE_NEW.each_ref().map(|r| r.swap(0, Ordering::Relaxed));
+            crate::runreport::send_memory_made(made[1]);
             tracing::info!(
                 "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                 taking them out of the CPU sides; their memory made new (none spare fitted; VICTORY_SEND_KEEP_PEAK) {:.2} times, \
+                 {:.2} ms, {:.1} MB",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
                 t[3] / 1000.0,
+                made[0] as f64 / frames,
+                made[1] as f64 / 1000.0 / frames,
+                made[2] as f64 / (1 << 20) as f64 / frames,
             );
             if send::coalesce_gap() > 0 {
                 let c: Vec<f64> = send::COALESCED.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();

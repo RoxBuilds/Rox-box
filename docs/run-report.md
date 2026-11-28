@@ -272,6 +272,7 @@ are left out (rather than written as zeros).
 | `card_idle_behind_us_ms` | "N ms of that while the submitting thread was working" | The card stood idle behind our own CPU work (preparing, copying back): our overhead, not the title's |
 | `submitting_thread_stood_ms` | "the submitting thread stood waiting for the card N ms" | The submitting thread blocked on the card; with a low `card_busy_pct`, the waits themselves are the cost |
 | `heap_buffer_passes`, `heap_buffer_ms` | "heap buffers N passes N ms": passes over the view heap for shaders that pick views by index; with the buffer views' pass on a thread beside (the default) the ms are its texture side, which takes a share of the frame (`VICTORY_TEXTURE_STAGE_SHARE`); the line splits them | Many or slow passes: big heaps rescanned often, or many textures made and staged; a tenth of the frame is the share at work |
+| `send_memory_made_ms` | "their memory made new ... ms" in the line of bytes sent up: memory for submissions' sends made on the submitting thread because no spare one fitted, with its wait until it was resident (`VICTORY_SEND_KEEP_PEAK` keeps what submissions held lately) | The submitting thread makes and waits for new memory each frame: the spare memory is let go of and made again, or the PC is short of memory |
 
 `[frame_time.waits]` (and its `.steady`) splits the waiting in settles of
 submissions sent ahead (`VICTORY_LATE_WAIT` or the relay; all 0 when
@@ -650,6 +651,7 @@ card_idle_behind_us_ms = 4.00
 submitting_thread_stood_ms = 7.00
 heap_buffer_passes = 2.00
 heap_buffer_ms = 0.40
+send_memory_made_ms = 0.00
 
 [frame_time.steady]
 from_s = 40.00
@@ -669,6 +671,7 @@ card_idle_behind_us_ms = 1.62
 submitting_thread_stood_ms = 7.30
 heap_buffer_passes = 2.00
 heap_buffer_ms = 0.30
+send_memory_made_ms = 0.00
 
 [frame_time.waits]
 # ms per frame the waiting for the card in settles took, by what settled, whole run

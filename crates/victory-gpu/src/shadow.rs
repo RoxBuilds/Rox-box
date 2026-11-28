@@ -7194,9 +7194,10 @@ pub(crate) fn no_copy_tell(now: u64) {
 
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking that last took it; the askings so far; and
+/// the bytes the copies hold ([`view_bytes_tally`]).
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, u64)> = Mutex::new((0, BTreeMap::new(), 0));
 
 /// Since the last frame line: askings for such copies, copies made, and
 /// copies not made for [`view_bytes_most`].
@@ -7263,6 +7264,26 @@ fn exact_bytes(map: &BTreeMap<(u64, u64), (Arc<Shadow>, u64)>) -> u64 {
     map.values().map(|(shadow, _)| shadow.len).sum()
 }
 
+/// Whether the bytes the copies of views' own bytes hold are kept as a sum
+/// beside them, changed as copies come and go (`VICTORY_VIEW_BYTES_TALLY`, on
+/// unless `0`; `0`: summed over all the copies at each new one, as before).
+///
+/// Ring positions move every frame, so hundreds of new copies a frame were
+/// asked for among thousands kept, and each new one summed all those kept,
+/// under the lock every thread that makes a buffer view takes: in profiles of
+/// runs on a PC short of memory some 9 ms a frame of the translating threads'
+/// time inside the lock and 30 ms or more of their waiting for it. The sum is
+/// the same either way.
+fn view_bytes_tally() -> bool {
+    crate::toggled!("VICTORY_VIEW_BYTES_TALLY")
+}
+
+/// The bytes the copies of `map` hold: `held`, the sum kept beside them, with
+/// [`view_bytes_tally`]; else summed now.
+fn exact_held(map: &BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, held: u64) -> u64 {
+    if view_bytes_tally() { held } else { exact_bytes(map) }
+}
+
 #[cfg(test)]
 mod view_bytes_tests {
     use super::{view_bytes_fit, view_bytes_of};
@@ -7324,7 +7345,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
+    let (tick, map, held) = &mut *guard;
+    #[cfg(test)]
+    assert_eq!(*held, exact_bytes(map), "the sum kept beside the copies is their bytes");
     *tick += 1;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
@@ -7339,7 +7362,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // [`view_bytes_sweep`] new copies while there are many, and whenever the
     // limit would be passed.
     let since = EXACT_SINCE_SWEEP.fetch_add(1, Ordering::Relaxed) + 1;
-    let fits = view_bytes_fit(exact_bytes(map), len, most);
+    let fits = view_bytes_fit(exact_held(map, *held), len, most);
     if sweep_due(map.len(), MANY, since, view_bytes_sweep()) || !fits {
         EXACT_SINCE_SWEEP.store(0, Ordering::Relaxed);
         // Held by the map alone (no list), its buffer by the copy alone (no
@@ -7353,6 +7376,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             let keep = Arc::strong_count(shadow) > 1 || shown || *used + LATELY > now;
             if !keep && reuse && !shadow.pooled() {
                 gone.push(shadow.clone());
+            }
+            if !keep {
+                *held = held.saturating_sub(shadow.len);
             }
             keep
         });
@@ -7370,7 +7396,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 spare.put(SpareBuffer { size, buffer, data, gpu, mark, ready: None }, crate::host::retire_resource);
             }
         }
-        if !view_bytes_fit(exact_bytes(map), len, most) {
+        if !view_bytes_fit(exact_held(map, *held), len, most) {
             EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -7379,7 +7405,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         && let Some(shadow) = cut_copy(address, len, clock)
     {
         let shadow = Arc::new(shadow);
-        map.insert((address, len), (shadow.clone(), now));
+        exact_insert(map, held, (address, len), shadow.clone(), now);
         EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
         OWN_MADE.fetch_add(1, Ordering::Relaxed);
         IN_BLOCKS.fetch_add(1, Ordering::Relaxed);
@@ -7409,10 +7435,19 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     #[cfg(feature = "diagnostics")]
     crate::book::tag(&buffer, "copies of views' own bytes");
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    exact_insert(map, held, (address, len), shadow.clone(), now);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Puts `shadow` in `map` ([`EXACT`]) at `key`, with its bytes in `held`.
+#[allow(clippy::type_complexity)]
+fn exact_insert(map: &mut BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, held: &mut u64, key: (u64, u64), shadow: Arc<Shadow>, now: u64) {
+    *held = held.saturating_add(shadow.len);
+    if let Some((old, _)) = map.insert(key, (shadow, now)) {
+        *held = held.saturating_sub(old.len);
+    }
 }
 
 /// Copies of single views' bytes made since the start.
@@ -7745,6 +7780,7 @@ impl TestViewCopies {
 pub(crate) fn forget_copies_in(from: u64, to: u64) {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     guard.1.retain(|&(start, _), _| start < from || start >= to);
+    guard.2 = exact_bytes(&guard.1);
 }
 
 /// Tests: whether the range at `start` of the block whose buffer is `block`
@@ -7958,7 +7994,7 @@ pub(crate) fn exact_line(frames: f64) {
     }
     let (kept, bytes) = {
         let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.1.len(), exact_bytes(&guard.1))
+        (guard.1.len(), exact_held(&guard.1, guard.2))
     };
     let [in_blocks, own_buffers, blocks, block_bytes] = view_blocks_counts();
     tracing::info!(
