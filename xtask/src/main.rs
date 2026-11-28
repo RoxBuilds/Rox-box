@@ -39,6 +39,11 @@ enum Cmd {
     /// to install), no timestamp, no build-machine paths; then check it
     /// (`verify-dist`).
     Dist,
+    /// Build the launcher as it is shipped (`launcher/target/release/roxbox-launcher.exe`):
+    /// its own workspace and release profile, with the distribution build's
+    /// flags (the C runtime linked in, no timestamp, no build-machine paths);
+    /// then check it (`verify-dist`).
+    DistLauncher,
     /// Check that a built binary names no build-machine path (the workspace,
     /// the user profile, the Cargo home) and no debug-symbol file.
     VerifyDist {
@@ -66,6 +71,7 @@ fn main() -> Result<()> {
         }
         Cmd::Switches { check } => switches::run(&root, check),
         Cmd::Dist => run_dist(&root),
+        Cmd::DistLauncher => run_dist_launcher(&root),
         Cmd::VerifyDist { file } => verify_dist(&root, &file.unwrap_or_else(|| dist_binary(&root))),
     }
 }
@@ -117,17 +123,54 @@ fn dist_rustflags(prefixes: &[(PathBuf, &'static str)], existing: &str, windows:
     flags
 }
 
-fn run_dist(root: &Path) -> Result<()> {
+/// The distribution build's flags on this machine, as Cargo takes them in
+/// `CARGO_ENCODED_RUSTFLAGS` (the caller's own flags first).
+fn encoded_dist_rustflags(root: &Path) -> String {
     let existing = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
         Ok(encoded) if !encoded.is_empty() => encoded.replace('\x1f', " "),
         _ => std::env::var("RUSTFLAGS").unwrap_or_default(),
     };
-    let flags = dist_rustflags(&host_prefixes(root), &existing, cfg!(windows));
+    dist_rustflags(&host_prefixes(root), &existing, cfg!(windows)).join("\x1f")
+}
+
+/// Where `dist-launcher` leaves the launcher. Its target folder is named to
+/// Cargo outright, so it is here whatever `CARGO_TARGET_DIR` says.
+fn launcher_target(root: &Path) -> PathBuf {
+    root.join("launcher").join("target")
+}
+
+fn launcher_binary(root: &Path) -> PathBuf {
+    let name = if cfg!(windows) { "roxbox-launcher.exe" } else { "roxbox-launcher" };
+    launcher_target(root).join("release").join(name)
+}
+
+/// The launcher is a workspace of its own (`launcher/`): it is built there,
+/// with its own lock file and release profile, and the same flags as the
+/// engine's distribution build, so that what is shipped beside the engine
+/// passes the same check.
+fn run_dist_launcher(root: &Path) -> Result<()> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["build", "--locked", "--release", "--manifest-path"])
+        .arg(root.join("launcher").join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(launcher_target(root))
+        .current_dir(root)
+        .env("CARGO_ENCODED_RUSTFLAGS", encoded_dist_rustflags(root))
+        .env_remove("RUSTFLAGS")
+        .status()
+        .context("running cargo build --release for the launcher")?;
+    anyhow::ensure!(status.success(), "the launcher's distribution build failed");
+    verify_dist(root, &launcher_binary(root))
+}
+
+fn run_dist(root: &Path) -> Result<()> {
+    let flags = encoded_dist_rustflags(root);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
         .args(["build", "--locked", "--profile", "release-dist", "-p", "victory"])
         .current_dir(root)
-        .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"))
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
         .env_remove("RUSTFLAGS")
         .status()
         .context("running cargo build --profile release-dist")?;
@@ -276,6 +319,15 @@ mod tests {
         // Elsewhere: no linker arguments of the Windows linker.
         let other = dist_rustflags(&prefixes, "", false);
         assert!(!other.iter().any(|f| f.contains("link-arg") || f.contains("crt-static")));
+    }
+
+    #[test]
+    fn the_launcher_is_built_in_its_own_target_folder() {
+        let root = Path::new("work").join("tree");
+        let binary = launcher_binary(&root);
+        assert!(binary.starts_with(root.join("launcher").join("target").join("release")), "{binary:?}");
+        assert_eq!(binary.file_stem().and_then(|s| s.to_str()), Some("roxbox-launcher"));
+        assert_ne!(binary, dist_binary(&root));
     }
 
     #[test]

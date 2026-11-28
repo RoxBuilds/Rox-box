@@ -156,12 +156,31 @@ It is written in Rust with egui, not with a web view: the repository's asset
 policy (`cargo xtask policy`) admits source and text files only, and a web
 front end would need page, style and image files that it refuses.
 
+## What it needs of the engine
+
+It reads and starts these, and nothing else of the engine:
+
+| It uses | How |
+|---|---|
+| `scripts\play.ps1` (release: `play.ps1`) | `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File play.ps1 <folder> [-Fast] [-Safe] [-Log] [-Build <b>] [-Console SeriesS] [-More "<a=b;c=d>"] [-Prepare] [-Shots <s>]`. `-Shots` is given only when the script's text holds `]$Shots`. |
+| `victory.exe --version` | a word of digits and dots |
+| `victory.exe check` | lines `[ <STATUS> ] <name>  <detail>` (two spaces before the detail); the line named `Graphics card` with `<name>, <n> MB video memory, ...`; the last line as the summary |
+| `victory.exe config` | lines `cache_dir : <path>` and `data_dir : <path>` |
+| `victory.exe shaders`, `warm --used --settle`, `selftest`, `report` | as they are; `report`'s standard output is what is copied |
+| `<cache_dir>\pipelines\` | removes `host-pipelines.bin`, `warm-stamp.txt`, `warm-done.txt`, `warm-bad.txt` on a reset; nothing else |
+| `VICTORY_GAME_DIR` | set for every `victory.exe` it starts |
+| `victory.toml` | reads `game_dir` under `[paths]`; writes that line only (a copy kept) |
+
+A change to any row needs the matching change in `launcher\src\runner.rs`,
+`system.rs` or `main.rs`; each has a test with the format in it.
+
 ## Not done yet, and not tried
 
-- It is not in the release package (`scripts\package-release.ps1`) or in CI:
-  both are outside `launcher\` and were left alone. Until the package holds
-  `roxbox-launcher.exe`, an update replaces the engine and the scripts and
-  starts the launcher that is there again.
+- Shipping: `cargo xtask dist-launcher` builds it with the distribution build's
+  flags (the C runtime linked in, no build-machine paths) and checks it;
+  `scripts\package-release.ps1` puts it beside `victory.exe` in the package, and
+  `THIRD_PARTY_LICENSES.md` lists its crates. Not tried yet: a real release
+  that carries it.
 - Tried only by tests on files and processes of our own, never for real: an
   update from a release (the checksum, the swap and the putting back are
   tested; the download and the restart are not), launching a title, Stop on

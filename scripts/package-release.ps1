@@ -1,9 +1,12 @@
 # Makes the release a player downloads: dist\Rox-box-<version>-windows-x64.zip (+ .sha256).
-#   scripts\package-release.ps1            builds `cargo xtask dist` first
-#   scripts\package-release.ps1 -NoBuild   packages the target\release-dist\victory.exe there is
-# Steps: hermetic build; check that the binary names no build-machine path; check that every DLL
-# it imports is part of Windows (or bundled); check that THIRD_PARTY_LICENSES.md is current;
-# assemble the folder; run the packaged binary once; zip it and write the SHA-256.
+#   scripts\package-release.ps1            builds `cargo xtask dist` and `cargo xtask dist-launcher` first
+#   scripts\package-release.ps1 -NoBuild   packages the target\release-dist\victory.exe and the
+#                                          launcher\target\release\roxbox-launcher.exe there are
+# Two binaries are shipped: the engine (victory.exe) and the launcher (roxbox-launcher.exe, the
+# window over it; a workspace of its own in launcher\). Both get the same treatment.
+# Steps: hermetic builds; check that neither binary names a build-machine path; check that every
+# DLL they import is part of Windows (or bundled); check that THIRD_PARTY_LICENSES.md is current;
+# assemble the folder; run each packaged binary once; zip it and write the SHA-256.
 # The version is `version` under [workspace.package] in Cargo.toml.
 # -OutDir <dir>   where the folder and the zip go (default: dist\ in the repository, git-ignored)
 # -Bundle <dll>   DLLs to ship next to victory.exe (none are needed today)
@@ -44,6 +47,7 @@ if (-not $version) { Stop-Packaging 'no version under [workspace.package] in Car
 $name = "Rox-box-$version-windows-x64"
 $xtask = 'run', '--locked', '--quiet', '--package', 'xtask', '--'
 $victory = Join-Path $root 'target\release-dist\victory.exe'
+$launcher = Join-Path $root 'launcher\target\release\roxbox-launcher.exe'
 
 Push-Location $root
 try {
@@ -52,22 +56,33 @@ try {
         & cargo @xtask dist
         if ($LASTEXITCODE -ne 0) { Stop-Packaging 'the distribution build failed (scripts\build.ps1 -PrereqOnly checks the toolchain)' }
     }
-    if (-not (Test-Path -LiteralPath $victory)) { Stop-Packaging "no ${victory}: run without -NoBuild" }
-    Write-Host '== hermeticity (cargo xtask verify-dist)'
-    & cargo @xtask verify-dist $victory
-    if ($LASTEXITCODE -ne 0) { Stop-Packaging 'the hermeticity check did not pass (see above): the binary names a build-machine path or a symbol file, or the check could not run' }
+    if (-not $NoBuild) {
+        Write-Host '== hermetic distribution build of the launcher (cargo xtask dist-launcher)'
+        & cargo @xtask dist-launcher
+        if ($LASTEXITCODE -ne 0) { Stop-Packaging 'the launcher''s distribution build failed, or what it built is not hermetic (see above)' }
+    }
+    foreach ($binary in $victory, $launcher) {
+        if (-not (Test-Path -LiteralPath $binary)) { Stop-Packaging "no ${binary}: run without -NoBuild" }
+        Write-Host "== hermeticity of $(Split-Path -Leaf $binary) (cargo xtask verify-dist)"
+        & cargo @xtask verify-dist $binary
+        if ($LASTEXITCODE -ne 0) { Stop-Packaging "the hermeticity check of $(Split-Path -Leaf $binary) did not pass (see above): it names a build-machine path or a symbol file, or the check could not run" }
+    }
 } finally { Pop-Location }
 
-Write-Host '== imported DLLs'
-$dlls = Get-ImportedDlls $victory $victory
-if (-not $dlls) { Stop-Packaging 'the binary could not list its own imports (victory inspect)' }
 $bundled = @($Bundle | ForEach-Object { (Split-Path -Leaf $_).ToLowerInvariant() })
-$needed = @()
-foreach ($dll in $dlls) {
-    $kind = $(if ($bundled -contains $dll) { 'bundled' } elseif (Test-SystemDll $dll) { 'Windows' } else { $needed += $dll; 'NOT PROVIDED' })
-    Write-Host ("  {0,-40} {1}" -f $dll, $kind)
+foreach ($binary in $victory, $launcher) {
+    $leaf = Split-Path -Leaf $binary
+    Write-Host "== DLLs $leaf imports"
+    # The engine reads any 64-bit image's imports, the launcher's as its own.
+    $dlls = Get-ImportedDlls $victory $binary
+    if (-not $dlls) { Stop-Packaging "the imports of $leaf could not be listed (victory inspect)" }
+    $needed = @()
+    foreach ($dll in $dlls) {
+        $kind = $(if ($bundled -contains $dll) { 'bundled' } elseif (Test-SystemDll $dll) { 'Windows' } else { $needed += $dll; 'NOT PROVIDED' })
+        Write-Host ("  {0,-40} {1}" -f $dll, $kind)
+    }
+    if ($needed) { Stop-Packaging "$leaf needs $($needed -join ', '), which Windows does not provide: link it statically, or ship it with -Bundle <path>" }
 }
-if ($needed) { Stop-Packaging "the binary needs $($needed -join ', '), which Windows does not provide: link it statically, or ship it with -Bundle <path>" }
 
 Write-Host '== third-party licenses'
 & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'third-party-licenses.ps1') -Check
@@ -80,6 +95,7 @@ if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -F
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 $files = @(
     $victory,
+    $launcher,
     (Join-Path $root 'scripts\play.ps1'),
     (Join-Path $root 'scripts\play.cmd'),
     (Join-Path $root 'victory.example.toml'),
@@ -107,6 +123,23 @@ foreach ($file in Get-ChildItem -LiteralPath $stage -File | Where-Object { $_.Ex
 Push-Location $stage
 try { $said = "$(& (Join-Path $stage 'victory.exe') --version 2>&1)" } finally { Pop-Location }
 if ($LASTEXITCODE -ne 0 -or $said -notmatch [regex]::Escape($version)) { Stop-Packaging "the packaged victory.exe did not report version $version (it said: $said)" }
+
+# The packaged launcher starts too, and finds the engine beside it with nothing set up: `--probe`
+# prints what it found and opens no window. Its output goes through a file: a windowed program
+# has no console of its own to write to.
+$probeOut = Join-Path $OutDir 'launcher-probe.txt'
+$savedHome = $env:ROXBOX_HOME
+$env:ROXBOX_HOME = $null
+try {
+    $probe = Start-Process -FilePath (Join-Path $stage 'roxbox-launcher.exe') -ArgumentList '--probe' -WorkingDirectory $stage -RedirectStandardOutput $probeOut -NoNewWindow -Wait -PassThru
+    $probeSaid = $(if (Test-Path -LiteralPath $probeOut) { [System.IO.File]::ReadAllText($probeOut) } else { '' })
+} finally {
+    $env:ROXBOX_HOME = $savedHome
+    Remove-Item -LiteralPath $probeOut -Force -ErrorAction SilentlyContinue
+}
+if ($probe.ExitCode -ne 0 -or $probeSaid -notmatch '(?m)^home: Release' -or $probeSaid -notmatch '(?m)^victory\.exe: true') {
+    Stop-Packaging "the packaged roxbox-launcher.exe did not find the engine beside it (exit code $($probe.ExitCode); it said: $probeSaid)"
+}
 
 Write-Host "== $name.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }

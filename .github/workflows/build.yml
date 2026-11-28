@@ -29,6 +29,11 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The engine's workspace, and the launcher's own (launcher\), which the package step builds too.
+          workspaces: |
+            . -> target
+            launcher -> target
       # A release tag must name the version being built.
       - name: Tag matches the workspace version
         if: startsWith(github.ref, 'refs/tags/v')

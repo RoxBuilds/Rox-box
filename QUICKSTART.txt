@@ -32,6 +32,9 @@ SET UP (ONCE)
   is kept as victory.toml.bak-<date>, and only its game_dir line changes).
   To test your PC without starting anything: open a terminal in the folder
   (type  cmd  in Explorer's address bar) and run  play.cmd -Check.
+  Prefer a window? Double-click  roxbox-launcher.exe  instead of play.cmd:
+  your title folders, a Play button, the checks and the settings in one
+  place. It starts the same commands; use whichever you like.
 
   Doing it by hand instead (the same result):
   a. Copy  victory.example.toml  to  victory.toml  in the same folder
