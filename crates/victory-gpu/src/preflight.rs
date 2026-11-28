@@ -1,5 +1,5 @@
 //! What the host has, asked before a run: the Windows build, the commit
-//! memory left and what the default graphics adapter (or the software
+//! memory left and what the graphics adapter a run uses (or the software
 //! adapter, when a run is asked to use it) can do. Nothing here
 //! needs a title; `victory check` prints it and `victory run --execute`
 //! refuses to start without what a run cannot do without.
@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
-/// The default graphics adapter and what a run needs of it.
+/// The graphics adapter a run uses ([`crate::adapter::choose`]) and what a run needs of it.
 #[derive(Debug, Clone)]
 pub struct Gpu {
     /// The adapter's name as Windows reports it.
@@ -25,6 +25,11 @@ pub struct Gpu {
     pub driver: Option<String>,
     /// Its dedicated video memory, in MiB.
     pub dedicated_mb: u64,
+    /// The system memory it may share, in MiB (what a chip without memory of
+    /// its own has instead of dedicated memory).
+    pub shared_mb: u64,
+    /// The other adapters the PC has, not used by a run.
+    pub others: Vec<crate::adapter::Info>,
     /// Whether it is a software rasteriser (no graphics card is used).
     pub software: bool,
     /// The highest shader model it runs, up to 6.6 (`(6, 6)`).
@@ -105,7 +110,7 @@ pub fn software_asked() -> bool {
     crate::switch::on("VICTORY_D3D12_WARP")
 }
 
-/// Makes a Direct3D 12 device on the default adapter, as a run does, asks it
+/// Makes a Direct3D 12 device on the adapter a run uses, as a run does, asks it
 /// what it can do and lets it go again.
 pub fn gpu() -> Result<Gpu, NoDevice> {
     ask(false)
@@ -137,9 +142,16 @@ fn ask(software: bool) -> Result<Gpu, NoDevice> {
         }
         .map(|d| adapter_name(&d.Description));
         let mut device: Option<ID3D12Device> = None;
-        let made = match &warp {
-            Some(warp) => D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, &mut device),
-            None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device),
+        let mut others = Vec::new();
+        // The adapter a run makes its device on (`crate::adapter::choose`), else the default.
+        let made = match (&warp, if warp.is_none() { crate::adapter::choose() } else { None }) {
+            (Some(warp), _) => D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, &mut device),
+            (None, Some(chosen)) => {
+                others = chosen.others();
+                device = Some(chosen.device);
+                Ok(())
+            }
+            (None, None) => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device),
         };
         if let Err(e) = made {
             return Err(NoDevice { adapter: first, reason: e.to_string() });
@@ -184,6 +196,8 @@ fn ask(software: bool) -> Result<Gpu, NoDevice> {
                 .unwrap_or_else(|| "(unnamed adapter)".into()),
             driver,
             dedicated_mb: desc.as_ref().map_or(0, |d| d.DedicatedVideoMemory as u64 >> 20),
+            shared_mb: desc.as_ref().map_or(0, |d| d.SharedSystemMemory as u64 >> 20),
+            others,
             software: desc.as_ref().is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0),
             shader_model,
             mesh_shaders,

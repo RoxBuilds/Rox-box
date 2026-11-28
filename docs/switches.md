@@ -4,7 +4,7 @@ Every `VICTORY_*` environment variable the source reads. This file is generated 
 
 To add a switch, write it in the code (`switch::on`, `toggled!` or a value read), describe it in a comment directly above the read, and run `cargo xtask switches`. `cargo xtask switches --check` (and `cargo test`) fail when this file is stale. `scripts\play.ps1` clears every other `VICTORY_*` variable; see [ARCHITECTURE.md](../ARCHITECTURE.md#configuration-and-switches).
 
-506 switches: 9 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 386 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
+507 switches: 9 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 387 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
 
 How to read the tables:
 
@@ -77,6 +77,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 
 | Name | Kind | Set by default | Description | Where |
 |---|---|---|---|---|
+| `VICTORY_ADAPTER` | value |  | `VICTORY_ADAPTER=<index or name>`: the graphics adapter to run on instead of the best one: its position in the list `victory check` prints (0 is the system's high-performance choice), or part of its name whatever the case (`VICTORY_ADAPTER=geforce`). An adapter that is not there or makes no Direct3D 12 device is said in the log and the best one is used. Unset, the first non-software adapter... | `crates/victory-gpu/src/adapter.rs` |
 | `VICTORY_ALIAS_ALWAYS` | off unless set |  | `VICTORY_ALIAS_ALWAYS=1`: the aliasing barrier before the first upload goes to every texture while the pool is on, committed ones too, which fails the list's `Close`. | `crates/victory-gpu/src/texture.rs` |
 | `VICTORY_ALIAS_COPY` | value |  | \[`alias_of`\]'s search: `found` is given the texture found, under the lock of \[`TARGETS_AT`\] (a texture leaves it before it is freed). | `crates/victory-gpu/src/resource.rs` |
 | `VICTORY_ALIAS_EACH_SOURCE` | value |  | Whether \[`alias`\] copies into a view whenever its list made no copy into it from that source yet (`VICTORY_ALIAS_EACH_SOURCE`, on unless `0`, read once; `0`: at the view's first use in the list only, as before). | `crates/victory-gpu/src/texture.rs` |
@@ -151,7 +152,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_D3D12_DEBUG` | off unless set<br>shader cache key |  | The debug layer only in builds with diagnostics. | `crates/victory-gpu/src/host.rs`<br>`crates/victory-shader/src/emit/host.rs` |
 | `VICTORY_D3D12_DRED` | off unless set | `light` built in<br>`light` | Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics builds). | `crates/victory-gpu/src/host.rs` |
 | `VICTORY_D3D12_GBV` | off unless set |  | GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range descriptor heap indices and the like become messages naming the command instead of page faults. Without state tracking (directly indexed textures are not transitioned). | `crates/victory-gpu/src/host.rs` |
-| `VICTORY_D3D12_WARP` | off unless set |  | `VICTORY_D3D12_WARP=1`: the software adapter, on which a shader's wild access is an access violation in this process (a crash report with the address and instruction) instead of a GPU fault and driver reset; on which this crate's tests and `victory selftest --warp` run on a PC without a card; and on which CI runs the demo title (docs/demo-title.md), since a hosted runner has no graphics card... | `apps/victory/src/selftest.rs`<br>`crates/victory-gpu/src/host.rs`<br>`crates/victory-gpu/src/preflight.rs` |
+| `VICTORY_D3D12_WARP` | off unless set |  | `VICTORY_D3D12_WARP=1`: the software adapter, on which a shader's wild access is an access violation in this process (a crash report with the address and instruction) instead of a GPU fault and driver reset; on which this crate's tests and `victory selftest --warp` run on a PC without a card; and on which CI runs the demo title (docs/demo-title.md), since a hosted runner has no graphics card... | `apps/victory/src/selftest.rs`<br>`crates/victory-gpu/src/adapter.rs`<br>`crates/victory-gpu/src/host.rs`<br>`crates/victory-gpu/src/preflight.rs` |
 | `VICTORY_DECLARE_ONCE` | value |  | See \[`HostList::defer_gpu_write`\]. | `crates/victory-gpu/src/host.rs` |
 | `VICTORY_DEPTH_TWINS` | value |  |  | `crates/victory-gpu/src/resource.rs` |
 | `VICTORY_DIRECT_WRITES` | value |  | Whether title memory is written with the kernel's own call (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks what the pages are (as `VirtualQuery` does: about 2 ms a call in the title's big pools, see \[`copy_mapped`\]): putting back what shaders wrote cost more than a second a frame for hundreds of pieces, 2 ms each whatever their size. On by default... | `crates/victory-gpu/src/host.rs` |

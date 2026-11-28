@@ -355,12 +355,24 @@ fn gpu_items(gpu: Result<victory_gpu::preflight::Gpu, victory_gpu::preflight::No
             )];
         }
     };
-    let described = format!(
-        "{}, {} MB video memory, driver {}",
-        gpu.name,
-        gpu.dedicated_mb,
-        gpu.driver.as_deref().unwrap_or("unknown")
-    );
+    // A chip that shares the PC's memory has little or none of its own: say what it shares instead.
+    let memory = if gpu.dedicated_mb < 1024 && gpu.shared_mb > 0 {
+        format!("{} MB video memory, {} MB shared with the PC", gpu.dedicated_mb, gpu.shared_mb)
+    } else {
+        format!("{} MB video memory", gpu.dedicated_mb)
+    };
+    let mut described = format!("{}, {memory}, driver {}", gpu.name, gpu.driver.as_deref().unwrap_or("unknown"));
+    if !gpu.others.is_empty() {
+        let others: Vec<String> = gpu
+            .others
+            .iter()
+            .map(|a| {
+                let bytes = if a.dedicated >> 20 < 1024 && a.shared > 0 { a.shared } else { a.dedicated };
+                format!("{} ({} MB{})", a.name, bytes >> 20, if a.software { ", software" } else { "" })
+            })
+            .collect();
+        described.push_str(&format!(" (the PC's other adapters: {}; VICTORY_ADAPTER picks another)", others.join(", ")));
+    }
     let card = if gpu.software && asked_software {
         Item::warn(
             "Graphics card",
@@ -809,12 +821,27 @@ mod tests {
             name: "Some Adapter".into(),
             driver: Some("1.2.3.4".into()),
             dedicated_mb: 8192,
+            shared_mb: 8192,
+            others: Vec::new(),
             software: false,
             shader_model: (6, 6),
             mesh_shaders: true,
         };
         assert!(gpu_items(Ok(gpu.clone()), false).iter().all(|i| i.state == State::Ok));
-        let old = gpu_items(Ok(Gpu { shader_model: (6, 5), mesh_shaders: false, ..gpu.clone() }), false);
+        // Another adapter in the PC is named, with its memory.
+        let other = victory_gpu::adapter::Info {
+            name: "Integrated Chip".into(),
+            vendor: 0x8086,
+            software: false,
+            dedicated: 128 << 20,
+            shared: 16 << 30,
+            luid: (0, 1),
+            made: true,
+            sm66: true,
+        };
+        let two = gpu_items(Ok(Gpu { others: vec![other], ..gpu.clone() }), false);
+        assert!(two[0].message().contains("Integrated Chip (16384 MB)"), "{}", two[0].message());
+        let old = gpu_items(Ok(Gpu { shader_model: (6, 5),mesh_shaders: false, ..gpu.clone() }), false);
         assert_eq!(old[1].state, State::Missing);
         assert!(old[1].message().contains("6.5") && old[1].message().contains("driver"));
         assert_eq!(old[2].state, State::Warn);

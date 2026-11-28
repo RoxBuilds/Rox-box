@@ -3526,7 +3526,10 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         let mut device: Option<ID3D12Device> = None;
         match &adapter {
             Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-            None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            None => match crate::adapter::choose() {
+                Some(chosen) => device = Some(chosen.device),
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            },
         }
         let device = device.context("no device")?;
         let info = device.cast::<ID3D12InfoQueue>().ok();

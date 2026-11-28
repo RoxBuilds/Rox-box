@@ -10,11 +10,13 @@
 # The version is `version` under [workspace.package] in Cargo.toml.
 # -OutDir <dir>   where the folder and the zip go (default: dist\ in the repository, git-ignored)
 # -Bundle <dll>   DLLs to ship next to victory.exe (none are needed today)
+# -SelfTest       checks the vendor-binary guard below on made-up folders and exits (no build, no package)
 # -Installer      also build the installer (needs Inno Setup 6's iscc.exe): its absence is an error;
 #                 without the switch the installer is built when iscc.exe is found, else a note is printed
 param(
     [switch]$NoBuild,
     [switch]$Installer,
+    [switch]$SelfTest,
     [string]$OutDir,
     [string[]]$Bundle = @()
 )
@@ -43,6 +45,52 @@ function Test-SystemDll([string]$Dll) {
     if ($Dll -match '^(api-ms-win-|ext-ms-)') { return $true }
     if ($Dll -match '^(vcruntime|msvcp|msvcr|concrt|vcomp|vccorlib|mfc|atl|ucrtbased|dxcompiler|dxil)') { return $false }
     Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\$Dll")
+}
+
+# Vendor binaries (upscaler and driver-SDK libraries, the Agility SDK runtime) never ship: users
+# supply them locally (docs/upscaling.md). Names are wildcards, matched without regard to case.
+$VendorBinaryPatterns = @('amd_fidelityfx*', 'ffx_*.dll', 'nvngx*', 'sl.*.dll', 'nvapi*', 'amd_ags*', 'D3D12Core.dll', 'd3d12SDKLayers.dll')
+
+# The files under `Folder` (any depth) whose names match a vendor pattern; nothing when it is clean.
+function Find-VendorBinaries([string]$Folder) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Folder -Recurse -File -Force)) {
+        foreach ($pattern in $VendorBinaryPatterns) {
+            if ($file.Name -like $pattern) { $file.FullName; break }
+        }
+    }
+}
+
+# Fails the packaging when the stage folder holds a vendor binary.
+function Assert-NoVendorBinaries([string]$Folder) {
+    $found = @(Find-VendorBinaries $Folder)
+    if ($found.Count -gt 0) {
+        Stop-Packaging "vendor binaries must never ship (users supply them locally, docs/upscaling.md), but the package holds: $($found -join ', ')"
+    }
+}
+
+if ($SelfTest) {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("roxbox-guard-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        foreach ($clean in 'victory.exe', 'roxbox-launcher.exe', 'play.ps1', 'slide.dll', 'slx.dll', 'nvidia-notes.txt', 'ffx.txt') {
+            [System.IO.File]::WriteAllText((Join-Path $dir $clean), 'x')
+        }
+        if (@(Find-VendorBinaries $dir).Count -ne 0) { Write-Host 'SELFTEST FAILED: a clean folder was flagged'; exit 1 }
+        foreach ($bad in 'amd_fidelityfx_dx12.dll', 'ffx_fsr2_api_x64.dll', 'nvngx_dlss.dll', 'sl.interposer.dll', 'nvapi64.dll', 'amd_ags_x64.dll', 'D3D12Core.dll', 'd3d12SDKLayers.dll', 'NVAPI64.DLL') {
+            $path = Join-Path $dir $bad
+            [System.IO.File]::WriteAllText($path, 'x')
+            $hit = @(Find-VendorBinaries $dir)
+            if ($hit.Count -ne 1 -or $hit[0] -ne $path) { Write-Host "SELFTEST FAILED: $bad was not flagged (found: $($hit -join ', '))"; exit 1 }
+            Remove-Item -LiteralPath $path -Force
+        }
+        # In a subfolder too.
+        $sub = Join-Path $dir 'local\bin'
+        New-Item -ItemType Directory -Force -Path $sub | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $sub 'nvngx_dlssg.dll'), 'x')
+        if (@(Find-VendorBinaries $dir).Count -ne 1) { Write-Host 'SELFTEST FAILED: a file in a subfolder was not flagged'; exit 1 }
+    } finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host 'vendor-binary guard: self-test passed'
+    exit 0
 }
 
 $version = Get-WorkspaceVersion $root
@@ -110,6 +158,7 @@ foreach ($file in $files) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { Stop-Packaging "missing $file" }
     Copy-Item -LiteralPath $file -Destination $stage
 }
+Assert-NoVendorBinaries $stage
 
 # Nothing that is packaged may name this PC: the user's folder or the repository's.
 $private = @($env:USERPROFILE, $root) | Where-Object { $_ -and $_.Length -ge 4 }
@@ -143,6 +192,9 @@ try {
 if ($probe.ExitCode -ne 0 -or $probeSaid -notmatch '(?m)^home: Release' -or $probeSaid -notmatch '(?m)^victory\.exe: true') {
     Stop-Packaging "the packaged roxbox-launcher.exe did not find the engine beside it (exit code $($probe.ExitCode); it said: $probeSaid)"
 }
+
+# Again, now that the packaged programs have run from the folder: nothing they wrote is vendor's either.
+Assert-NoVendorBinaries $stage
 
 Write-Host "== $name.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
@@ -191,6 +243,8 @@ if (-not $iscc) {
     if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup -Force }
     # The numeric part of the version for the setup's file-version resource (1.2.3 of 1.2.3-rc1).
     $numeric = [regex]::Match($version, '^\d+\.\d+\.\d+').Value
+    # The installer takes the whole folder: the same check, right before it is built.
+    Assert-NoVendorBinaries $stage
     $isccArgs = @('/Qp', "/DAppVersion=$version", "/DSourceDir=$stage", "/O$OutDir")
     if ($numeric) { $isccArgs += "/DAppVersionNumeric=$numeric" }
     & $iscc @isccArgs (Join-Path $root 'dist\installer\rox-box.iss')

@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees.
 
 #[cfg(windows)]
+pub mod adapter;
+#[cfg(windows)]
 mod ambient;
 mod shader_profile;
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -1671,7 +1671,12 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The best adapter (a laptop's dedicated chip, not Windows' default
+            // integrated one; `VICTORY_ADAPTER` picks another), else the default.
+            match crate::adapter::choose() {
+                Some(chosen) => device = Some(chosen.device),
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -1688,11 +1693,9 @@ fn create() -> windows::core::Result<Host> {
         // PC that is bound by its CPU, and frames were measurably longer while
         // they ran. Whether the card is slower with the shaders it then keeps
         // is not known.
-        let vram = (|| {
-            let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()).ok()?;
-            Some(adapter.GetDesc1().ok()?.DedicatedVideoMemory as u64)
-        })();
+        // The card's own memory; for a chip that shares the PC's memory (its
+        // dedicated figure is a few hundred MB or zero) the budget the system gives.
+        let vram = crate::adapter::card_bytes(&device);
         crate::cores::keep_background_slow();
         let set = std::env::var("VICTORY_D3D12_BACKGROUND").ok();
         if background_off(set.as_deref(), total_physical_ram(), vram) {

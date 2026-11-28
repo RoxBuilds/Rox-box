@@ -56,6 +56,13 @@ jobs:
           }
           $found = @($known | Where-Object { Test-Path -LiteralPath $_ })
           if ($found.Count -gt 0) { & $found[0] /? | Select-Object -First 2 } else { iscc.exe /? | Select-Object -First 2 }
+      # The guard that fails packaging when a vendor binary (upscaler or
+      # driver-SDK library) is in the folder, tried on made-up folders.
+      - name: Vendor-binary guard
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-release.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       # Builds `cargo xtask dist`, checks hermeticity, the imported DLLs and
       # the license file, and writes dist\Rox-box-<version>-windows-x64.zip
       # and, with -Installer (an error without Inno Setup), the setup program
