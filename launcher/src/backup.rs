@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn a_saves_folder_is_preferred_and_sizes_are_counted() {
-        let data = std::env::temp_dir().join(format!("roxbox-launcher-source-{}", std::process::id()));
+        let data = std::env::temp_dir().join(format!("roxbox-launcher-backup-source-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
         std::fs::create_dir_all(data.join("reports").join("deep")).unwrap();
         std::fs::write(data.join("reports").join("deep").join("a.txt"), vec![1u8; 3000]).unwrap();
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn a_folder_is_packed_into_a_zip_and_old_ones_go() {
-        let dir = std::env::temp_dir().join(format!("roxbox-launcher-backup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("roxbox-launcher-backup-pack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saves = dir.join("data");
         let backups = dir.join("backups");

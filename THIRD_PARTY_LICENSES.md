@@ -278,7 +278,7 @@ their respective licenses as declared in each crate's manifest.
 | idna | 1.1.0 | The rust-url developers | https://github.com/servo/rust-url/ |
 | image | 0.25.10 | The image-rs Developers | https://github.com/image-rs/image |
 | is_terminal_polyfill | 1.70.2 | (not stated) | https://github.com/polyfill-rs/is_terminal_polyfill |
-| lazy_static | 1.5.1 | Marvin L├╢bel | https://github.com/rust-lang-nursery/lazy-static.rs |
+| lazy_static | 1.5.1 | Marvin Löbel | https://github.com/rust-lang-nursery/lazy-static.rs |
 | litrs | 1.1.0 | Lukas Kalbertodt | https://github.com/LukasKalbertodt/litrs |
 | lock_api | 0.4.14 | Amanieu d'Antras | https://github.com/Amanieu/parking_lot |
 | log | 0.4.35 | The Rust Project Developers | https://github.com/rust-lang/log |
@@ -313,7 +313,7 @@ their respective licenses as declared in each crate's manifest.
 | toml_datetime | 1.1.3+spec-1.1.0 | (not stated) | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.6+spec-1.1.0 | (not stated) | https://github.com/toml-rs/toml |
 | toml_writer | 1.2.0+spec-1.1.0 | (not stated) | https://github.com/toml-rs/toml |
-| ttf-parser | 0.25.1 | Caleb Maclennan, Laurenz Stampfl, Yevhenii Reizner, ╪«╪º┘ä╪» ╪¡╪│┘å┘è (Khaled Hosny) | https://github.com/harfbuzz/ttf-parser |
+| ttf-parser | 0.25.1 | Caleb Maclennan, Laurenz Stampfl, Yevhenii Reizner, خالد حسني (Khaled Hosny) | https://github.com/harfbuzz/ttf-parser |
 | unicode-segmentation | 1.13.3 | kwantam, Manish Goregaokar | https://github.com/unicode-rs/unicode-segmentation |
 | url | 2.5.9 | The rust-url developers | https://github.com/servo/rust-url |
 | webbrowser | 1.2.7 | Amod Malviya @amodm | https://github.com/amodm/webbrowser-rs |

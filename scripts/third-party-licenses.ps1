@@ -15,6 +15,9 @@ if (-not $OutFile) { $OutFile = Join-Path $root 'THIRD_PARTY_LICENSES.md' }
 $target = 'x86_64-pc-windows-msvc'
 # The same order on every PC, whatever its language settings.
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+# Cargo writes UTF-8. Read it as that whatever console started this script: another code page
+# turns an author's name with a letter outside ASCII into other characters, and -Check then fails.
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
 function ConvertFrom-BigJson([string]$Json) {
     try { return ConvertFrom-Json -InputObject $Json -ErrorAction Stop } catch { }
