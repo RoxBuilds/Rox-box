@@ -2040,8 +2040,9 @@ fn render_selftest(s: &Snapshot, test: &Selftest, switches: &[(String, String)])
 // ---------------------------------------------------------------------------
 // Files.
 
-/// `yyyymmdd-hhmmss` (UTC) of `secs` since the Unix epoch.
-fn utc_stamp(secs: u64) -> String {
+/// `yyyymmdd-hhmmss` (UTC) of `secs` since the Unix epoch (the run reports'
+/// names, and `victory play`'s log files, so that the two match).
+pub fn utc_stamp(secs: u64) -> String {
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
     // Civil from days (the proleptic Gregorian calendar, after H. Hinnant).
     let z = days + 719_468;

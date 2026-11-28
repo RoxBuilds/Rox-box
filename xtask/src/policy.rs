@@ -33,6 +33,8 @@ const GENERIC_PROFILES: &[&str] = &[
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // The installer's script (dist/installer/rox-box.iss): text, Inno Setup source.
+    "iss",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

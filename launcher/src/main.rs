@@ -340,6 +340,19 @@ impl App {
         // What the run is given: the toggles, with the saved switches before the extra text.
         let mut given = self.lib.clone();
         given.more = switches::more_for_run(self.book.active_profile(), &self.lib.more);
+        // An engine with `victory play`: one job, no script or PowerShell in between.
+        if let Some(exe) = self.victory_exe().filter(|exe| runner::knows_play(exe)) {
+            let mut run = runner::play_direct(&exe, &given, false);
+            if self.lib.on_play == "close" {
+                // The launcher will be gone: no pipes to it, and the log file keeps the output.
+                if !run.args.iter().any(|a| a == "--log") {
+                    run.args.insert(1, "--log".to_string());
+                }
+                run.detached = true;
+            }
+            self.queue.push_back(run);
+            return;
+        }
         if self.lib.prepare {
             self.queue.push_back(runner::play(&script, &given, source, true));
         }
@@ -617,11 +630,34 @@ impl App {
 
     /// Whether an update can be done here: a release folder, and a package to take.
     fn can_install(&self) -> bool {
-        self.home.as_ref().is_some_and(|h| h.layout == Layout::Release) && matches!(&self.release, Some(Ok(r)) if r.package.is_some())
+        self.home.as_ref().is_some_and(|h| h.layout == Layout::Release)
+            && matches!(&self.release, Some(Ok(r)) if r.package.is_some() || self.via_setup())
+    }
+
+    /// Whether this copy updates through the setup program: it was installed
+    /// by it, and the release has one.
+    fn via_setup(&self) -> bool {
+        self.home.as_ref().is_some_and(|h| update::installed(&h.root)) && matches!(&self.release, Some(Ok(r)) if r.setup.is_some())
     }
 
     fn start_update(&mut self, ctx: &egui::Context) {
+        let via_setup = self.via_setup();
         let (Some(home), Some(Ok(release))) = (&self.home, &self.release) else { return };
+        if via_setup && let Some((setup, _)) = &release.setup {
+            let stage = update::staging(&home.root, &release.tag);
+            let _ = std::fs::remove_dir_all(&stage);
+            if let Err(e) = std::fs::create_dir_all(&stage) {
+                self.update_failed(ctx, format!("the staging folder could not be made: {e}"));
+                return;
+            }
+            if let Some(checksum) = &release.setup_checksum {
+                self.queue.push_back(runner::download(Kind::UpdateChecksum, checksum, &stage.join("setup.exe.sha256")));
+            }
+            self.queue.push_back(runner::download(Kind::UpdatePackage, setup, &stage.join("setup.exe")));
+            self.updating = Updating::Downloading;
+            self.pump(ctx);
+            return;
+        }
         let Some((package, _)) = &release.package else { return };
         let stage = update::staging(&home.root, &release.tag);
         let _ = std::fs::remove_dir_all(&stage);
@@ -647,6 +683,25 @@ impl App {
     /// The package is here: it is checked before anything of it is used.
     fn update_downloaded(&mut self, ctx: &egui::Context) {
         let Some(stage) = self.stage() else { return };
+        let setup = stage.join("setup.exe");
+        if setup.is_file() {
+            // An installed copy: the setup program, once it matches, is run over this folder.
+            let checksum = stage.join("setup.exe.sha256");
+            let Some(home) = self.home.clone() else { return };
+            match update::verify(&setup, checksum.is_file().then_some(checksum.as_path())) {
+                Ok(Some(sum)) => {
+                    self.say(format!("[update: the setup program matches the release's checksum {}\u{2026}; it installs over this folder]", &sum[..12]));
+                    match std::process::Command::new(&setup).args(update::setup_arguments(&home.root)).spawn() {
+                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => self.update_failed(ctx, format!("the setup program could not be started: {e}")),
+                    }
+                }
+                // A setup program is run only when the release says what it must be.
+                Ok(None) => self.update_failed(ctx, "the release publishes no checksum for its setup program".to_string()),
+                Err(e) => self.update_failed(ctx, e),
+            }
+            return;
+        }
         let checksum = stage.join("package.zip.sha256");
         match update::verify(&stage.join("package.zip"), checksum.is_file().then_some(checksum.as_path())) {
             Ok(checked) => {
@@ -1116,7 +1171,18 @@ impl App {
                     ui.add_space(8.0);
                     let missing = self.missing();
                     let (state, mark, detail) = match (&running, &self.status) {
-                        (Some((Kind::Launch, secs)), _) => ("Running".to_string(), Mark::Ok, clock(*secs)),
+                        (Some((Kind::Launch, secs)), _) => {
+                            // `victory play` prepares before it runs: say which step it is at,
+                            // with the last line it printed while it prepares (its progress).
+                            let output = self.job.as_ref().map(|j| j.output.as_slice()).unwrap_or_default();
+                            match runner::phase(output) {
+                                runner::Phase::Running => ("Running".to_string(), Mark::Ok, clock(*secs)),
+                                p => {
+                                    let last: String = output.last().map(|l| l.chars().take(90).collect()).unwrap_or_default();
+                                    (p.words().to_string(), Mark::Warn, format!("{}  \u{00b7}  {last}", clock(*secs)))
+                                }
+                            }
+                        }
                         (Some((Kind::Prepare, secs)), _) => ("Preparing shaders".to_string(), Mark::Warn, format!("{}  \u{00b7}  the title starts when this is done", clock(*secs))),
                         (Some((kind, secs)), _) => (format!("Working: {}", kind.label()), Mark::Warn, clock(*secs)),
                         (None, _) if missing > 0 => ("Not ready".to_string(), Mark::Err, format!("the preflight check misses {missing} thing(s): Diagnostics says which")),

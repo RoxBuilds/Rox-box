@@ -87,6 +87,16 @@ request.
   `MONITORX`, `MWAITX`, `CLWB`, `RDPID`, `EXTRQ`, `INSERTQ`, `UD2`), with no
   GPL-2.0-only third-party code.
 
+## Installer
+
+The Windows setup program (`Rox-box-<version>-windows-x64-setup.exe`) is built
+with [Inno Setup](https://jrsoftware.org/isinfo.php) by Jordan Russell and
+Martijn Laan. Its license permits building and distributing installers with it,
+including for GPL-licensed programs; the setup stub inside the installer is
+Inno Setup's own code, under that license. The installer script is
+[dist/installer/rox-box.iss](dist/installer/rox-box.iss) and installs only
+Rox-box's own files.
+
 ## Cargo Crate Dependencies
 
 Runtime and build dependencies declared in [Cargo.toml](Cargo.toml) (such as

@@ -38,7 +38,7 @@ touch it; PLAY writes it, and so does a button in Settings.
 | Part | What happens when you use it |
 |---|---|
 | **Add folder / drop** | A folder dialog, or a folder (or a title's `.exe`) dropped on the window. Several are kept; the active one is the title of every command. |
-| **PLAY** | `play.ps1 <folder> [-Fast] [-Safe] [-Log] [-Build ..] [-Console SeriesS] [-More "..."]`, started the way `play.cmd` starts it. **Prepare first** runs the same with `-Prepare` before it and starts the title only if that succeeds. |
+| **PLAY** | `victory.exe play [--fast] [--safe] [--log] [--console series-s] [--shots N] [--warm]`, with the title folder as `VICTORY_GAME_DIR` and the saved switches as variables of the run: no script and no PowerShell in between. It checks the PC, translates the shaders when they are stale, then starts the title; the status line says which step it is at. **Prepare first** adds `--warm`: the pipeline warm-up runs first when it is stale. An engine older than `victory play` is started the old way, `play.ps1 <folder> [-Fast] ...` as `play.cmd` starts it. |
 | **Pictures of a run** | Settings, Launch defaults: adds `-Shots <seconds>` to the run (a half-size picture every so often, into `<data_dir>\shots`). Shown only when the engine's `play.ps1` has the option. |
 | **STOP** | Ends the whole process tree at once: what is started is put into a Windows job object, and Stop ends the job, so `victory.exe` and the title go with the script, also when a parent in between has ended already. (`taskkill /T /F` where the job could not be made.) |
 | **Readiness** | GPU and video memory from `victory check`; RAM, Windows, page file from Windows. It reads; it changes nothing. |
@@ -80,7 +80,13 @@ launcher asks GitHub's public API for the newest release of
 `RoxBuilds/Rox-box`, through the `curl.exe` Windows ships. A newer one is shown
 as a banner with the start of its notes.
 
-**Download & install**, in a release folder:
+**Download & install**, in a copy the setup program installed (its uninstaller
+is beside it): the release's setup program and its checksum file are
+downloaded into `local\update\<tag>\`, the setup program runs only when it
+matches the checksum, quietly, over the same folder, and it starts the
+launcher again. The setup program keeps `victory.toml` and `local\`.
+
+In an unzipped release folder:
 
 1. The release's package (`Rox-box-<version>-windows-x64.zip`) and its checksum
    file are downloaded into `local\update\<tag>\`. Files are only taken from

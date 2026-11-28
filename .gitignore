@@ -10,9 +10,10 @@
 # Build output
 /target/
 # Release packages (scripts/package-release.ps1)
-/dist/
+/dist/*
+# ... except the installer's script, which is source
+!/dist/installer/
 /tests/fixtures/*/target/
-/dist/
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml

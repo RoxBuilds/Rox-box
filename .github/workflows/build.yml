@@ -44,11 +44,25 @@ jobs:
             Write-Host "::error::tag $env:GITHUB_REF_NAME does not match the workspace version $version (Cargo.toml)"
             exit 1
           }
+      # The installer is built with Inno Setup 6 (dist\installer\rox-box.iss).
+      # The hosted image usually has it; if not, a pinned version is installed.
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $known = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe")
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not ($known | Where-Object { Test-Path -LiteralPath $_ })) {
+            choco install innosetup --version 6.4.3 --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          $found = @($known | Where-Object { Test-Path -LiteralPath $_ })
+          if ($found.Count -gt 0) { & $found[0] /? | Select-Object -First 2 } else { iscc.exe /? | Select-Object -First 2 }
       # Builds `cargo xtask dist`, checks hermeticity, the imported DLLs and
-      # the license file, and writes dist\Rox-box-<version>-windows-x64.zip.
+      # the license file, and writes dist\Rox-box-<version>-windows-x64.zip
+      # and, with -Installer (an error without Inno Setup), the setup program
+      # dist\Rox-box-<version>-windows-x64-setup.exe, each with its .sha256.
       - name: Package
         shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-release.ps1
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Installer
       # The package as a player gets it: unzipped elsewhere, nothing of the
       # checkout beside it.
       - name: Try the package
@@ -70,6 +84,70 @@ jobs:
           # The rates are for reading in the log; nothing is compared yet.
           .\victory.exe selftest --warp --bench
           if ($LASTEXITCODE -ne 0) { Write-Host "selftest exit code: $LASTEXITCODE"; exit 1 }
+          exit 0
+      # The installer as a player gets it: a silent per-user install (no admin
+      # rights) into a folder with spaces and non-ASCII letters, the installed
+      # program run, an upgrade over it, then the uninstall. The player's own
+      # files (victory.toml, local\, the saves under %LOCALAPPDATA%\victory)
+      # must survive both the upgrade and the uninstall.
+      - name: Try the installer
+        shell: pwsh
+        run: |
+          function Fail([string]$why) { Write-Host "::error::$why"; exit 1 }
+          function Run-Quiet([string]$exe, [string[]]$arguments) {
+            $p = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Fail "$exe $arguments exited with $($p.ExitCode)" }
+          }
+          $setup = (Get-ChildItem dist\Rox-box-*-windows-x64-setup.exe).FullName
+          if (-not $setup) { Fail 'no setup program in dist' }
+          $sums = (Get-Content -LiteralPath "$setup.sha256" -Raw).Trim()
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sums -ne "$hash  $(Split-Path -Leaf $setup)") { Fail "the .sha256 does not match the setup program: $sums" }
+          $inst = Join-Path $env:RUNNER_TEMP "Inst $([char]0xDC)n$([char]0xEF)code Folder\Rox-box"
+          $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=`"$inst`""
+          Run-Quiet $setup $setupArgs
+          foreach ($f in 'victory.exe', 'roxbox-launcher.exe', 'play.cmd', 'play.ps1', 'victory.example.toml', 'QUICKSTART.txt', 'LICENSE', 'THIRD_PARTY_LICENSES.md', 'unins000.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $inst $f))) { Fail "the installed folder has no $f" }
+          }
+          Set-Location -LiteralPath $inst
+          .\victory.exe --version
+          if ($LASTEXITCODE -ne 0) { Fail 'victory.exe --version failed' }
+          .\victory.exe config
+          if ($LASTEXITCODE -ne 0) { Fail 'victory.exe config failed' }
+          .\victory.exe selftest --warp
+          if ($LASTEXITCODE -ne 0) { Fail "selftest exit code: $LASTEXITCODE" }
+          # The launcher finds the engine beside it (its output goes through a file: a windowed program has no console).
+          $probeOut = Join-Path $env:RUNNER_TEMP 'installed-probe.txt'
+          $env:ROXBOX_HOME = $null
+          $probe = Start-Process -FilePath (Join-Path $inst 'roxbox-launcher.exe') -ArgumentList '--probe' -WorkingDirectory $inst -RedirectStandardOutput $probeOut -NoNewWindow -Wait -PassThru
+          $probeSaid = [System.IO.File]::ReadAllText($probeOut)
+          if ($probe.ExitCode -ne 0 -or $probeSaid -notmatch '(?m)^home: Release' -or $probeSaid -notmatch '(?m)^victory\.exe: true') { Fail "the installed launcher did not find the engine (exit $($probe.ExitCode)): $probeSaid" }
+          # The player's own files, and a "save" under %LOCALAPPDATA%\victory.
+          Set-Content -LiteralPath (Join-Path $inst 'victory.toml') -Value '# mine'
+          New-Item -ItemType Directory -Force -Path (Join-Path $inst 'local') | Out-Null
+          Set-Content -LiteralPath (Join-Path $inst 'local\keep.txt') -Value 'keep'
+          $save = Join-Path $env:LOCALAPPDATA 'victory\data\saves-test'
+          New-Item -ItemType Directory -Force -Path $save | Out-Null
+          Set-Content -LiteralPath (Join-Path $save 'keep.txt') -Value 'save'
+          # Upgrade: the same setup again over it. A deleted program file comes back, the player's files stay.
+          Remove-Item -LiteralPath (Join-Path $inst 'play.cmd')
+          Run-Quiet $setup $setupArgs
+          if (-not (Test-Path -LiteralPath (Join-Path $inst 'play.cmd'))) { Fail 'the upgrade did not restore play.cmd' }
+          foreach ($f in 'victory.toml', 'local\keep.txt') {
+            if (-not (Test-Path -LiteralPath (Join-Path $inst $f))) { Fail "the upgrade removed $f" }
+          }
+          # Uninstall, silent: the program is gone, the player's files are not.
+          Set-Location $env:RUNNER_TEMP
+          Run-Quiet (Join-Path $inst 'unins000.exe') '/VERYSILENT', '/SUPPRESSMSGBOXES'
+          for ($i = 0; $i -lt 30 -and (Test-Path -LiteralPath (Join-Path $inst 'victory.exe')); $i++) { Start-Sleep -Seconds 1 }
+          foreach ($f in 'victory.exe', 'roxbox-launcher.exe', 'play.cmd', 'play.ps1', 'victory.example.toml', 'QUICKSTART.txt', 'LICENSE', 'THIRD_PARTY_LICENSES.md', 'unins000.exe') {
+            if (Test-Path -LiteralPath (Join-Path $inst $f)) { Fail "the uninstall left $f" }
+          }
+          foreach ($f in 'victory.toml', 'local\keep.txt') {
+            if (-not (Test-Path -LiteralPath (Join-Path $inst $f))) { Fail "the uninstall removed $f" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $save 'keep.txt'))) { Fail 'the uninstall touched %LOCALAPPDATA%\victory' }
+          Remove-Item -LiteralPath $save -Recurse -Force
           exit 0
       # The self-test's rates (median, minimum, maximum of five runs) and one run
       # of the open demo title, from the packaged binary, kept as numbers: a
@@ -115,6 +193,8 @@ jobs:
           path: |
             dist/Rox-box-*-windows-x64.zip
             dist/Rox-box-*-windows-x64.zip.sha256
+            dist/Rox-box-*-windows-x64-setup.exe
+            dist/Rox-box-*-windows-x64-setup.exe.sha256
           if-no-files-found: error
 
   release:
@@ -135,6 +215,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $files = (Get-ChildItem dist\Rox-box-*-windows-x64.zip*).FullName
+          $files = (Get-ChildItem dist\Rox-box-*-windows-x64.zip*, dist\Rox-box-*-windows-x64-setup.exe*).FullName
           gh release create $env:GITHUB_REF_NAME @files --title "Rox-box $env:GITHUB_REF_NAME" --generate-notes --verify-tag
           if ($LASTEXITCODE -ne 0) { exit 1 }

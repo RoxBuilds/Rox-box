@@ -6,6 +6,8 @@
 mod census;
 mod defaults;
 mod inspect;
+#[cfg(windows)]
+mod play;
 mod preflight;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -169,6 +171,12 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// A run as a player starts it: the check, the preparation a run needs
+    /// (the title's shaders, and with --warm the pipeline warm-up), then the
+    /// run; with --log its output also goes to a log file. What the launcher
+    /// starts.
+    #[cfg(windows)]
+    Play(play::Play),
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -231,6 +239,16 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+/// `victory play` checks the config file itself (its first step is the check).
+fn is_play(command: &Command) -> bool {
+    #[cfg(windows)]
+    if matches!(command, Command::Play(_)) {
+        return true;
+    }
+    let _ = command;
+    false
 }
 
 /// Errors end the process with exit code 1 and what went wrong in plain
@@ -296,6 +314,7 @@ fn real_main() -> Result<()> {
         cli.command,
         Command::Config | Command::Check { .. } | Command::Inspect { .. } | Command::LibExports { .. }
     ) || matches!(cli.command, Command::Selftest { .. })
+        || is_play(&cli.command)
         || matches!(cli.command, Command::Report { diff: Some(_), .. });
     // The commands that start the graphics layer get the confirmed defaults
     // (defaults.rs) before any switch is read.
@@ -370,6 +389,8 @@ fn real_main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(windows)]
+        Command::Play(options) => play::run(options),
         Command::Config => show_config(),
         Command::Check { exe } => preflight::check(exe.as_deref()),
         Command::Report {

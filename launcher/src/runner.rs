@@ -161,6 +161,105 @@ pub fn play(script: &Path, lib: &Library, source_tree: bool, prepare: bool) -> S
     }
 }
 
+/// Whether the engine at `exe` has `victory play` (a run with no script in
+/// between). Engines before it had only play.ps1; their text lacks the option
+/// that only `victory play` has.
+pub fn knows_play(exe: &Path) -> bool {
+    std::fs::read(exe).is_ok_and(|bytes| bytes.windows(PLAY_MARK.len()).any(|w| w == PLAY_MARK))
+}
+
+/// Text that is in an engine with `victory play` (its `--prepare-only` option's help).
+const PLAY_MARK: &[u8] = b"Prepare only: start nothing.";
+
+/// The `NAME=value;NAME=value` text of a run's switches as pairs (what
+/// play.ps1 does with `-More`), for the run's environment.
+pub fn pairs_of(more: &str) -> Vec<(String, String)> {
+    more.split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, _)| crate::switches::valid_name(k))
+        .collect()
+}
+
+/// `victory.exe play`: the check, the preparation and the run, with no
+/// script or PowerShell in between. The toggles become its options, the
+/// title folder `VICTORY_GAME_DIR`, the switches (`lib.more`) variables of
+/// the run. **Prepare first** asks it to warm the pipelines up when that is
+/// stale (shaders it translates whenever they are); `prepare_only` starts
+/// nothing after the preparation.
+pub fn play_direct(exe: &Path, lib: &Library, prepare_only: bool) -> Spec {
+    let mut args = vec!["play".to_string()];
+    if lib.fast {
+        args.push("--fast".to_string());
+    }
+    if lib.safe {
+        args.push("--safe".to_string());
+    }
+    if lib.log {
+        args.push("--log".to_string());
+    }
+    if lib.console == "SeriesS" {
+        args.extend(["--console".to_string(), "series-s".to_string()]);
+    }
+    if lib.prepare || prepare_only {
+        args.push("--warm".to_string());
+    }
+    if prepare_only {
+        args.push("--prepare-only".to_string());
+    } else if lib.shots {
+        args.extend(["--shots".to_string(), lib.shots_every.to_string()]);
+    }
+    let mut envs = pairs_of(&lib.more);
+    if let Some(title) = &lib.active {
+        envs.retain(|(k, _)| k != "VICTORY_GAME_DIR");
+        envs.push(("VICTORY_GAME_DIR".to_string(), title.clone()));
+    }
+    Spec {
+        kind: if prepare_only { Kind::Prepare } else { Kind::Launch },
+        program: exe.to_path_buf(),
+        args,
+        envs,
+        cwd: exe.parent().map(Path::to_path_buf),
+        detached: false,
+    }
+}
+
+/// Where a `victory play` job is, from what it printed so far (its own
+/// lines in play.rs: "victory ... preflight", "Shaders: translating",
+/// "Pipelines: warming up", "Starting the title.").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Checking,
+    Shaders,
+    Pipelines,
+    Running,
+}
+
+impl Phase {
+    pub fn words(self) -> &'static str {
+        match self {
+            Phase::Checking => "Checking this PC",
+            Phase::Shaders => "Translating shaders (first run of this version)",
+            Phase::Pipelines => "Warming up pipelines",
+            Phase::Running => "Running",
+        }
+    }
+}
+
+pub fn phase(lines: &[String]) -> Phase {
+    let mut at = Phase::Checking;
+    for line in lines {
+        if line.starts_with("Starting the title.") {
+            return Phase::Running;
+        } else if line.starts_with("Shaders: translating") {
+            at = Phase::Shaders;
+        } else if line.starts_with("Pipelines: warming up") {
+            at = Phase::Pipelines;
+        }
+    }
+    at
+}
+
 /// What a running job says.
 #[derive(Debug)]
 pub enum Event {
@@ -413,6 +512,39 @@ mod tests {
 
     fn lib() -> Library {
         Library { titles: vec!["D:\\My Titles\\One".into()], active: Some("D:\\My Titles\\One".into()), ..Library::default() }
+    }
+
+    #[test]
+    fn the_toggles_become_victory_play_options_and_variables() {
+        let mut l = lib();
+        l.fast = true;
+        l.log = true;
+        l.safe = false;
+        l.prepare = true;
+        l.shots = true;
+        l.shots_every = 15;
+        l.console = "SeriesS".into();
+        l.active = Some(r"D:\My Títles\One".into());
+        l.more = "VICTORY_UPSCALER=6; VICTORY_GAME_DIR=elsewhere ;not a pair;lower=1".into();
+        let s = play_direct(Path::new(r"C:\Rox-box\victory.exe"), &l, false);
+        assert_eq!(s.kind, Kind::Launch);
+        assert_eq!(s.args, ["play", "--fast", "--log", "--console", "series-s", "--warm", "--shots", "15"]);
+        assert_eq!(
+            s.envs,
+            [("VICTORY_UPSCALER".to_string(), "6".to_string()), ("VICTORY_GAME_DIR".to_string(), r"D:\My Títles\One".to_string())]
+        );
+        let p = play_direct(Path::new(r"C:\Rox-box\victory.exe"), &l, true);
+        assert_eq!(p.kind, Kind::Prepare);
+        assert!(p.args.ends_with(&["--warm".to_string(), "--prepare-only".to_string()]), "{:?}", p.args);
+    }
+
+    #[test]
+    fn a_play_job_says_where_it_is() {
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(phase(&[]), Phase::Checking);
+        assert_eq!(phase(&lines(&["victory 0.3.0 preflight", "Shaders: translating the title's shaders (no stamp)."])), Phase::Shaders);
+        assert_eq!(phase(&lines(&["Shaders: prepared", "Pipelines: warming up the pipelines"])), Phase::Pipelines);
+        assert_eq!(phase(&lines(&["Pipelines: warming up", "Starting the title.", "Shaders: translating"])), Phase::Running);
     }
 
     #[test]

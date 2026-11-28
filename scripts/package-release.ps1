@@ -10,8 +10,11 @@
 # The version is `version` under [workspace.package] in Cargo.toml.
 # -OutDir <dir>   where the folder and the zip go (default: dist\ in the repository, git-ignored)
 # -Bundle <dll>   DLLs to ship next to victory.exe (none are needed today)
+# -Installer      also build the installer (needs Inno Setup 6's iscc.exe): its absence is an error;
+#                 without the switch the installer is built when iscc.exe is found, else a note is printed
 param(
     [switch]$NoBuild,
+    [switch]$Installer,
     [string]$OutDir,
     [string[]]$Bundle = @()
 )
@@ -168,8 +171,41 @@ try {
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n", (New-Object System.Text.UTF8Encoding($false)))
 
+# The installer: the same folder as the zip, as one per-user setup program (dist\installer\rox-box.iss).
+$setup = Join-Path $OutDir "$name-setup.exe"
+$iscc = $null
+$found = Get-Command iscc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($found) { $iscc = $found.Source }
+foreach ($dir in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, (Join-Path $env:LOCALAPPDATA 'Programs')) | Where-Object { $_ }) {
+    if (-not $iscc) {
+        $candidate = Join-Path $dir 'Inno Setup 6\ISCC.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $iscc = $candidate }
+    }
+}
+$setupHash = $null
+if (-not $iscc) {
+    if ($Installer) { Stop-Packaging 'the installer was asked for (-Installer) but Inno Setup 6 (iscc.exe) was not found: install it (winget install --id JRSoftware.InnoSetup -e)' }
+    Write-Host '== installer skipped: Inno Setup 6 (iscc.exe) not found (winget install --id JRSoftware.InnoSetup -e), only the zip was made'
+} else {
+    Write-Host "== $name-setup.exe (Inno Setup: $iscc)"
+    if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup -Force }
+    # The numeric part of the version for the setup's file-version resource (1.2.3 of 1.2.3-rc1).
+    $numeric = [regex]::Match($version, '^\d+\.\d+\.\d+').Value
+    $isccArgs = @('/Qp', "/DAppVersion=$version", "/DSourceDir=$stage", "/O$OutDir")
+    if ($numeric) { $isccArgs += "/DAppVersionNumeric=$numeric" }
+    & $iscc @isccArgs (Join-Path $root 'dist\installer\rox-box.iss')
+    if ($LASTEXITCODE -ne 0) { Stop-Packaging "Inno Setup failed to build the installer (exit code $LASTEXITCODE)" }
+    if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { Stop-Packaging "Inno Setup did not write $setup" }
+    $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+    [System.IO.File]::WriteAllText("$setup.sha256", "$setupHash  $name-setup.exe`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+
 Write-Host ''
 Write-Host "Packaged $name ($said)"
 Write-Host "  folder : $stage"
 Write-Host ("  zip    : {0} ({1:N1} MB)" -f $zip, ((Get-Item -LiteralPath $zip).Length / 1MB))
 Write-Host "  sha256 : $hash"
+if ($setupHash) {
+    Write-Host ("  setup  : {0} ({1:N1} MB)" -f $setup, ((Get-Item -LiteralPath $setup).Length / 1MB))
+    Write-Host "  sha256 : $setupHash"
+}

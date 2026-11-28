@@ -182,24 +182,51 @@ pub const STAMP: &str = "warm-stamp.txt";
 /// from .NET): its headers (the link time among them) and the first code.
 const STAMP_HEAD: u64 = 1 << 20;
 /// The build this is: the folder play.ps1 takes it from.
-const BUILD: &str = if cfg!(feature = "diagnostics") { "diag" } else { "release" };
+pub const BUILD: &str = if cfg!(feature = "diagnostics") { "diag" } else { "release" };
+
+/// What names one build of `victory.exe` in the stamps (this one's and
+/// `victory play`'s): its size, its last write time (seconds since 1970, UTC)
+/// and the SHA-256 of its first [`STAMP_HEAD`] bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExeIdentity {
+    pub size: u64,
+    pub modified: u64,
+    pub head_sha256: String,
+}
+
+impl ExeIdentity {
+    pub fn of(exe: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(exe).with_context(|| exe.display().to_string())?;
+        let mut head = Vec::new();
+        std::fs::File::open(exe)?.take(STAMP_HEAD).read_to_end(&mut head)?;
+        let head_sha256 = sha256(&head).iter().map(|b| format!("{b:02x}")).collect();
+        let modified = meta.modified()?.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        Ok(ExeIdentity { size: meta.len(), modified, head_sha256 })
+    }
+
+    /// The stamp lines every stamp shares: `exe`, `build`, `size`,
+    /// `modified`, `head_sha256`.
+    pub fn lines(&self, exe: &Path) -> String {
+        format!(
+            "exe={}\nbuild={BUILD}\nsize={}\nmodified={}\nhead_sha256={}\n",
+            exe.display(),
+            self.size,
+            self.modified,
+            self.head_sha256
+        )
+    }
+}
 
 /// [`STAMP`]'s text for the exe at `exe`, one `name=value` a line: its path,
-/// [`BUILD`], its size, its last write time (seconds since 1970, UTC), the
-/// SHA-256 of its first [`STAMP_HEAD`] bytes; whether `--settle` ran to its end;
+/// [`BUILD`] and its [`ExeIdentity`]; whether `--settle` ran to its end;
 /// `now` (seconds).
 fn stamp_text(exe: &Path, settled: bool, now: SystemTime) -> Result<String> {
-    let meta = std::fs::metadata(exe).with_context(|| exe.display().to_string())?;
-    let mut head = Vec::new();
-    std::fs::File::open(exe)?.take(STAMP_HEAD).read_to_end(&mut head)?;
-    let hash: String = sha256(&head).iter().map(|b| format!("{b:02x}")).collect();
+    let id = ExeIdentity::of(exe)?;
     let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     Ok(format!(
         "# victory warm: the build that made the pipelines (scripts\\play.ps1 compares the exe it runs with it)\n\
-         exe={}\nbuild={BUILD}\nsize={}\nmodified={}\nhead_sha256={hash}\nsettled={}\nwarmed={}\n",
-        exe.display(),
-        meta.len(),
-        secs(meta.modified()?),
+         {}settled={}\nwarmed={}\n",
+        id.lines(exe),
         if settled { "yes" } else { "no" },
         secs(now)
     ))

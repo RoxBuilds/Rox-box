@@ -16,9 +16,21 @@ WHAT YOU NEED
     file) when you start
   - Nothing to install: no runtime, no redistributable, no compiler
 
+INSTALL
+  Run  Rox-box-<version>-windows-x64-setup.exe  (check its SHA-256 against the
+  .sha256 file first). It needs no administrator rights: it installs for your
+  user only, by default into  %LOCALAPPDATA%\Programs\Rox-box. Then open
+  "Rox-box" from the Start Menu. To update, run a newer setup over the old one:
+  your victory.toml and your "local" folder are kept. Uninstalling (Settings,
+  Apps) asks whether to remove those two as well; your caches, saves and logs
+  in %LOCALAPPDATA%\victory are never removed.
+  Portable instead: unzip the Rox-box-<version>-windows-x64.zip anywhere you
+  like (not inside a copy of the Rox-box source code), keep its files
+  together, and follow the steps below from that folder. It holds the same
+  files as the installed folder.
+
 SET UP (ONCE)
-  1. Unzip the whole folder anywhere you like (not inside a copy of the
-     Rox-box source code). Keep its files together.
+  1. Open the Rox-box folder (the install folder, or the unzipped one).
   2. Double-click  play.cmd.  The first time, it asks for the folder that
      holds your own, legally obtained title files (the title's .exe and
      everything shipped beside it) and opens a window to pick it. Or, if you

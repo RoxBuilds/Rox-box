@@ -14,6 +14,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether the Rox-box folder `home` was installed by the setup program.
+pub fn installed(home: &Path) -> bool {
+    home.join("unins000.exe").is_file()
+}
+
+/// The setup program's options for a quiet update over `home`: progress shown,
+/// no questions, this user's install, the same folder, the launcher started
+/// again afterwards (`/RELAUNCH=1`, read by the setup script).
+pub fn setup_arguments(home: &Path) -> Vec<String> {
+    ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/RELAUNCH=1"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(format!("/DIR={}", home.display())))
+        .collect()
+}
+
 /// Where a release's files must come from to be taken at all.
 pub const DOWNLOAD_PREFIX: &str = "https://github.com/RoxBuilds/Rox-box/releases/download/";
 
@@ -30,6 +46,10 @@ pub struct Release {
     pub package: Option<(String, u64)>,
     /// The package's checksum file, if the release has one.
     pub checksum: Option<String>,
+    /// The setup program (an installed copy updates by running it) and its
+    /// checksum file, if the release has them.
+    pub setup: Option<(String, u64)>,
+    pub setup_checksum: Option<String>,
 }
 
 /// The JSON string that starts at `text` (after its opening quote), unescaped.
@@ -69,7 +89,7 @@ pub fn parse_release(json: &str) -> Option<Release> {
         return None;
     }
     let notes = string_of(json, "body").unwrap_or_default();
-    let (mut package, mut checksum) = (None, None);
+    let (mut package, mut checksum, mut setup, mut setup_checksum) = (None, None, None, None);
     let mut chunks = json.split("\"browser_download_url\"");
     let mut before = chunks.next().unwrap_or_default();
     for chunk in chunks {
@@ -84,11 +104,15 @@ pub fn parse_release(json: &str) -> Option<Release> {
                 package = Some((url, size.unwrap_or(0)));
             } else if url.ends_with("-windows-x64.zip.sha256") {
                 checksum = Some(url);
+            } else if url.ends_with("-windows-x64-setup.exe") {
+                setup = Some((url, size.unwrap_or(0)));
+            } else if url.ends_with("-windows-x64-setup.exe.sha256") {
+                setup_checksum = Some(url);
             }
         }
         before = chunk;
     }
-    Some(Release { tag, notes, package, checksum })
+    Some(Release { tag, notes, package, checksum, setup, setup_checksum })
 }
 
 /// The first lines of release notes, for the banner: plain text, short.
@@ -306,6 +330,8 @@ mod tests {
         let json = r###"{"url":"x","tag_name":"v0.3.0","name":"Rox-box v0.3.0","assets":[
           {"name":"Rox-box-0.3.0-windows-x64.zip","size":4515465,"browser_download_url":"https://github.com/RoxBuilds/Rox-box/releases/download/v0.3.0/Rox-box-0.3.0-windows-x64.zip"},
           {"name":"Rox-box-0.3.0-windows-x64.zip.sha256","size":98,"browser_download_url":"https://github.com/RoxBuilds/Rox-box/releases/download/v0.3.0/Rox-box-0.3.0-windows-x64.zip.sha256"},
+          {"name":"Rox-box-0.3.0-windows-x64-setup.exe","size":5000000,"browser_download_url":"https://github.com/RoxBuilds/Rox-box/releases/download/v0.3.0/Rox-box-0.3.0-windows-x64-setup.exe"},
+          {"name":"Rox-box-0.3.0-windows-x64-setup.exe.sha256","size":104,"browser_download_url":"https://github.com/RoxBuilds/Rox-box/releases/download/v0.3.0/Rox-box-0.3.0-windows-x64-setup.exe.sha256"},
           {"name":"evil.zip","size":1,"browser_download_url":"https://example.invalid/x-windows-x64.zip"}],
           "body":"## What's new\r\n- Faster \"frames\"\n- A launcher\n"}"###;
         let release = parse_release(json).unwrap();
@@ -313,6 +339,9 @@ mod tests {
         assert_eq!(release.package.as_ref().unwrap().1, 4_515_465);
         assert!(release.package.as_ref().unwrap().0.ends_with("/v0.3.0/Rox-box-0.3.0-windows-x64.zip"));
         assert!(release.checksum.as_ref().unwrap().ends_with(".zip.sha256"));
+        assert_eq!(release.setup.as_ref().unwrap().1, 5_000_000);
+        assert!(release.setup.as_ref().unwrap().0.ends_with("-setup.exe"));
+        assert!(release.setup_checksum.as_ref().unwrap().ends_with("-setup.exe.sha256"));
         assert_eq!(release.notes, "## What's new\n- Faster \"frames\"\n- A launcher\n");
         assert_eq!(notes_preview(&release.notes, 200), "What's new  ·  Faster \"frames\"  ·  A launcher");
         assert_eq!(notes_preview(&release.notes, 12).chars().count(), 12);

@@ -82,28 +82,43 @@ files, and use the Direct3D 12 runtime that ships with Windows 11.
 
 ### Quick start
 
-1. **Download** `Rox-box-<version>-windows-x64.zip` and
-   `Rox-box-<version>-windows-x64.zip.sha256` from this repository's GitHub
-   **Releases** page.
+1. **Download** `Rox-box-<version>-windows-x64-setup.exe` and
+   `Rox-box-<version>-windows-x64-setup.exe.sha256` from this repository's
+   GitHub **Releases** page.
 2. **Verify** the download. In PowerShell, in the download folder:
 
    ```powershell
-   (Get-FileHash .\Rox-box-<version>-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
-   Get-Content .\Rox-box-<version>-windows-x64.zip.sha256
+   (Get-FileHash .\Rox-box-<version>-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower()
+   Get-Content .\Rox-box-<version>-windows-x64-setup.exe.sha256
    ```
 
    The two hashes must be the same.
-3. **Unzip** the whole folder anywhere (not inside a copy of the Rox-box source
-   code) and keep its files together: `victory.exe`, `play.cmd`, `play.ps1`,
-   `victory.example.toml`, `QUICKSTART.txt` and the license files.
-4. **Double-click `play.cmd`.** The first time, a window asks for the folder
+3. **Install.** Run the setup program. It needs no administrator rights: it
+   installs for your user only (by default into
+   `%LOCALAPPDATA%\Programs\Rox-box`). To update, run a newer setup over the
+   old one: your `victory.toml` and `local` folder are kept. Uninstalling
+   (Settings, Apps) asks whether to remove those two as well; your caches,
+   saves and logs in `%LOCALAPPDATA%\victory` are never removed.
+4. **Open Rox-box** from the Start Menu: the launcher window, with your title
+   folders, a Play button, the checks and the settings. The steps below use the
+   command-line launcher `play.cmd` in the install folder; the window starts
+   the same commands.
+
+   *Portable alternative:* instead of the setup program, download
+   `Rox-box-<version>-windows-x64.zip` (and its `.sha256`, verified the same
+   way) and **unzip** the whole folder anywhere (not inside a copy of the
+   Rox-box source code). Keep its files together: `victory.exe`, `play.cmd`,
+   `play.ps1`, `victory.example.toml`, `QUICKSTART.txt` and the license files.
+   They are the same files the installer puts down; nothing is registered
+   with Windows (caches, saves and logs still go to `%LOCALAPPDATA%\victory`).
+5. **Double-click `play.cmd`.** The first time, a window asks for the folder
    that holds your own, legally obtained title files (the title's executable
    and everything shipped beside it); you can also drag that folder onto
    `play.cmd`. Rox-box remembers it in `victory.toml` next to `victory.exe`,
    checks your PC (`victory check`: every prerequisite is listed as `OK`,
    `WARN` or `MISSING`, and each line that is not `OK` says how to fix it) and
    asks `Start now? [Y/n]`.
-5. **Play**. From then on, double-click `play.cmd`. If the game folder holds
+6. **Play**. From then on, double-click `play.cmd`. If the game folder holds
    more than one `.exe`, drag the one to run onto `play.cmd`, or name it:
 
    ```
