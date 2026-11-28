@@ -1265,6 +1265,11 @@ pub(crate) struct HostTexture {
     /// ([`note_recorded`]; `u32::MAX`: none yet): it holds nothing written
     /// below that level, and nothing at all without one.
     pub(crate) recorded: std::sync::atomic::AtomicU32,
+    /// The card wrote it: a copy on the card was recorded into it (a view
+    /// the title placed in the memory of a texture the card renders to, in
+    /// another format, `crate::texture::alias`). Its texels are the card's,
+    /// not title memory's: no upload ever goes into it.
+    pub(crate) card_wrote: std::sync::atomic::AtomicBool,
 }
 
 /// An upload into `copy` of the title's levels from `first` on was recorded.
@@ -1273,17 +1278,112 @@ pub(crate) fn note_recorded(copy: &HostTexture, first: u32) {
     copy.recorded.fetch_min(first, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A copy on the card into the host copy of title texture `this` was
+/// recorded ([`HostTexture::card_wrote`]).
+#[cfg(windows)]
+pub(crate) fn note_card_wrote(this: This) {
+    if let Some(copy) = made_copy(this) {
+        copy.card_wrote.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What a host copy holds (its contents), for whether a slot may show it
+/// ([`show_written`], [`holds_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Contents {
+    /// Memory of its own (zeros where nothing was written), or levels made
+    /// level by level (`crate::tiles`, which zero what they give): never
+    /// another texture's bytes.
+    OwnMemory,
+    /// A texture the card renders to or writes (target, depth, unordered
+    /// access): its contents are the card's alone.
+    CardTexture,
+    /// The card wrote it (a copy on the card, [`HostTexture::card_wrote`])
+    /// or the host copied into it (`crate::texture::host_wrote`).
+    CardWrote,
+    /// An upload into it was recorded: it holds the title's bytes from that
+    /// upload's first level on.
+    Uploaded,
+    /// Cut from a block, filled from title memory, and nothing went into it
+    /// yet: what it shows is what the block held before.
+    Nothing,
+}
+
+/// [`Contents`] of a copy: `pooled` cut from a block; `filled` its contents
+/// come from title memory; `tiled` made level by level; `recorded` the first
+/// level of the lowest upload recorded into it (`u32::MAX`: none);
+/// `card_wrote` / `host_wrote` the card or the host wrote it. Only
+/// [`Contents::Nothing`] is ever given a stand-in. Before the copies the card
+/// writes were told apart, a view placed in a target's memory in another
+/// format (written by a copy on the card, never uploaded) counted as one
+/// nothing went into, and was shown as the neutral texture wherever no
+/// upload followed: a full-screen pass read it as grey, a veil over the
+/// whole picture.
+#[cfg(any(windows, test))]
+pub(crate) fn holds_of(
+    pooled: bool,
+    filled: bool,
+    tiled: bool,
+    recorded: u32,
+    card_wrote: bool,
+    host_wrote: impl FnOnce() -> bool,
+) -> Contents {
+    if !filled {
+        Contents::CardTexture
+    } else if !pooled || tiled {
+        Contents::OwnMemory
+    } else if card_wrote {
+        Contents::CardWrote
+    } else if recorded != u32::MAX {
+        Contents::Uploaded
+    } else if host_wrote() {
+        Contents::CardWrote
+    } else {
+        Contents::Nothing
+    }
+}
+
+/// [`holds_of`] for host copy `copy` of title texture `this`.
+#[cfg(windows)]
+pub(crate) fn holds(this: This, copy: &HostTexture) -> Contents {
+    use std::sync::atomic::Ordering::Relaxed;
+    holds_of(
+        copy.pooled,
+        copy.filled,
+        copy.tiled.is_some(),
+        copy.recorded.load(Relaxed),
+        copy.card_wrote.load(Relaxed),
+        || crate::texture::host_wrote(this as usize),
+    )
+}
+
 /// Whether a slot made from host copy `copy` of title texture `this` could
-/// show bytes nothing wrote ([`show_written`]): the copy is cut from a block,
-/// the title fills it, no upload into it was recorded, and the host did not
-/// copy into it either. (A copy of memory of its own reads zeros unwritten.)
+/// show bytes nothing wrote ([`show_written`]): [`Contents::Nothing`]. A copy
+/// the card wrote, one of a texture the card writes, and one that holds an
+/// upload are always shown as they are.
 #[cfg(windows)]
 pub(crate) fn unwritten(this: This, copy: &HostTexture) -> bool {
-    copy.pooled
-        && copy.filled
-        && copy.tiled.is_none()
-        && copy.recorded.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX
-        && !crate::texture::host_wrote(this as usize)
+    holds(this, copy) == Contents::Nothing
+}
+
+/// Since the start: slots that would have been given a stand-in for a copy
+/// cut from a block before the card's writes were told apart, left on their
+/// copy because the card wrote it ([`Contents::CardWrote`]); slots of the
+/// texture pass whose upload was held back, left on their copy because it
+/// held an earlier upload ([`Contents::Uploaded`]).
+#[cfg(windows)]
+pub(crate) static LEFT_ON_COPY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts a slot left on its copy (`holds`) where a stand-in was asked
+/// about: [`LEFT_ON_COPY`]'s kinds; nothing for the others.
+#[cfg(windows)]
+pub(crate) fn left_on_copy(holds: Contents) {
+    let at = match holds {
+        Contents::CardWrote => 0,
+        Contents::Uploaded => 1,
+        _ => return,
+    };
+    LEFT_ON_COPY[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether nothing is shown that was never written (`VICTORY_SHOW_WRITTEN`,
@@ -1293,15 +1393,18 @@ pub(crate) fn unwritten(this: This, copy: &HostTexture) -> bool {
 /// - a slot made where no upload follows in the same list (a slot flipped
 ///   after an upload ran, `descriptor/host.rs` `texture_slots_flip`; a slot
 ///   made again for a copy of more levels, `texture_views_remade`) does not
-///   replace its texture's copy by a new one ([`want_level`]), shows the
-///   neutral texture for a copy no upload went into, and the levels an upload
+///   replace its texture's copy by a new one ([`want_level`]), shows a
+///   stand-in for a copy nothing went into, and the levels an upload
 ///   went into for one whose view starts below them ([`NoUploadFollows`]);
 ///   the slot is made again by the next texture pass;
 /// - a slot of the texture pass made before its upload, and a draw's table
-///   slot, whose upload was held back (the commit guard), shows the neutral
-///   texture;
+///   slot, whose upload was held back (the commit guard), shows a stand-in;
 /// - the first upload into a copy cut from a block writes zeros into the
 ///   levels below the first one it uploads (`crate::texture` `upload_from`).
+///
+/// Only a copy that holds nothing ([`Contents::Nothing`], [`holds_of`]) is
+/// hidden so; the stand-in is a null view, which reads zeros, unless
+/// `VICTORY_STAND_IN=neutral` (`descriptor/host.rs` `stand_in_for`).
 ///
 /// Of a run on a card of 8 GB, textures showed dense coloured noise in rows: a
 /// copy made with fewer levels for the band ([`detail`]) and uploaded was
@@ -1376,7 +1479,7 @@ pub(crate) fn no_upload_follows() -> bool {
     NO_UPLOAD.get()
 }
 
-/// A slot made under [`NoUploadFollows`] was given the neutral texture or
+/// A slot made under [`NoUploadFollows`] was given a stand-in or
 /// fewer levels than its view: it is made again later.
 #[cfg(windows)]
 pub(crate) fn stand_in() {
@@ -1391,11 +1494,11 @@ pub(crate) fn stood_in() -> bool {
 }
 
 /// Since the start ([`show_written`]): slots made where no upload follows
-/// that showed the neutral texture for a copy no upload went into; such
+/// that showed a stand-in for a copy nothing went into; such
 /// slots shown from the first level an upload wrote; copies kept that
 /// showing a slot would have replaced by a new one ([`want_level`]); slots
 /// of the texture pass, and draws' table slots, whose upload was held back
-/// and that showed the neutral texture; first uploads that wrote zeros
+/// and that showed a stand-in; first uploads that wrote zeros
 /// below their first level.
 #[cfg(windows)]
 pub(crate) static UNWRITTEN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
@@ -1409,7 +1512,7 @@ pub(crate) fn unwritten_line() {
     let now = crate::host::coarse_ms();
     let last = SAID[0].load(Relaxed);
     let n = UNWRITTEN.each_ref().map(|n| n.load(Relaxed));
-    let sum: u64 = n.iter().sum();
+    let sum: u64 = n.iter().sum::<u64>() + LEFT_ON_COPY.iter().map(|n| n.load(Relaxed)).sum::<u64>();
     if sum == SAID[1].load(Relaxed)
         || now < last.saturating_add(1000)
         || SAID[0].compare_exchange(last, now.max(1), Relaxed, Relaxed).is_err()
@@ -1417,18 +1520,22 @@ pub(crate) fn unwritten_line() {
         return;
     }
     SAID[1].store(sum, Relaxed);
+    let left = LEFT_ON_COPY.each_ref().map(|n| n.load(Relaxed));
     tracing::info!(
-        "host copies not shown before their bytes (VICTORY_SHOW_WRITTEN), since the start: slots made after an upload \
-         ran that showed the neutral texture for a copy no upload went into {}, shown from the first level uploaded {}; \
-         copies kept that a slot's view would have replaced by an empty one {}; slots of the texture pass {} and draws' \
-         table slots {} that showed the neutral texture as their upload was held back; first uploads that wrote zeros \
-         below their first level {}",
+        "host copies not shown before their bytes (VICTORY_SHOW_WRITTEN, stand-in VICTORY_STAND_IN), since the start: \
+         slots made after an upload ran that showed a stand-in for a copy nothing went into {}, shown from the first \
+         level uploaded {}; copies kept that a slot's view would have replaced by an empty one {}; slots of the texture \
+         pass {} and draws' table slots {} that showed a stand-in as their upload was held back; first uploads that \
+         wrote zeros below their first level {}; left on their copy: as the card wrote it {}, as it held an earlier \
+         upload {}",
         n[0],
         n[1],
         n[2],
         n[3],
         n[4],
-        n[5]
+        n[5],
+        left[0],
+        left[1]
     );
 }
 
@@ -3843,6 +3950,7 @@ impl HostTexture {
             flags,
             pooled: false,
             recorded: std::sync::atomic::AtomicU32::new(u32::MAX),
+            card_wrote: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3871,6 +3979,7 @@ impl HostTexture {
             flags,
             pooled: false,
             recorded: std::sync::atomic::AtomicU32::new(u32::MAX),
+            card_wrote: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -5271,6 +5380,38 @@ mod tests {
         assert!(!fits_pool(4 * MIB, 16 * MIB, 2 * MIB));
         assert!(!fits_pool(0, 16 * MIB, 1000 * MIB));
         assert!(!fits_pool(4 * MIB, 0, 0));
+    }
+
+    /// What a copy holds decides whether a slot may be given a stand-in: only
+    /// one cut from a block, filled from title memory, that no upload, copy
+    /// on the card or host copy went into. A texture the card renders to or
+    /// writes, one the card wrote (a view placed in a target's memory in
+    /// another format), and one that holds an earlier upload are shown as
+    /// they are, whatever else is true of them.
+    #[test]
+    fn only_a_copy_nothing_went_into_is_given_a_stand_in() {
+        let none = u32::MAX;
+        let host = |wrote: bool| move || wrote;
+        // (pooled, filled, tiled, recorded, card wrote, host wrote)
+        assert_eq!(holds_of(true, true, false, none, false, host(false)), Contents::Nothing);
+        assert_eq!(holds_of(true, false, false, none, false, host(false)), Contents::CardTexture);
+        assert_eq!(holds_of(false, false, false, none, false, host(false)), Contents::CardTexture);
+        assert_eq!(holds_of(true, true, false, none, true, host(false)), Contents::CardWrote);
+        assert_eq!(holds_of(true, true, false, none, false, host(true)), Contents::CardWrote);
+        assert_eq!(holds_of(true, true, false, 0, false, host(false)), Contents::Uploaded);
+        assert_eq!(holds_of(true, true, false, 3, false, host(false)), Contents::Uploaded);
+        // Written by the card and uploaded too: the card's.
+        assert_eq!(holds_of(true, true, false, 0, true, host(false)), Contents::CardWrote);
+        // Memory of its own, or levels given level by level: zeros at worst.
+        assert_eq!(holds_of(false, true, false, none, false, host(false)), Contents::OwnMemory);
+        assert_eq!(holds_of(true, true, true, none, false, host(false)), Contents::OwnMemory);
+        // The host's copies are asked about last, and only when it matters.
+        let asked = std::cell::Cell::new(false);
+        let _ = holds_of(true, true, false, 0, false, || {
+            asked.set(true);
+            true
+        });
+        assert!(!asked.get());
     }
 
     /// A host copy made with fewer levels for the band is not replaced by an

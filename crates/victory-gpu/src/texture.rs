@@ -586,6 +586,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
+    // Its texels are the card's from now on: no stand-in hides them
+    // (`crate::resource::Contents::CardWrote`).
+    crate::resource::note_card_wrote(placed);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -1367,6 +1370,7 @@ fn record_upload(
     let cover = below > 0
         && copy.pooled
         && copy.recorded.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX
+        && !copy.card_wrote.load(std::sync::atomic::Ordering::Relaxed)
         && crate::resource::show_written();
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.

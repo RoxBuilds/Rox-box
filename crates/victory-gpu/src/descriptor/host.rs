@@ -2426,10 +2426,10 @@ impl HostHeap {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
-            note_before(index, shown, "neutral, kept too long");
+            note_before(index, shown, "stand-in, kept too long");
             self.quick_is(index, 0);
             self.made.set(index, 0);
-            let kept = neutral_for(&view, self.at(index)).map(Held::from);
+            let kept = kept_long_stand_in(&view, self.at(index)).map(Held::from);
             self.put(index);
             self.clear_twin(index);
             self.keep(index, kept);
@@ -2774,14 +2774,18 @@ impl HostHeap {
         let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
             return;
         };
-        if !unwritten_view(&view) {
-            return;
+        match view_holds(&view) {
+            Some(crate::resource::Contents::Nothing) => {}
+            // (Left on its copy: what it holds is the card's, or an
+            // earlier upload's.)
+            Some(holds) => return crate::resource::left_on_copy(holds),
+            None => return,
         }
         crate::resource::UNWRITTEN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        note_before(index, key, "neutral, upload held back");
+        note_before(index, key, "stand-in, upload held back");
         self.stood_in(index);
-        let kept = neutral_for(&view, self.at(index)).map(Held::from);
+        let kept = stand_in_for(&view, self.at(index)).map(Held::from);
         self.put(index);
         self.keep(index, kept);
     }
@@ -2796,7 +2800,7 @@ impl HostHeap {
             return false;
         }
         crate::resource::UNWRITTEN[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let kept = neutral_for(view, self.at(index)).map(Held::from);
+        let kept = stand_in_for(view, self.at(index)).map(Held::from);
         self.put(index);
         self.clear_twin(index);
         self.write_made_stride(index, 0);
@@ -3991,7 +3995,8 @@ impl HostHeap {
                         self.unmake_stale(index, stale);
                         return Some(view);
                     }
-                    neutral = !self.sampler && is_texture_view(&view) && neutral_at_once();
+                    neutral =
+                        !self.sampler && is_texture_view(&view) && !title_null_view(&view) && neutral_at_once();
                 }
             }
             // A texture made while lists sent before it may still run: those
@@ -5040,21 +5045,30 @@ fn make_twinned(
                 // into shows the neutral texture, one whose view starts below
                 // the levels an upload wrote shows those; either is made again
                 // later (`crate::resource::stand_in`).
+                // Only a copy that holds nothing
+                // (`crate::resource::Contents::Nothing`) is ever hidden: one the
+                // card wrote or of a texture the card writes is shown as it is
+                // (counted where the rule before took it for one that holds
+                // nothing).
+                use std::sync::atomic::Ordering::Relaxed;
+                let holds = crate::resource::holds(resource, &copy);
+                let recorded = copy.recorded.load(Relaxed);
+                if holds == crate::resource::Contents::CardWrote && recorded == u32::MAX {
+                    crate::resource::left_on_copy(holds);
+                }
                 if !crate::resource::no_upload_follows() {
                     // (Its upload follows, unless it is held back: the caller
                     // asks, `crate::resource::take_made_unwritten`.)
-                    if crate::resource::unwritten(resource, &copy) {
+                    if holds == crate::resource::Contents::Nothing {
                         crate::resource::made_unwritten(resource);
                     }
                 } else {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    if crate::resource::unwritten(resource, &copy) {
+                    if holds == crate::resource::Contents::Nothing {
                         crate::resource::stand_in();
                         crate::resource::UNWRITTEN[0].fetch_add(1, Relaxed);
-                        return Some(neutral_for(view, at).map(Held::from));
+                        return Some(stand_in_for(view, at).map(Held::from));
                     }
-                    let recorded = copy.recorded.load(Relaxed);
-                    if copy.pooled
+                    if holds == crate::resource::Contents::Uploaded
                         && let Some(desc) = &mut desc
                         && let Some(from) = written_from(copy.base, recorded)
                     {
@@ -5424,13 +5438,68 @@ fn keep_shown_ms() -> u64 {
 /// that it does not go on showing ([`keep_shown`]: one of another dimension,
 /// a buffer, or by the switch's value) shows the neutral texture at once
 /// until the new one is made, where the new view is of a 2D texture or array
-/// (`VICTORY_NEUTRAL_AT_ONCE`, on unless `0`: a null view meanwhile, which
-/// reads zeros, as before). Of the slots written with another texture, most
-/// were of another dimension: never kept, they showed black for as long as
-/// the new texture waited, then the neutral texture (as [`show_after`] gives
-/// it) or the new one.
+/// (`VICTORY_NEUTRAL_AT_ONCE=1`; off by default: a null view meanwhile, which
+/// reads zeros, as before). Never for the title's own null view (a placed
+/// view at address 0), which shaders are meant to read as zeros. Of the slots
+/// written with another texture, most were of another dimension: never kept,
+/// they showed black for as long as the new texture waited, then the neutral
+/// texture (as [`show_after`] gives it) or the new one.
+///
+/// Off by default since runs with it on showed a veil of grey: the neutral
+/// texture is mid-grey with alpha one half, and a slot given it stays so until
+/// it is made again, which the texture pass does not do for a slot whose view
+/// is the title's null view or of memory not mapped. A mask, a light or fog
+/// input, an emissive or alpha map read as one half adds light everywhere;
+/// zeros add nothing.
 fn neutral_at_once() -> bool {
-    crate::toggled!("VICTORY_NEUTRAL_AT_ONCE")
+    std::env::var_os("VICTORY_NEUTRAL_AT_ONCE").is_some_and(|v| v == "1")
+}
+
+/// Whether a placed shader view is the title's null view: at address 0.
+fn title_null_view(view: &View) -> bool {
+    matches!(view, View::Placed(false, _, desc) if desc[10] == 0 && desc[11] == 0)
+}
+
+/// Whether the stand-in for a host copy that holds nothing
+/// (`crate::resource::show_written`) is the neutral texture
+/// (`VICTORY_STAND_IN=neutral`) or a null view of the slot's kind, which reads
+/// zeros (unset or any other value: the default). Zeros are what a slot read
+/// before a texture was made, and what the title's null views read; the
+/// neutral texture (mid-grey, alpha one half) stood in for every view whose
+/// copy held nothing yet, and runs showed a grey veil over the whole picture
+/// where a full-screen pass read such a slot.
+fn stand_in_neutral() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| neutral_if(std::env::var("VICTORY_STAND_IN").ok().as_deref()))
+}
+
+/// Whether a stand-in switch set to `set` asks for the neutral texture:
+/// `neutral` alone; unset or any other value, a null view.
+fn neutral_if(set: Option<&str>) -> bool {
+    set.is_some_and(|v| v.trim() == "neutral")
+}
+
+/// Makes the stand-in for `view` at `at` ([`stand_in_neutral`]): the neutral
+/// texture's descriptor (what the slot then holds), or a null view.
+fn stand_in_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    if stand_in_neutral() {
+        neutral_for(view, at)
+    } else {
+        null_for(view, at);
+        None
+    }
+}
+
+/// The stand-in of a slot that went on showing another texture too long
+/// ([`HostHeap::texture_slots_kept_long`]): the neutral texture, as before
+/// (`VICTORY_KEPT_LONG_STAND_IN=neutral`), or by default as
+/// [`stand_in_for`] gives it. With the bound in time as well as frames
+/// ([`keep_shown_ms`]) slots are given it far more often, and some wait for
+/// their texture long: the same grey would lie over what they show.
+fn kept_long_stand_in(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    static NEUTRAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let neutral = *NEUTRAL.get_or_init(|| neutral_if(std::env::var("VICTORY_KEPT_LONG_STAND_IN").ok().as_deref()));
+    if neutral { neutral_for(view, at) } else { stand_in_for(view, at) }
 }
 
 /// Slots that went on showing the texture of another view than the title's
@@ -5790,22 +5859,18 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
-/// Whether `view` shows a host copy no upload went into, of memory another
-/// texture may have held (`crate::resource::unwritten`). Nothing is made or
-/// asked for here.
-fn unwritten_view(view: &View) -> bool {
+/// What the host copy `view` shows holds (`crate::resource::holds`); `None`
+/// without one. Nothing is made or asked for here.
+fn view_holds(view: &View) -> Option<crate::resource::Contents> {
     let resource = match view {
         &View::Shader(r, _) => r as crate::object::This,
         View::Placed(false, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            match crate::resource::placed_known(address, resource) {
-                Some(texture) => texture,
-                None => return false,
-            }
+            crate::resource::placed_known(address, resource)?
         }
-        _ => return false,
+        _ => return None,
     };
-    crate::resource::made_copy(resource).is_some_and(|copy| crate::resource::unwritten(resource, &copy))
+    crate::resource::made_copy(resource).map(|copy| crate::resource::holds(resource, &copy))
 }
 
 /// Whether `view` is of a title texture that has no host copy because the
@@ -6182,6 +6247,27 @@ mod tests {
         assert_eq!(view(14, 1, 0.0), (9, 1, 0.0));
         assert_eq!(view(3, 12, 0.0), (0, 10, 0.0));
         assert_eq!(view(10, 4, 0.0), (7, 3, 0.0));
+    }
+
+    /// The stand-ins: a null view unless the switch says `neutral`; never
+    /// the neutral texture at once for the title's own null view.
+    #[test]
+    fn stand_ins_read_zeros_unless_asked_for_grey() {
+        assert!(!neutral_if(None));
+        assert!(!neutral_if(Some("")));
+        assert!(!neutral_if(Some("null")));
+        assert!(!neutral_if(Some("1")));
+        assert!(neutral_if(Some("neutral")));
+        assert!(neutral_if(Some(" neutral ")));
+        let placed = |address: u64| {
+            let mut desc = [0u32; 16];
+            desc[1] = 4;
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        assert!(title_null_view(&placed(0)));
+        assert!(!title_null_view(&placed(0x1_0000_0000)));
+        assert!(!title_null_view(&placed(0x8000)));
     }
 
     /// A view of a copy cut from a block that an upload went into from a
