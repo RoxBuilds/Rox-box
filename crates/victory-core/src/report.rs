@@ -867,6 +867,15 @@ pub enum Figure {
     SparedSpans,
     SparedRoundsFirst,
     SparedRoundsAtSubmit,
+    /// Work moved off the threads a frame waits for, microseconds: objects
+    /// let go on a thread of their own (`VICTORY_BURY_ASIDE`), the log's
+    /// table of pipelines put together on one (`VICTORY_PIPE_TABLE_ASIDE`),
+    /// snapshots taken beside the submitting thread's work and its wait for
+    /// them after (`VICTORY_SNAPSHOTS_BESIDE`).
+    MovedBuryUs,
+    MovedTableUs,
+    MovedSnapshotsUs,
+    SnapshotsWaitedUs,
     /// Fed by [`present`]: frames between two presents, and the draws and
     /// dispatches left out in them.
     Intervals,
@@ -885,6 +894,15 @@ const SPARED: [(Figure, &str, f64); 5] = [
     (Figure::SparedSpans, "slot_writes_sparing_spans", 1.0),
     (Figure::SparedRoundsFirst, "heap_rounds_begun_first", 1.0),
     (Figure::SparedRoundsAtSubmit, "heap_rounds_asked_at_submit", 1.0),
+];
+
+/// The work moved off the threads a frame waits for, under our keys (ms per
+/// frame).
+const MOVED: [(Figure, &str); 4] = [
+    (Figure::MovedBuryUs, "objects_let_go_aside_ms"),
+    (Figure::MovedTableUs, "pipeline_table_aside_ms"),
+    (Figure::MovedSnapshotsUs, "snapshots_beside_ms"),
+    (Figure::SnapshotsWaitedUs, "snapshots_waited_ms"),
 ];
 
 /// The settles' causes as the frame line words them, under our keys.
@@ -3063,6 +3081,14 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
         Some(steady) => spared(d, &steady.figures),
         None => d.comment("none (see [frame_time.steady])"),
     }
+    d.table("frame_time.moved");
+    d.comment("ms per frame of work moved off the threads a frame waits for (0 with the switches off), whole run");
+    moved(d, &s.figures);
+    d.table("frame_time.moved.steady");
+    match &s.steady {
+        Some(steady) => moved(d, &steady.figures),
+        None => d.comment("none (see [frame_time.steady])"),
+    }
     gpu_time_sections(d, &s.gpu_time, s.steady.as_ref(), s.first_present_us.is_some());
 
     d.table("pipelines");
@@ -3257,6 +3283,14 @@ fn spared(d: &mut Doc, f: &[u64; FIGS]) {
     let frames = f[Figure::Frames as usize].max(1) as f64;
     for (figure, key, scale) in SPARED {
         d.float(key, f[figure as usize] as f64 / scale / frames);
+    }
+}
+
+/// The work moved of `f`, ms per frame.
+fn moved(d: &mut Doc, f: &[u64; FIGS]) {
+    let frames = f[Figure::Frames as usize].max(1) as f64;
+    for (figure, key) in MOVED {
+        d.float(key, f[figure as usize] as f64 / 1e3 / frames);
     }
 }
 
@@ -3527,6 +3561,9 @@ mod tests {
             (F::SettledFence, 200_000),
             (F::SparedLeftOnCardBytes, 50_000_000_000),
             (F::SparedPagesInPlace, 9_000),
+            (F::MovedBuryUs, 4_000_000),
+            (F::MovedSnapshotsUs, 3_000_000),
+            (F::SnapshotsWaitedUs, 500_000),
             (F::Intervals, 1_000),
             (F::LeftOut, 1_880),
         ]);
@@ -3555,6 +3592,7 @@ mod tests {
             (F::SettledFence, 100_000),
             (F::SparedLeftOnCardBytes, 18_500_000_000),
             (F::SparedPagesInPlace, 3_330),
+            (F::MovedBuryUs, 1_110_000),
             (F::Intervals, 370),
             (F::LeftOut, 30),
         ]);
@@ -3840,6 +3878,15 @@ mod tests {
             assert!(frame_time["spared"]["steady"].get(key).is_some(), "no steady {key}");
         }
         assert_eq!(frame_time["spared"]["shader_writes_left_on_card_mb"].as_float(), Some(50.0));
+        for (_, key) in MOVED {
+            assert!(frame_time["moved"].get(key).is_some(), "no frame_time.moved.{key}");
+            assert!(frame_time["moved"]["steady"].get(key).is_some(), "no steady moved {key}");
+        }
+        assert_eq!(frame_time["moved"]["objects_let_go_aside_ms"].as_float(), Some(4.0));
+        assert_eq!(frame_time["moved"]["snapshots_beside_ms"].as_float(), Some(3.0));
+        assert_eq!(frame_time["moved"]["snapshots_waited_ms"].as_float(), Some(0.5));
+        assert_eq!(frame_time["moved"]["steady"]["objects_let_go_aside_ms"].as_float(), Some(3.0));
+        assert_eq!(frame_time["moved"]["pipeline_table_aside_ms"].as_float(), Some(0.0));
         assert_eq!(frame_time["preparing_ms"].as_float(), Some(6.2));
         assert_eq!(frame_time["card_busy_pct"].as_float(), Some(70.1));
         assert_eq!(frame_time["steady"]["from_s"].as_float(), Some(40.0));

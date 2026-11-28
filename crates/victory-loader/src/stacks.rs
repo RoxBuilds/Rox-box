@@ -1,6 +1,8 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
-//! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! [`dump_stacks_on_schedule`], to find what a title waits on (diagnostics
+//! builds). The unwinding of another thread's stack is also the sampling
+//! profiler's (`crate::profile`, every build).
 
 use std::ffi::c_void;
 
@@ -15,14 +17,20 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
-    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, ResumeThread, SuspendThread,
+};
+#[cfg(any(test, feature = "diagnostics"))]
+use windows_sys::Win32::System::Threading::{
+    OpenThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+#[cfg(feature = "diagnostics")]
+use crate::crash::locate;
+use crate::crash::{MAX_FRAMES, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
+#[cfg(feature = "diagnostics")]
 pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
@@ -40,6 +48,7 @@ pub fn dump_stacks_on_schedule() {
 /// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in
 /// order. Negative times are now; times no `Duration` holds (`inf`, `NaN`,
 /// `1e20`) are left out instead of panicking the dump thread.
+#[cfg(feature = "diagnostics")]
 fn schedule(list: &str) -> Vec<std::time::Duration> {
     let mut times: Vec<_> = list
         .split(',')
@@ -100,6 +109,7 @@ pub(crate) fn other_threads() -> Vec<u32> {
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
+#[cfg(feature = "diagnostics")]
 pub fn dump_stacks() {
     let ids = other_threads();
     eprintln!("Rox-box: stacks of {} threads", ids.len());
@@ -237,6 +247,7 @@ mod tests {
         assert!(start_of(thread) != 0);
         // SAFETY: opened above.
         unsafe { CloseHandle(thread) };
+        #[cfg(feature = "diagnostics")]
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
@@ -244,6 +255,7 @@ mod tests {
 
     /// Times no `Duration` holds are left out instead of panicking the dump
     /// thread (`from_secs_f64` panicked on `inf`); the rest come in order.
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn schedules_skip_times_out_of_range() {
         let secs = |list| {

@@ -1022,6 +1022,13 @@ pub(crate) fn line(frames: f64) {
     );
 }
 
+/// Microseconds the thread that puts the log's table of pipelines together
+/// spent since the last call (`VICTORY_PIPE_TABLE_ASIDE`): the frame line's
+/// work before.
+pub(crate) fn table_aside_us() -> u64 {
+    pipes::aside_us()
+}
+
 /// When the report that names the run's end is written: the frames since
 /// the line's last second, as the line would give them, without a line.
 /// And the log's table of pipelines over the steady state, once.

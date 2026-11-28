@@ -1839,8 +1839,16 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
-    let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    wide_join(&wide_begin(jobs));
+}
+
+/// How many of a [`wide_begin`]'s jobs are left, and the word that none is.
+type Left = Arc<(Mutex<usize>, std::sync::Condvar)>;
+
+/// Gives `jobs` to the kept threads and returns: [`wide_join`] waits for them.
+fn wide_begin(jobs: Vec<Job>) -> Left {
+    let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1858,6 +1866,13 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
+    left
+}
+
+/// Does jobs of the queue here (any caller's, as the kept threads do) until
+/// it is empty, then waits until those of `left` are done.
+fn wide_join(left: &Left) {
+    let workers = workers();
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1937,6 +1952,91 @@ pub(crate) fn take_snapshots() {
         return;
     }
     wide(copy_jobs(snaps, snap_job()));
+}
+
+/// Whether a submission's snapshots ([`take_snapshots`]) are taken by the
+/// kept threads while the submitting thread prepares the copies in the card's
+/// memory, and waited for before anything writes a snapshot or the lists go
+/// to the card (`VICTORY_SNAPSHOTS_BESIDE`, on unless `0`; `0`: taken there and
+/// then, the submitting thread doing its share, as before).
+///
+/// The snapshots are megabytes of copying a submission: 5 ms a frame of the
+/// submitting thread in a profile, most of it its own share of the copying,
+/// while the kept threads stood idle through what came next (the plan of the
+/// copies in the card's memory, the same again). The bytes taken are the same:
+/// a declared range's bytes do not change between the end of the refreshes and
+/// the lists' send (`wide_back`), the copies in the card's memory have no
+/// snapshot (`Shadow::writing`), and the one thing in between that writes a
+/// snapshot, the sends the lists' copies put (`Shadow::placed_copy`), comes
+/// after the wait ([`Taking::wait`]).
+pub(crate) fn snapshots_beside() -> bool {
+    crate::toggled!("VICTORY_SNAPSHOTS_BESIDE")
+}
+
+/// A submission's snapshots being taken ([`begin_snapshots`]): done when this
+/// is waited for or dropped, whichever comes first.
+pub(crate) struct Taking {
+    left: Option<Left>,
+    began: std::time::Instant,
+}
+
+impl Taking {
+    /// Waits until the snapshots are taken. The microseconds since they began
+    /// and those of the wait.
+    pub(crate) fn wait(mut self) -> (u64, u64) {
+        self.join()
+    }
+
+    fn join(&mut self) -> (u64, u64) {
+        let Some(left) = self.left.take() else {
+            return (0, 0);
+        };
+        let beside = self.began.elapsed().as_micros() as u64;
+        let waiting = std::time::Instant::now();
+        let _wait = crate::timeline::span("waiting for the snapshots taken beside");
+        wide_join(&left);
+        let waited = waiting.elapsed().as_micros() as u64;
+        BESIDE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        BESIDE_STATS[1].fetch_add(beside, Ordering::Relaxed);
+        BESIDE_STATS[2].fetch_add(waited, Ordering::Relaxed);
+        (beside + waited, waited)
+    }
+}
+
+impl Drop for Taking {
+    fn drop(&mut self) {
+        // (The copies read and write memory the caller holds only so long.)
+        self.join();
+    }
+}
+
+/// Since the last frame line: submissions whose snapshots were taken beside,
+/// the microseconds they were taken beside the submitting thread's work, and
+/// the microseconds it then waited for them.
+static BESIDE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`BESIDE_STATS`], taken.
+pub(crate) fn snapshots_beside_taken() -> [u64; 3] {
+    std::array::from_fn(|i| BESIDE_STATS[i].swap(0, Ordering::Relaxed))
+}
+
+/// [`take_snapshots`], begun on the kept threads ([`snapshots_beside`]); the
+/// caller waits for them before anything writes a snapshot or the lists go
+/// to the card.
+pub(crate) fn begin_snapshots() -> Taking {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    begin_copies(snaps, snap_job())
+}
+
+/// `copies` (from, to, bytes) begun on the kept threads in pieces of about
+/// `job` bytes ([`copy_jobs`]); done when the result is waited for or
+/// dropped.
+fn begin_copies(copies: Vec<(usize, usize, usize)>, job: usize) -> Taking {
+    let began = std::time::Instant::now();
+    if copies.is_empty() {
+        return Taking { left: None, began };
+    }
+    Taking { left: Some(wide_begin(copy_jobs(copies, job))), began }
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about `job` bytes each
@@ -2137,7 +2237,7 @@ pub(crate) fn declared(root: bool, len: u64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, snap_job_of, spin_us_of, wide};
+    use super::{Job, PIECE, WIDE_JOB, begin_copies, copy_jobs, find_pieces, snap_job_of, spin_us_of, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2245,6 +2345,52 @@ mod wide_tests {
         }
         // The two ways of the switch, and a third: the same bytes.
         assert!(taken.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    /// Snapshots taken beside other work (`VICTORY_SNAPSHOTS_BESIDE`) are
+    /// byte for byte those taken there and then (the switch off): waited for,
+    /// or only dropped, and with other spread work run by the caller in
+    /// between (the plan of the copies in the card's memory does some).
+    #[test]
+    fn snapshots_taken_beside_are_the_snapshots_taken_there_and_then() {
+        let job = snap_job_of(None);
+        let sizes = [0usize, 1, 4095, job - 1, job, job + 1, 3 * job + 12345, 70_001, 2 * job + 9];
+        const GAP: usize = 17;
+        let total: usize = sizes.iter().map(|n| n + GAP).sum();
+        let src: Vec<u8> = (0..total).map(|i| (i * 131 + i / 4093) as u8).collect();
+        let mut places = Vec::new();
+        let mut at = 0;
+        for &n in &sizes {
+            places.push((at, n));
+            at += n + GAP;
+        }
+        let copies = |dst: &mut Vec<u8>| -> Vec<(usize, usize, usize)> {
+            let (s, d) = (src.as_ptr() as usize, dst.as_mut_ptr() as usize);
+            places.iter().map(|&(at, n)| (s + at, d + at, n)).collect()
+        };
+        // The switch off: there and then.
+        let mut there = vec![0x5au8; total];
+        wide(copy_jobs(copies(&mut there), job));
+        // On, waited for.
+        let mut waited = vec![0x5au8; total];
+        begin_copies(copies(&mut waited), job).wait();
+        // On, with other spread work done by the caller before, and only
+        // dropped.
+        let mut dropped = vec![0x5au8; total];
+        let other_src = vec![7u8; 3 * WIDE_JOB];
+        let mut other_dst = vec![0u8; 3 * WIDE_JOB];
+        {
+            let _taking = begin_copies(copies(&mut dropped), job);
+            let (s, d) = (other_src.as_ptr() as usize, other_dst.as_mut_ptr() as usize);
+            wide(copy_jobs(vec![(s, d, other_src.len())], WIDE_JOB));
+        }
+        assert!(other_src == other_dst);
+        assert!(there == waited && waited == dropped);
+        // Every range taken, and nothing between them touched.
+        assert!(places.iter().all(|&(at, n)| there[at..at + n] == src[at..at + n]));
+        assert!(places.iter().all(|&(at, n)| there[at + n..at + n + GAP].iter().all(|&b| b == 0x5a)));
+        // Nothing to take: nothing begun, nothing waited for.
+        assert_eq!(begin_copies(Vec::new(), job).wait(), (0, 0));
     }
 
     /// The time a thread waits awake: 50 us unless set, the setting's older

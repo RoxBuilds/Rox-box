@@ -211,6 +211,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
 | **`[frame_time.spared]`**, **`.steady`** | Per frame, work the unified-memory synchronisation switches spared (all 0 with them off; [below](#reading-the-spared-work)) |
+| **`[frame_time.moved]`**, **`.steady`** | Per frame, ms of work moved off the threads a frame waits for (all 0 with the switches off; [below](#reading-the-moved-work)) |
 | **`[gpu_time]`**, **`[gpu_time.steady]`** | Per frame, the card's own time on the host queue by kind of work (the title's draws and dispatches, each kind of bookkeeping of ours), what our work moved, and the memory the budget governor saw meanwhile; the steady state as `[frame_time.steady]`'s ([below](#reading-the-gpu-time)) |
 | **`[pipelines]`** | `created_by_title`; host pipelines `host_made_now` (compiled during the run) and `host_from_library`; `host_failed` |
 | **`[shaders]`** | Translations `translated_now`, `from_cache`, `failed` |
@@ -418,6 +419,19 @@ switch is off.
 | `slot_writes_sparing_spans` | `VICTORY_SPANS_QUICK` | Writes of view slots that left the placed views' spans and their lock alone. Less waiting on that lock, in the heaps' records' round and the texture passes |
 | `heap_rounds_begun_first` | `VICTORY_HEAP_SYNC_FIRST` | Submissions whose round of the heaps' records began as they took the submission lock, beside the planning before it |
 | `heap_rounds_asked_at_submit` | `VICTORY_HEAP_SYNC_AT_SUBMIT` | Preparings that found the round they need asked for at the title's submit call, while the submission waited in the line (with `VICTORY_ASYNC_SUBMIT`) |
+
+### Reading the moved work
+
+`[frame_time.moved]` (and its `.steady`) says, in ms per frame, what work
+ran on a thread a frame does not wait for instead of on one it does, from
+the frame line's own lines. Every key is 0 while its switch is off.
+
+| Key | Switch | What it is, and which figure it should move |
+|---|---|---|
+| `objects_let_go_aside_ms` | `VICTORY_BURY_ASIDE` | Objects let go past the bury lag, dropped on a thread of their own instead of by the landing that let them go. The relay's landings end sooner: `lists_in_the_air` in `[frame_time.waits]` and `copying_back_ms` should fall |
+| `pipeline_table_aside_ms` | `VICTORY_PIPE_TABLE_ASIDE` | The log's table of compute pipelines (and the look at their programs' loops) put together on a thread of its own, not by the submitting thread right after a present |
+| `snapshots_beside_ms` | `VICTORY_SNAPSHOTS_BESIDE` | Time a submission's snapshots were being taken by the kept threads while the submitting thread planned the copies in the card's memory |
+| `snapshots_waited_ms` | `VICTORY_SNAPSHOTS_BESIDE` | What the submitting thread then still waited for them; `snapshots_beside_ms` less this is what came off `preparing_ms` |
 
 ### Reading memory pressure and textures
 
@@ -658,6 +672,19 @@ heap_pages_read_in_place = 9.00
 slot_writes_sparing_spans = 0.00
 heap_rounds_begun_first = 0.00
 heap_rounds_asked_at_submit = 0.00
+
+[frame_time.moved]
+# ms per frame of work moved off the threads a frame waits for (0 with the switches off), whole run
+objects_let_go_aside_ms = 4.00
+pipeline_table_aside_ms = 0.00
+snapshots_beside_ms = 3.00
+snapshots_waited_ms = 0.50
+
+[frame_time.moved.steady]
+objects_let_go_aside_ms = 3.00
+pipeline_table_aside_ms = 0.00
+snapshots_beside_ms = 0.00
+snapshots_waited_ms = 0.00
 
 [gpu_time]
 # the card's own time on the host queue per frame by kind of work, ms (GPU timestamps around

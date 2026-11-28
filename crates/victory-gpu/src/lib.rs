@@ -113,10 +113,18 @@ pub fn switched(switch: &str) -> Option<bool> {
     ab::pick(switch)
 }
 
-/// What the frame is at (`copystat::phase`), for the sampling profiler.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// What the frame is at (`copystat::phase`), for the sampling profiler; 0 in
+/// ordinary builds, which do not keep it (the profiler runs in every build).
+#[cfg(windows)]
 pub fn frame_phase() -> u32 {
-    copystat::phase()
+    #[cfg(feature = "diagnostics")]
+    {
+        copystat::phase()
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        0
+    }
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};

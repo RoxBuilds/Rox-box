@@ -1121,6 +1121,33 @@ mod sweep_tests {
     }
 }
 
+/// For the frame-rate line: work moved off the threads a frame waits for, per
+/// frame, and the run report's figures of it: the objects let go past the
+/// bury lag (`grave`, `VICTORY_BURY_ASIDE`), the log's table of pipelines
+/// (`VICTORY_PIPE_TABLE_ASIDE`), the snapshots taken beside the plan of the
+/// copies in the card's memory (`VICTORY_SNAPSHOTS_BESIDE`).
+fn moved_line(frames: f64) {
+    let frames_ = frames.max(1e-9);
+    let bury = grave::line(frames_);
+    let table_ms = gpu_split::table_aside_us() as f64 / 1000.0 / frames_;
+    let [beside_n, beside_us, waited_us] = crate::shadow::snapshots_beside_taken();
+    let beside_ms = beside_us as f64 / 1000.0 / frames_;
+    let waited_ms = waited_us as f64 / 1000.0 / frames_;
+    let bury_ms = bury.as_ref().map_or(0.0, |b| b.1);
+    crate::runreport::moved(frames, [bury_ms, table_ms, beside_ms, waited_ms]);
+    if let Some((words, _)) = bury {
+        tracing::info!("{words}");
+    }
+    if table_ms > 0.0 || beside_n > 0 {
+        tracing::info!(
+            "work beside the submitting thread per frame: the log's table of pipelines {table_ms:.2} ms on a thread of its own \
+             (VICTORY_PIPE_TABLE_ASIDE=1); the snapshots of {:.1} submissions taken beside its plan of the copies in the \
+             card's memory for {beside_ms:.2} ms, then waited for {waited_ms:.2} ms (VICTORY_SNAPSHOTS_BESIDE=1)",
+            beside_n as f64 / frames_,
+        );
+    }
+}
+
 /// For the frame-rate line: the sweeps since the last one.
 fn sweep_line(frames: f64) {
     let s: Vec<u64> = SWEEPS.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
@@ -1208,7 +1235,8 @@ fn bury_lag() -> u64 {
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
+/// those is dropped a little later than it could be. Dropped on a thread of
+/// its own (`grave`, `VICTORY_BURY_ASIDE`; `0`: here, as before).
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
@@ -1219,7 +1247,7 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    grave::bury(done);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -5187,6 +5215,55 @@ struct RelayFetch {
     had: crate::land::Had,
 }
 
+/// Whether a landing of the relay's wakes the thread that prepares
+/// submissions (`crate::queue`'s line, `VICTORY_ASYNC_SUBMIT`) once it has
+/// told the title what the card did: fences set, values written, submissions
+/// finished (`VICTORY_LANDING_WAKES`, on unless `0`; `0`: as before).
+///
+/// That thread stands at a title's queue's wait until the fence has the
+/// value, and the relay sets such fences when the flights before the signal
+/// have landed (`Host::relay_land`). Nothing told it so: it looked again
+/// when its wait of a millisecond ran out, or when the thread that lets go of
+/// landed lists was done with them and looked at what queues hold. A profile
+/// had it standing with work in its line for a quarter of the frame. The
+/// fence is set as before, and when; only the look at it comes sooner (a
+/// wake with nothing met is one look more).
+fn landing_wakes() -> bool {
+    crate::toggled!("VICTORY_LANDING_WAKES")
+}
+
+/// Since the last frame line: landings that woke the line, without and with
+/// a fence or value told.
+static LANDING_WAKES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a landing that `told` the title a fence or value, and `finished`
+/// submissions, wakes the line with the switch `on` ([`landing_wakes`]): the
+/// place of [`LANDING_WAKES`] it counts in, or `None`.
+fn landing_wake(told: bool, finished: bool, on: bool) -> Option<usize> {
+    (on && (told || finished)).then_some(usize::from(told))
+}
+
+#[cfg(test)]
+mod landing_wake_tests {
+    use super::landing_wake;
+
+    /// Off, no landing wakes the line (it looks when its millisecond is out,
+    /// as before); on, every landing that told or finished something does,
+    /// counted by whether it told a fence or value.
+    #[test]
+    fn a_landing_wakes_the_line_only_with_the_switch() {
+        for told in [false, true] {
+            for finished in [false, true] {
+                assert_eq!(landing_wake(told, finished, false), None);
+            }
+        }
+        assert_eq!(landing_wake(false, false, true), None);
+        assert_eq!(landing_wake(false, true, true), Some(0));
+        assert_eq!(landing_wake(true, false, true), Some(1));
+        assert_eq!(landing_wake(true, true, true), Some(1));
+    }
+}
+
 /// The thread that lands flights ([`relay`]): as soon as the card has run
 /// the first flights of the line it takes them, with what follows them,
 /// and does what they left to do ([`Host::relay_land`]); else it waits for
@@ -5441,6 +5518,13 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        let [ran, told] = [0, 1].map(|i| LANDING_WAKES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if ran + told > 0.0 {
+            tracing::info!(
+                "landings that woke the thread that prepares submissions per frame (VICTORY_LANDING_WAKES=1): {told:.1} \
+                 that told the title a fence or a value, {ran:.1} that only finished submissions"
+            );
+        }
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -5512,6 +5596,7 @@ mod card_join;
 mod card_steps;
 #[cfg(feature = "diagnostics")]
 mod frameline;
+mod grave;
 pub(crate) mod gpu_split;
 #[cfg(any(test, feature = "diagnostics"))]
 pub(crate) mod indirects;
@@ -7117,7 +7202,11 @@ impl Host {
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
+        // Whether a fence or a value in memory was told: something a queue
+        // of the title's may stand at ([`landing_wakes`]).
+        let mut told = false;
         for item in items {
+            told |= !matches!(item, Late::Run(_));
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
@@ -7149,6 +7238,12 @@ impl Host {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             gpu_split::landed(last);
+        }
+        if let Some(why) = landing_wake(told, last > 0, landing_wakes()) {
+            LANDING_WAKES[why].fetch_add(1, Ordering::Relaxed);
+            crate::queue::line_moved();
+        }
+        if last > 0 {
             bury(last);
         }
         stage.next("landing: the rest");
@@ -7987,8 +8082,12 @@ impl Host {
         stage.next("submit: snapshots");
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
-        // lists have not gone to the card.
-        {
+        // lists have not gone to the card. Or begun below, and taken beside
+        // the plan of the copies in the card's memory
+        // (`crate::shadow::snapshots_beside`; read once: the same for the
+        // whole submission).
+        let snapshots_beside = crate::shadow::snapshots_beside();
+        if !snapshots_beside {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
@@ -8007,6 +8106,9 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        // The snapshots, begun on the kept threads; waited for before the
+        // sends are taken (they write snapshots).
+        let taking = snapshots_beside.then(crate::shadow::begin_snapshots);
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let picked = crate::picked::declare(runs);
@@ -8027,6 +8129,11 @@ impl Host {
             seq.append(body);
             seq
         });
+        if let Some(taking) = taking {
+            let (_took, _waited) = taking.wait();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SnapshotUs, _waited);
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -11604,6 +11711,7 @@ impl Meter {
         scratch_relief_line();
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        moved_line(frames);
         sweep_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);

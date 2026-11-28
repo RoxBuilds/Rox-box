@@ -281,6 +281,19 @@ pub(crate) fn settle_waits(frames: f64, ms: [f64; 9]) {
     report::figures(&values);
 }
 
+/// Work moved off the threads a frame waits for, ms per frame, in the order
+/// of the log line (`host::moved_line`): objects let go on a thread of their
+/// own, the log's table of pipelines put together on one, snapshots taken
+/// beside the submitting thread's work, and its wait for them after.
+pub(crate) fn moved(frames: f64, ms: [f64; 4]) {
+    report::figures(&[
+        (Figure::MovedBuryUs, us(ms[0], frames)),
+        (Figure::MovedTableUs, us(ms[1], frames)),
+        (Figure::MovedSnapshotsUs, us(ms[2], frames)),
+        (Figure::SnapshotsWaitedUs, us(ms[3], frames)),
+    ]);
+}
+
 /// Passes over the heap's buffer views per frame, and their ms.
 pub(crate) fn heap_buffers(frames: f64, passes: f64, ms: f64) {
     report::figures(&[

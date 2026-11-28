@@ -153,6 +153,9 @@ pub fn run(
     // The shareable run report (`VICTORY_REPORT=0`: none).
     crate::report::start(&cfg);
     victory_hle::runtime::use_console_timers();
+    // The sampling profiler (`VICTORY_PROFILE`), in every build: nothing runs
+    // unless it is set.
+    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = Arc::new(LateDlls {
@@ -197,7 +200,6 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
-    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);

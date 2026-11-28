@@ -326,10 +326,13 @@ impl<W: Work> Lane<W> {
                         // It stands at something the CPU may write without
                         // a call of ours (or a wake came between the reading
                         // of the count and this wait).
+                        let standing = Instant::now();
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        STATS[STOOD].fetch_add(standing.elapsed().as_micros() as u64, Relaxed);
                         if out.timed_out() {
+                            STATS[POLLED].fetch_add(1, Relaxed);
                             break (self.asked(&state), state.next);
                         }
                     }
@@ -753,8 +756,10 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present; parts taken along; and what our thread took to
-/// unfold submissions whose lists were translated.
-static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// unfold submissions whose lists were translated; and the looks our thread
+/// took when its wait of a millisecond ran out with work standing in the line
+/// (nothing woke it), with the microseconds it stood so.
+static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -770,6 +775,10 @@ const JOINED: usize = 10;
 /// Microseconds of [`Job::unfold`] (`crate::list::detach`): with
 /// [`unfold_locked`] all of it with the line's lock held.
 const UNFOLDING: usize = 11;
+/// Looks after a millisecond's wait with work standing that no wake ended,
+/// and the microseconds of all waits with work standing.
+const POLLED: usize = 12;
+const STOOD: usize = 13;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -1013,7 +1022,9 @@ pub(super) fn line(frames: f64) {
          when one was added (at most {:.0}); that thread worked {:.1} ms, and unfolded translated submissions {:.1} ms with the \
          line's lock {} (VICTORY_UNFOLD_LOCKED); threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
-         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
+         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS); that thread stood {:.1} ms \
+         with work in the line that waited for something, and looked again {:.1} times when a millisecond had passed \
+         with no word (fewer with VICTORY_LANDING_WAKES=1)",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
         s[DEPTH] / s[RUNS].max(1.0),
@@ -1026,7 +1037,9 @@ pub(super) fn line(frames: f64) {
         ms(DRAINING),
         s[DRAINS] / frames,
         s[FORCED] / frames,
-        s[JOINED] / frames
+        s[JOINED] / frames,
+        ms(STOOD),
+        s[POLLED] / frames
     );
 }
 

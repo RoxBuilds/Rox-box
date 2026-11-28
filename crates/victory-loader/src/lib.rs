@@ -29,9 +29,9 @@ pub(crate) mod publish;
 #[cfg(windows)]
 mod resolution;
 pub mod resolve;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod profile;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -57,7 +57,7 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use victory_core::report;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub use profile::profile_on_schedule;
 #[cfg(windows)]
 pub use threads::{disable_thread_calls, exit_process, exiting_with};

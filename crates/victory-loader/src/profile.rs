@@ -8,7 +8,11 @@
 //! The file: `thread <id> <start> <cpu ms> <samples> <name>`, then
 //! `stack <thread> <phase> <count> <frame>;<frame>;...` (innermost first, as
 //! `module+rva`), where the phase is what the caller's function says of the
-//! frame at that moment.
+//! frame at that moment (diagnostics builds; 0 in ordinary ones).
+//!
+//! In every build: unset, nothing runs and nothing is read but the variable,
+//! once. So a profile can come from the build that is measured, without the
+//! diagnostics build's own costs (its frame line and counters) in it.
 
 use std::collections::HashMap;
 use std::io::Write;

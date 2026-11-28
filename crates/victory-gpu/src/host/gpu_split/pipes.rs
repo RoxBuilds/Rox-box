@@ -13,8 +13,9 @@
 //! is of pipelines not told apart ([`MIXED`]); the time by kind stays exact.
 //!
 //! Which programs have loops ([`Loops`]): from the console program's code,
-//! looked at once per pipeline in the line's thread (at most 20 ms of it a
-//! second, the costliest first), never while recording:
+//! looked at once per pipeline by the thread that puts the table together
+//! (one of its own, `VICTORY_PIPE_TABLE_ASIDE`; else the line's, at most 20 ms
+//! of it a second), the costliest first, never while recording:
 //! a backward branch is a loop (the translator caps every compute loop at its
 //! loop limit, 4,096 iterations by default); a loop whose body reads memory
 //! (loads or atomics) and stores none is shaped as a poll of memory. A guess
@@ -246,8 +247,9 @@ pub(super) fn second(frames: f64, measured_ns: u64, log: bool) -> [u64; 4] {
     }
     let (ranked, mixed) = ranked(sums);
     let out = figures(&ranked);
-    if log && frames > 0.0 {
-        tracing::info!("{}", table_line("a second", frames, measured_ns, &ranked, &mixed));
+    if log && frames > 0.0 && !(table_aside() && aside::give(frames, measured_ns, ranked.clone(), mixed)) {
+        let until = std::time::Instant::now() + LOOK_BUDGET;
+        tracing::info!("{}", table_line("a second", frames, measured_ns, &ranked, &mixed, until));
     }
     let mut top = ranked;
     let mut rest = mixed;
@@ -263,9 +265,91 @@ pub(super) fn second(frames: f64, measured_ns: u64, log: bool) -> [u64; 4] {
     out
 }
 
+/// Whether the log's table of each second is put together on a thread of its
+/// own (`VICTORY_PIPE_TABLE_ASIDE`, on unless `0`; `0`: by the frame line, as
+/// before).
+///
+/// The table looks at the console code of the pipelines whose loops are not
+/// known yet (once each: [`Info::loops`]). By the frame line that was up to
+/// [`LOOK_BUDGET`] of the submitting thread once a second, right after a
+/// present, for as long as new pipelines came: a profile had it at 3 ms a
+/// frame of that thread, minutes into a run. Aside the thread has no budget
+/// but [`ASIDE_BUDGET`] a table, and the frame line only hands it the second's
+/// figures. What changes: the table is said a little later, by another
+/// thread, and names fewer programs "not known (yet)". The report's figures
+/// ([`figures`]) are the frame line's, as before.
+fn table_aside() -> bool {
+    crate::toggled!("VICTORY_PIPE_TABLE_ASIDE")
+}
+
+/// The time the thread aside may spend looking at loops for one table (it is
+/// behind nothing, but tables queue behind it).
+const ASIDE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The tables' thread ([`table_aside`]).
+mod aside {
+    use super::{ASIDE_BUDGET, Pipe, Sum, table_line};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    type Table = (f64, u64, Vec<(Pipe, Sum)>, Sum);
+
+    /// Microseconds the thread spent on tables since [`taken_us`] was last
+    /// asked.
+    static SPENT_US: AtomicU64 = AtomicU64::new(0);
+
+    /// Hands a second's table to the thread; `false` if there is none (it
+    /// could not be made), and the caller says it.
+    pub(super) fn give(frames: f64, measured_ns: u64, ranked: Vec<(Pipe, Sum)>, mixed: Sum) -> bool {
+        static THREAD: OnceLock<Option<Mutex<mpsc::Sender<Table>>>> = OnceLock::new();
+        let thread = THREAD.get_or_init(|| {
+            let (send, tables) = mpsc::channel::<Table>();
+            std::thread::Builder::new()
+                .name("victory-pipe-table".into())
+                .spawn(move || {
+                    for table in tables {
+                        let began = std::time::Instant::now();
+                        let line = line_of(&table);
+                        tracing::info!("{line}");
+                        SPENT_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(send))
+        });
+        thread
+            .as_ref()
+            .is_some_and(|send| send.lock().unwrap_or_else(|e| e.into_inner()).send((frames, measured_ns, ranked, mixed)).is_ok())
+    }
+
+    /// What the thread says of a table.
+    pub(super) fn line_of((frames, measured_ns, ranked, mixed): &Table) -> String {
+        table_line("a second", *frames, *measured_ns, ranked, mixed, std::time::Instant::now() + ASIDE_BUDGET)
+    }
+
+    /// [`SPENT_US`], taken.
+    pub(super) fn taken_us() -> u64 {
+        SPENT_US.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Microseconds the tables' thread spent since the last call: work the
+/// submitting thread did before (`VICTORY_PIPE_TABLE_ASIDE`).
+pub(super) fn aside_us() -> u64 {
+    aside::taken_us()
+}
+
 /// The log's table: the costliest [`TOP`] of `ranked` per frame, and the
-/// dispatches of programs with loops.
-fn table_line(over: &str, frames: f64, measured_ns: u64, ranked: &[(Pipe, Sum)], mixed: &Sum) -> String {
+/// dispatches of programs with loops; loops not known yet are looked at
+/// until `until`.
+fn table_line(
+    over: &str,
+    frames: f64,
+    measured_ns: u64,
+    ranked: &[(Pipe, Sum)],
+    mixed: &Sum,
+    until: std::time::Instant,
+) -> String {
     let per = |v: u64| v as f64 / frames.max(1e-9);
     let ms = |ns: u64| per(ns) / 1e6;
     let share = |ns: u64| 100.0 * ns as f64 / measured_ns.max(1) as f64;
@@ -277,7 +361,6 @@ fn table_line(over: &str, frames: f64, measured_ns: u64, ranked: &[(Pipe, Sum)],
         ranked.len()
     );
     let (mut looped, mut polled, mut unknown) = (Sum::default(), Sum::default(), Sum::default());
-    let until = std::time::Instant::now() + LOOK_BUDGET;
     for (i, (pipe, sum)) in ranked.iter().enumerate() {
         let info = info(*pipe);
         let loops = info.as_ref().map_or(Loops::Unknown, |i| i.loops(until));
@@ -336,7 +419,8 @@ pub(super) fn steady_line() {
         return;
     };
     let (ranked, mixed) = ranked(sums);
-    tracing::info!("{}", table_line("the steady state, the run's last two thirds of seconds", frames, measured, &ranked, &mixed));
+    let until = std::time::Instant::now() + LOOK_BUDGET;
+    tracing::info!("{}", table_line("the steady state, the run's last two thirds of seconds", frames, measured, &ranked, &mixed, until));
 }
 
 /// The steady state of `seconds`: its frames, card time measured, and the
@@ -487,6 +571,24 @@ mod tests {
         assert_eq!(got[&7_000], Sum { ns: 290, direct: 2, indirect: 2, groups: 16 });
         assert_eq!(got[&7_001].ns, 0);
         assert!(!got.contains_key(&NO_PIPE));
+    }
+
+    /// The table the thread aside says is the one the frame line said: the
+    /// same words of the same second, whichever thread puts it together.
+    #[test]
+    fn the_table_aside_is_the_table_said_inline() {
+        // Pipelines no dispatch put in the table: their loops are not known
+        // on either thread, whatever the budget.
+        let ranked: Vec<(Pipe, Sum)> = (60_000..60_030).rev().map(|p| (p, sum(u64::from(p - 59_990) * 1000))).collect();
+        let mixed = sum(5000);
+        let inline = table_line("a second", 12.0, 2_000_000, &ranked, &mixed, std::time::Instant::now() + LOOK_BUDGET);
+        let table = (12.0, 2_000_000, ranked.clone(), mixed);
+        let aside = std::thread::spawn(move || aside::line_of(&table)).join().unwrap();
+        assert_eq!(aside, inline);
+        assert!(inline.contains("the costliest 20 of 30"));
+        // A budget run out leaves loops not known, as before.
+        let late = table_line("a second", 12.0, 2_000_000, &ranked, &mixed, std::time::Instant::now());
+        assert_eq!(late, inline);
     }
 
     /// The steady state is the last two thirds of the seconds kept.
