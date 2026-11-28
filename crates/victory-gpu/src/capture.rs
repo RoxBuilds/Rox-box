@@ -2,12 +2,18 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size, and the frames [`listed`] (`VICTORY_CAPTURE_FRAMES`, a run of frames
-//! in a row with `VICTORY_CAPTURE_RUN`). Only in builds with diagnostics.
+//! in a row with `VICTORY_CAPTURE_RUN`). Only in builds with diagnostics;
+//! the one picture every few seconds of `shots.rs` is in every build.
 
 use std::path::PathBuf;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+
+// The read-back and the PNG encoder are shared with the periodic shots
+// (`shots.rs`), which ordinary builds have too.
+pub(crate) use crate::shots::read_back;
+use crate::shots::{encode, half_rgb, read_back_of};
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
@@ -268,21 +274,7 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
-    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
-    for y in 0..h as usize {
-        raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
-        for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
-            if bgra {
-                raw.extend([p[2], p[1], p[0]]);
-            } else {
-                raw.extend_from_slice(p);
-            }
-        }
-    }
+    let (w, h, raw) = half_rgb(width, height, pitch, bgra, rows);
     let png = encode(w, h, &raw);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
@@ -300,126 +292,6 @@ pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
         raw.extend_from_slice(line);
     }
     encode(width, height, &raw)
-}
-
-/// A PNG of rows of RGB, each behind its filter byte.
-fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::new();
-    header.extend(w.to_be_bytes());
-    header.extend(h.to_be_bytes());
-    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
-    chunk(&mut png, b"IHDR", &header);
-    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
-    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-    chunk(&mut png, b"IDAT", idat);
-    chunk(&mut png, b"IEND", &[]);
-    png
-}
-
-fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    png.extend((data.len() as u32).to_be_bytes());
-    let start = png.len();
-    png.extend(kind);
-    png.extend(data);
-    let crc = crc32(&png[start..]);
-    png.extend(crc.to_be_bytes());
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
-    }
-    !crc
-}
-
-/// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer.
-pub(crate) fn read_back(
-    device: &ID3D12Device,
-    list: &ID3D12GraphicsCommandList,
-    texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
-    read_back_of(device, list, texture, 0)
-}
-
-/// As [`read_back`], of subresource `sub` (the stencil plane of a
-/// one-level, one-slice depth-stencil texture is subresource 1).
-fn read_back_of(
-    device: &ID3D12Device,
-    list: &ID3D12GraphicsCommandList,
-    texture: &ID3D12Resource,
-    sub: u32,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
-    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let mut total = 0;
-    // SAFETY: a live texture; outputs for one subresource.
-    unsafe {
-        let desc = texture.GetDesc();
-        device.GetCopyableFootprints(
-            &desc,
-            sub,
-            1,
-            0,
-            Some(&mut footprint),
-            None,
-            None,
-            Some(&mut total),
-        );
-    }
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_READBACK,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-            .ok()?;
-        let buffer = buffer?;
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(&buffer),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: footprint,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(texture),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: sub,
-            },
-        };
-        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint))
-    }
 }
 
 /// Saves a frame read back by [`read_back`] (8-bit color only).
@@ -949,11 +821,6 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{RUN_DEFAULT, RUN_MAX, Run, parse_run};
-
-    #[test]
-    fn crc_matches_the_png_check_value() {
-        assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
-    }
 
     /// `VICTORY_CAPTURE_RUN`: a first frame and a count, the first frame
     /// counted from the first busy frame with `w`; a lone number is a run of

@@ -27,6 +27,10 @@
 # -Display      reported display dimensions, e.g. `1920x1080`
 # -Output       output resolution override (`VICTORY_OUTPUT`)
 # -Log          writes process stdout/stderr under %LOCALAPPDATA%\victory\logs
+# -Shots <s>    saves a half-size picture of the run every <s> seconds (1 to 86400; at most 120 per run) to
+#               <data_dir>\shots\<the run's start, UTC digits>\shot-<seconds>s.png: it sets VICTORY_CAPTURE and
+#               VICTORY_CAPTURE_EVERY_S. The pictures are your own data and stay in that folder; the folder
+#               is refused when it lies inside the source tree.
 # -SettingsXml  optional explicit path to a title XML settings file (overrides `xml` in the local file)
 # -SettingsValues `<name value="..."/>` overrides applied atomically (with backup) before launch:
 #               "name=value;name2=value2" (works from play.cmd too) or a PowerShell hashtable @{ name = 'value' }
@@ -75,6 +79,7 @@ param(
     [ValidatePattern('^\d{3,5}x\d{3,5}$')][string]$Display,
     [ValidatePattern('^\d{3,5}x\d{3,5}$')][string]$Output,
     [switch]$Log,
+    [ValidateRange(1, 86400)][int]$Shots,
     [switch]$Check,
     [string]$SettingsXml,
     $SettingsValues = @{},
@@ -236,6 +241,17 @@ function Get-RunSettings([switch]$Safe, [switch]$RayTracing, [string]$Display, [
         foreach ($k in $preset.Keys) { $settings[$k] = $preset[$k] }
     }
     foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+    $settings
+}
+
+# The switches of -Shots: a picture every `$Every` seconds into `<data_dir>\shots` (the data folder of this run,
+# which `victory config` prints). None when -Shots was not given.
+function Get-ShotSettings([int]$Every, [string]$DataDir) {
+    $settings = @{}
+    if ($Every -gt 0) {
+        $settings.VICTORY_CAPTURE = ($DataDir.TrimEnd('\') + '\shots')
+        $settings.VICTORY_CAPTURE_EVERY_S = "$Every"
+    }
     $settings
 }
 
@@ -804,6 +820,15 @@ if ($SelfTest) {
         $w = @(Get-HostWarnings 8192 $true $false @([pscustomobject]@{ Name = 'a'; MB = 900 }, [pscustomobject]@{ Name = 'b'; MB = 100 }))
         Check ($w.Count -eq 4 -and $w[0] -match '8\.0 GB' -and $w[3] -match 'a 900 MB, b 100 MB') 'host warnings formatting'
 
+        $shotSettings = Get-ShotSettings 30 'D:\data'
+        Check ($shotSettings.Count -eq 2 -and $shotSettings.VICTORY_CAPTURE -eq 'D:\data\shots' -and $shotSettings.VICTORY_CAPTURE_EVERY_S -eq '30') '-Shots: a picture every N seconds into <data_dir>\shots'
+        Check ((Get-ShotSettings 0 'D:\data').Count -eq 0 -and (Get-RunSettings -Fast).ContainsKey('VICTORY_CAPTURE') -eq $false) '-Shots: nothing is set without it, in any preset'
+        $viaShots = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ShowSettings -Shots 45)
+        Check ($LASTEXITCODE -eq 0 -and ($viaShots -contains 'VICTORY_CAPTURE_EVERY_S=45') -and @($viaShots | Where-Object { $_ -match '^VICTORY_CAPTURE=.*shots$' }).Count -eq 1) '-Shots arrives through powershell -File and shows in -ShowSettings'
+        $noShots = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ShowSettings)
+        Check ($LASTEXITCODE -eq 0 -and @($noShots | Where-Object { $_ -match '^VICTORY_CAPTURE' }).Count -eq 0) '-ShowSettings without -Shots shows no capture switch'
+        $badShots = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ShowSettings -Shots 0 2>&1)
+        Check ($LASTEXITCODE -ne 0) '-Shots 0 is refused'
         $s = Get-RunSettings -Fast -Display '1280x720' -Output '1280x720'
         Check ($s.VICTORY_CARD_AWAKE -eq '0' -and $s.VICTORY_MWAITX_WAIT -eq '1' -and $s.VICTORY_OUTPUT -eq '1280x720') 'fast run settings'
         $f = Get-FastChoices @{}
@@ -1094,6 +1119,8 @@ if ($ShowSettings) {
     # ($Output keeps its pattern check: the preset's "none" is not assigned to it.)
     if ($Fast) { $f = Get-FastChoices $PSBoundParameters; $Display = $f.Display; if ($f.Output) { $Output = $f.Output } }
     $shown = Get-RunSettings -Safe:$Safe -RayTracing:$RayTracing -Fast:$Fast -Display $Display -Output $Output -More $More
+    $shotShown = Get-ShotSettings $Shots '<data_dir>'
+    foreach ($k in $shotShown.Keys) { $shown[$k] = $shotShown[$k] }
     $shown.Keys | Sort-Object | ForEach-Object { Write-Host "$_=$($shown[$_])" }
     $SettingsValues.Keys | Sort-Object | ForEach-Object { Write-Host "setting $_=$($SettingsValues[$_])" }
     if ($dropFolder) { Write-Host "VICTORY_GAME_DIR=$dropFolder" }
@@ -1214,6 +1241,14 @@ try {
         if ($report[$i] -match '^\[ WARN') { Write-Host $report[$i]; if ($report[$i + 1] -match '^\s+fix:') { Write-Host $report[$i + 1] } }
     }
     $config = @(& $victory config 2>&1 | ForEach-Object { "$_" })
+    # -Shots: with the data folder this run uses (set after the preparation's choice of what a child process sees).
+    if ($Shots) {
+        $dataDir = Get-ConfigValue $config 'data_dir'
+        if (-not $dataDir) { $dataDir = Join-Path $env:LOCALAPPDATA 'victory\data' }
+        $shotSettings = Get-ShotSettings $Shots $dataDir
+        foreach ($k in $shotSettings.Keys) { Set-Item "Env:$k" $shotSettings[$k]; $settings[$k] = $shotSettings[$k] }
+        Write-Host "Pictures of the run, one every $Shots s: $($shotSettings.VICTORY_CAPTURE)"
+    }
 
     # Shaders translated and pipelines warmed ahead of the run (-NoPrepare skips it; -Prepare stops after it).
     if (-not $NoPrepare) {
@@ -1272,7 +1307,7 @@ try {
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
     $file = Join-Path $logs ('{0:yyyyMMdd-HHmmss}-{1}{2}{3}.log' -f (Get-Date), $Console, $(if ($Display) { "-$Display" }), $(if ($Fast) { '-fast' }))
     $how = $(if ($Fast) { '-Fast ' }) + "-Console $Console -Build $Build" + $(if ($Display) { " -Display $Display" }) + $(if ($Output) { " -Output $Output" })
-    $how += $(if ($Safe) { ' -Safe' }) + $(if ($RayTracing) { ' -RayTracing' }) + $(if ($Fps) { " -Fps $Fps" })
+    $how += $(if ($Safe) { ' -Safe' }) + $(if ($RayTracing) { ' -RayTracing' }) + $(if ($Fps) { " -Fps $Fps" }) + $(if ($Shots) { " -Shots $Shots" })
     $head = @("# play.ps1 $how", "# victory $($run -join ' ')") + ($warnings | ForEach-Object { "# warning: $_" }) + ($settings.Keys | Sort-Object | ForEach-Object { "# $_=$($settings[$_])" })
     [System.IO.File]::WriteAllLines($file, [string[]]$head)
     Write-Host "Logging to $file"

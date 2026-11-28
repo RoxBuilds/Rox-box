@@ -459,6 +459,9 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // A picture of the run every few seconds (`shots.rs`), in every build.
+            let shot = crate::shots::due();
+            let read_now = read_now || shot.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -485,8 +488,9 @@ impl Host {
             // frames, the black-frame probe, the frame watch), and the panel
             // copied onto it.
             #[cfg(feature = "diagnostics")]
-            let (capture, probe, watched) = {
+            let (capture, probe, watched, shot) = {
                 list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let shot = shot.and_then(|seconds| Some((seconds, crate::shots::take(&self.device, list, &back)?)));
                 let capture =
                     crate::capture::wanted(frame).then(|| crate::capture::read_back(&self.device, list, &back)).flatten();
                 let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, &back) };
@@ -494,10 +498,21 @@ impl Host {
                 list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
                 p.panel.draw(self, copy, &back, (width, height), format);
                 list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
-                (capture, probe, watched)
+                (capture, probe, watched, shot)
             };
             #[cfg(not(feature = "diagnostics"))]
-            list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+            let shot = match shot {
+                Some(seconds) => {
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let read = crate::shots::take(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                    read.map(|read| (seconds, read))
+                }
+                None => {
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+                    None
+                }
+            };
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -519,6 +534,9 @@ impl Host {
                     crate::capture::save_read_back(frame, &buffer, &footprint);
                 }
                 crate::replay::record::present(first.texture, D3D12_RESOURCE_STATES(first.state as i32));
+            }
+            if let Some((seconds, (buffer, footprint))) = shot {
+                crate::shots::save(seconds, &buffer, &footprint);
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = (flown, first);

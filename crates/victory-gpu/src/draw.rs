@@ -3178,13 +3178,27 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{Role, Views, binding, depth_binding};
-        let Some(at) = binding(role) else {
+        use crate::ambient::{MissNote, Role, Views, binding, depth_binding, miss_depth_binding};
+        // (The miss program's views may be found by kind instead.)
+        let at = binding(role);
+        if at.is_none() && role != Role::Miss {
             return false;
-        };
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
+        // Which surfaces the miss program's rays are of (its first root
+        // constant), as the profile names the layers the stand-in follows.
+        let layer = t.used.iter().find(|u| u.root == RootType::Constants).and_then(|u| {
+            match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Constants(c)) => c.first().copied(),
+                _ => None,
+            }
+        });
+        if role == Role::Miss && !crate::ambient::miss_layer_followed(layer) {
+            crate::ambient::note_miss(MissNote::OtherLayer);
+            return false;
+        }
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
             return false;
@@ -3209,28 +3223,85 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        let image = entry(ResourceType::Uav, at);
+        // A 32-bit depth (typeless or D32, with or without stencil).
+        let depth_32 = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_R32_FLOAT
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                )
+        };
+        // The miss program's depth may be of a larger picture than its image,
+        // up to four times as wide.
+        let depth_fits = |d: &D3D12_RESOURCE_DESC, (w, h): (u64, u32)| {
+            depth_32(d) && d.Width >= w && d.Height >= h && d.Width <= w * 4
+        };
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables: where the profile names none, or
+        // the one it names holds nothing, the first table entry of that kind
+        // that fits (a 2D R11G11B10 image; a 2D 32-bit depth at least its
+        // size). After trustno1-coder/VIctory-NVIDIA f89b79d.
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let image = match role {
+            Role::Miss => at.and_then(|at| entry(ResourceType::Uav, at)).or_else(|| {
+                scan(ResourceType::Uav, &|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26)
+            }),
+            _ => at.and_then(|at| entry(ResourceType::Uav, at)),
+        };
         let depth = match role {
             Role::Resolve => depth_binding().and_then(|d| entry(ResourceType::Srv, d)),
+            Role::Miss => miss_depth_binding().and_then(|d| entry(ResourceType::Srv, d)).or_else(|| {
+                let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                scan(ResourceType::Srv, &|d| size.is_some_and(|size| depth_fits(d, size)))
+            }),
             Role::Radiance | Role::Air => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        let sizes = match role {
+            Role::Miss => depth_fits(&seen, (of.Width, of.Height)),
+            _ => (seen.Width, seen.Height) == (of.Width, of.Height),
+        };
+        if of.Format.0 != format || !sizes || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
-        crate::ambient::after(list, role, &Views {
+        let ran = crate::ambient::after(list, role, &Views {
             image,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+            depth_size: [seen.Width as u32, seen.Height],
+        });
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3840,9 +3911,15 @@ impl State {
                             }
                         }
                     }
+                    // (Told once per record and recording; with
+                    // `VICTORY_TABLED_REREAD=1` also of a slot the queue
+                    // holds again since: written after its first read.)
                     if let Some(title) = title_first
                         && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
+                        && (listed.tabled != Some((title + k, kind.is_some()))
+                            || (crate::descriptor::host::tabled_reread()
+                                && kind.is_some()
+                                && host.texture_slot_queued(title + k)))
                     {
                         listed.tabled = Some((title + k, kind.is_some()));
                         host.texture_slot_tabled(title + k, kind.is_some());

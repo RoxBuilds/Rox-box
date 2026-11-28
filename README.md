@@ -230,6 +230,7 @@ That is advice, not an error.
 | `-Output <W>x<H>` | Sets `VICTORY_OUTPUT`. Reserved: the current runtime does not read it yet, so it changes nothing on its own |
 | `-RayTracing` | Enables translation of a title's own ray-tracing compute passes (off by default; see [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)) |
 | `-Log` | Writes everything the run prints to a log file |
+| `-Shots <seconds>` | Saves a half-size picture of the run every that many seconds (at most 120 per run) to `<data_dir>\shots\<the run's start as UTC digits>\shot-<seconds>s.png`, in any build. The pictures are your own data: they stay in that folder, which is refused inside the source tree, and are not part of the run report |
 | `-Fps <N>`, `-SettingsXml`, `-SettingsValues` | Optional helpers that edit a title's own XML settings file before launch; they read `local\play.toml`, described at the top of `play.ps1` |
 | `-More "NAME=value;NAME2=value2"` | Sets additional `VICTORY_*` environment switches for this run |
 | `-ShowSettings` | Prints the environment switches these options give and starts nothing |
@@ -255,7 +256,14 @@ Window and input:
 - Alt+Enter toggles a borderless 16:9 window.
 - `VICTORY_WINDOW_MAX=1920x1080` (via `-More`) limits the window's size; it
   scales the picture and does not change the rendering resolution.
-- XInput controllers are used as they are. With none connected, the keyboard
+- XInput controllers are used as they are. A gamepad that Windows does not
+  list through XInput (a family of HID gamepads with a touch surface and motion
+  sensors, vendor id `054C`, product ids `0CE6` and `0DF2`, over USB or Bluetooth)
+  is read from HID instead, in the slots XInput leaves empty. XInput comes
+  first: while any XInput pad answers, HID pads are not used, because a
+  remapper can show one pad through both. Buttons, sticks and triggers only;
+  no rumble. `VICTORY_HID_PAD=0` (via `-More`) reads XInput only.
+- With none connected, the keyboard
   stands in for one while the title's window has the focus:
 
   | Keys | Pad |

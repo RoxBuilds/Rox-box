@@ -41,6 +41,28 @@ pub(crate) struct AmbientProfile {
     pub(crate) radiance_binding: Option<(u8, u32)>,
     #[serde(default)]
     pub(crate) air_binding: Option<(u8, u32)>,
+    /// The program that gives reflection rays that found nothing their light
+    /// (`crate::ambient::Role::Miss`, for `VICTORY_AMBIENT_SPECULAR`): a
+    /// substring of its container, and substrings that, also there, make it
+    /// another program (variants of it that are not for reflections).
+    #[serde(default)]
+    pub(crate) miss_substring: String,
+    #[serde(default)]
+    pub(crate) miss_not_substrings: Vec<String>,
+    /// Where it writes the reflections' image and reads the depth (found by
+    /// kind in its tables where these are unset or hold nothing).
+    #[serde(default)]
+    pub(crate) miss_light_binding: Option<(u8, u32)>,
+    #[serde(default)]
+    pub(crate) miss_depth_binding: Option<(u8, u32)>,
+    /// The values of its first root constant whose dispatches are followed
+    /// (the kind of surface its rays are of); those of `miss_alpha_layers`
+    /// only with `VICTORY_AMBIENT_SPECULAR_ALPHA=1`. Both empty: every
+    /// dispatch.
+    #[serde(default)]
+    pub(crate) miss_layers: Vec<u32>,
+    #[serde(default)]
+    pub(crate) miss_alpha_layers: Vec<u32>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -118,7 +140,8 @@ impl ShaderProfile {
     fn counts(&self) -> (usize, usize, bool) {
         let (bake, ambient) = (&self.bake, &self.ambient);
         let hashes = bake.old_pixel_shaders.len() + bake.pixel_shaders.len() + bake.geometry_shaders.len();
-        let roles = [&ambient.resolve_substring, &ambient.radiance_substring, &ambient.air_substring];
+        let roles =
+            [&ambient.resolve_substring, &ambient.radiance_substring, &ambient.air_substring, &ambient.miss_substring];
         (hashes, self.cull_shaders.len(), roles.iter().any(|s| !s.is_empty()))
     }
 
@@ -179,6 +202,12 @@ light_binding = [1, 10]
 depth_binding = [0, 20]
 radiance_binding = [1, 4]
 air_binding = [1, 8]
+miss_substring = "CS_Test_Miss_"
+miss_not_substrings = ["CS_Test_Miss_Other"]
+miss_light_binding = [1, 26]
+miss_depth_binding = [0, 250]
+miss_layers = [0]
+miss_alpha_layers = [1]
 
 [bake]
 old_pixel_shaders = ["aaaa000011112222"]
@@ -193,6 +222,11 @@ label = "test_cull"
         assert_eq!(p.ambient.resolve_substring, "CS_Test_Resolve");
         assert_eq!(p.ambient.light_binding, Some((1, 10)));
         assert_eq!(p.ambient.depth_binding, Some((0, 20)));
+        assert_eq!(p.ambient.miss_substring, "CS_Test_Miss_");
+        assert_eq!(p.ambient.miss_not_substrings, ["CS_Test_Miss_Other"]);
+        assert_eq!(p.ambient.miss_light_binding, Some((1, 26)));
+        assert_eq!(p.ambient.miss_depth_binding, Some((0, 250)));
+        assert_eq!((&p.ambient.miss_layers[..], &p.ambient.miss_alpha_layers[..]), (&[0][..], &[1][..]));
         assert_eq!(p.bake.old_pixel_shaders, ["aaaa000011112222"]);
         assert_eq!(p.bake.pixel_shaders, ["bbbb000011112222"]);
         assert_eq!(p.bake.geometry_shaders, ["cccc000011112222"]);

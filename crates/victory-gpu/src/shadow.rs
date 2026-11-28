@@ -25,6 +25,7 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 mod sparse;
+mod viewblocks;
 mod wc;
 pub use wc::asked as title_memory_write_combined;
 pub(crate) use wc::freed as write_combined_freed;
@@ -136,6 +137,13 @@ pub(crate) struct Shadow {
     /// Whether its title memory is write-combined, as last found
     /// ([`wc::cached`]; 0: not asked yet).
     wc: AtomicU64,
+    /// Of a copy of a view's own bytes cut from a block ([`exact`],
+    /// [`view_bytes_pool`]): its range of the block, given back when the
+    /// copy goes. `buffer` is the block's, `data` and `gpu` the range's.
+    cut: Option<viewblocks::Cut>,
+    /// The bytes from `buffer`'s first byte to the copy's (the range's start
+    /// in its block; 0 for a buffer of its own).
+    base: u64,
 }
 
 /// The pieces memory that is not watched is copied in: 64 KiB, cut at
@@ -2973,6 +2981,11 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if let Some(cut) = self.cut.take() {
+            // Nothing holds the copy: its range is another's once what may
+            // still read it has run ([`viewblocks`]).
+            blocks_give(cut, self.len);
+        }
         let sparse = self.sparse.take();
         let was_sparse = sparse.is_some();
         if let Some(cell) = sparse {
@@ -3362,7 +3375,9 @@ pub(crate) fn report_memory() -> [u64; 5] {
         LAST[2].store(pool.iter().map(|v| v.capacity() as u64).sum(), Ordering::Relaxed);
     }
     [
-        LIVE[1].load(Ordering::Relaxed).saturating_sub(LAST[1].load(Ordering::Relaxed)),
+        // (With the bytes of the blocks copies of views' own bytes are cut
+        // from that no copy holds: the blocks are what is held.)
+        LIVE[1].load(Ordering::Relaxed).saturating_sub(LAST[1].load(Ordering::Relaxed)) + blocks_slack(),
         LAST[0].load(Ordering::Relaxed),
         LAST[2].load(Ordering::Relaxed),
         CARD_BYTES[0].load(Ordering::Relaxed)
@@ -3642,7 +3657,13 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.base + self.place.as_ref().map_or(0, |place| place.1)
+    }
+
+    /// Whether it is a copy of a view's own bytes cut from a block
+    /// ([`view_bytes_pool`]): its buffer holds other copies too.
+    pub(crate) fn pooled(&self) -> bool {
+        self.cut.is_some()
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -3716,6 +3737,8 @@ impl Shadow {
             plain: 0,
             sparse: None,
             wc: AtomicU64::new(0),
+            cut: None,
+            base: 0,
         }
     }
 
@@ -7064,12 +7087,15 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let clock = crate::host::now_ms();
     if map.len() >= MANY || !view_bytes_fit(exact_bytes(map), len, most) {
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
+        // slot shows it), and not asked for lately. (A copy cut from a block
+        // is held by the slots that show it itself, `descriptor::host::Held`:
+        // its block is held by every copy in it. It goes back to its block
+        // when the map lets go of it, [`viewblocks`].)
         let mut gone = Vec::new();
         map.retain(|_, (shadow, used)| {
-            let keep =
-                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
-            if !keep && reuse {
+            let shown = !shadow.pooled() && crate::host::references(&shadow.buffer) > 1;
+            let keep = Arc::strong_count(shadow) > 1 || shown || *used + LATELY > now;
+            if !keep && reuse && !shadow.pooled() {
                 gone.push(shadow.clone());
             }
             keep
@@ -7093,6 +7119,16 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             return None;
         }
     }
+    if view_bytes_pool()
+        && let Some(shadow) = cut_copy(address, len, clock)
+    {
+        let shadow = Arc::new(shadow);
+        map.insert((address, len), (shadow.clone(), now));
+        EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+        IN_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        return Some(shadow);
+    }
     let size = exact_size(len, reuse);
     let again = if reuse {
         EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size, clock, spare_landed, crate::host::retire_resource)
@@ -7107,6 +7143,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         None => {
             let _as = crate::host::SharedAs::new(crate::host::NewMemory::ViewBytes);
             let (buffer, data) = host()?.shared_buffer(size)?;
+            OWN_BUFFERS.fetch_add(1, Ordering::Relaxed);
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             (buffer, data, gpu)
@@ -7128,6 +7165,155 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// Of [`OWN_MADE`], those made on the buffer of one let go of before
 /// ([`view_bytes_reuse`]), since the start.
 pub(crate) static EXACT_REUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Of [`OWN_MADE`], those cut from a block ([`view_bytes_pool`]), and the
+/// buffers of their own made for the others (not those of [`EXACT_REUSED`]),
+/// since the start.
+static IN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static OWN_BUFFERS: AtomicU64 = AtomicU64::new(0);
+
+/// The blocks there are now ([`VIEW_BLOCKS`]), and the bytes of the copies
+/// cut from them that are alive.
+static BLOCKS_NOW: AtomicU64 = AtomicU64::new(0);
+static BLOCKS_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether copies of views' own bytes ([`exact`]) of up to 64 KiB are cut
+/// from blocks of 1 MiB ([`viewblocks`]) instead of each being a buffer of
+/// its own (`VICTORY_VIEW_BYTES_POOL`, on unless `0`: a buffer each, made, or
+/// taken from those let go of with [`view_bytes_reuse`], as before).
+///
+/// Ring positions move every frame, so such copies come and go, hundreds a
+/// frame; a buffer each was made resident and waited for until the card had
+/// it mapped, which on a PC short of memory came to a second and more of
+/// every few seconds of a run, and each took 64 KiB for a few hundred bytes.
+/// Few of them came from buffers let go of: a buffer waits for the
+/// submissions that may still read it, and more were let go of in that time
+/// than are kept ([`SpareBuffers::MOST`]), the oldest, nearest their turn,
+/// first. A copy cut from a block is made as one on a buffer of its own is
+/// (the title's bytes whole before anything reads it) and its views take it
+/// the same way: its range begins on a multiple of every element and of 16,
+/// as its buffer did.
+fn view_bytes_pool() -> bool {
+    let on = crate::toggled!("VICTORY_VIEW_BYTES_POOL");
+    #[cfg(test)]
+    if let Some(on) = TEST_POOL.get() {
+        return on;
+    }
+    on
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`view_bytes_pool`] on this thread, in the place of the
+    /// switch.
+    static TEST_POOL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A block's memory: the buffer, its mapping and card address.
+#[derive(Clone)]
+struct BlockMemory {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+}
+
+// SAFETY: the mapping is of the buffer; each range of it is written by the
+// copy it is cut for alone.
+unsafe impl Send for BlockMemory {}
+
+/// The blocks copies of views' own bytes are cut from.
+static VIEW_BLOCKS: Mutex<viewblocks::Blocks<BlockMemory>> = Mutex::new(viewblocks::Blocks::new());
+
+fn view_blocks() -> std::sync::MutexGuard<'static, viewblocks::Blocks<BlockMemory>> {
+    VIEW_BLOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A copy of `[address, address + len)` cut from a block, a block made if
+/// none has room; `None` if the copy is too long for one, or no block could
+/// be made (then it is a buffer of its own, as before). The bytes of its
+/// range past `len` are zeros. Called with [`EXACT`] held; no lock of the
+/// blocks is held while a block is made.
+fn cut_copy(address: u64, len: u64, now: u64) -> Option<Shadow> {
+    viewblocks::Blocks::<BlockMemory>::size_of(len)?;
+    let taken = view_blocks().take(len, now, spare_landed);
+    let (cut, memory) = match taken {
+        Some(taken) => taken,
+        None => {
+            let host = host()?;
+            let made = {
+                let _as = crate::host::SharedAs::new(crate::host::NewMemory::ViewBlock);
+                host.shared_buffer(viewblocks::BLOCK)
+            };
+            let (buffer, data) = made?;
+            crate::host::name(&buffer, || "copies of views' own bytes (a block)".into());
+            #[cfg(feature = "diagnostics")]
+            crate::book::tag(&buffer, "copies of views' own bytes, in blocks");
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut blocks = view_blocks();
+            blocks.add(BlockMemory { buffer, data, gpu }, now);
+            BLOCKS_NOW.store(blocks.count() as u64, Ordering::Relaxed);
+            blocks.take(len, now, spare_landed)?
+        }
+    };
+    blocks_let_go(now);
+    // SAFETY: the range lies in the block's mapping (below its guard) and is
+    // this copy's alone; what it holds past the copy's bytes is zeros, as a
+    // new buffer's.
+    let data = unsafe {
+        let data = memory.data.add(cut.start as usize);
+        std::ptr::write_bytes(data.add(len as usize), 0, (cut.len - len) as usize);
+        data
+    };
+    BLOCKS_HELD.fetch_add(len, Ordering::Relaxed);
+    let mut shadow = Shadow::new(memory.buffer, data, memory.gpu + cut.start, address, len);
+    shadow.base = cut.start;
+    shadow.cut = Some(cut);
+    Some(shadow)
+}
+
+/// A copy of `len` bytes cut from a block went: its range waits for what may
+/// still read it ([`viewblocks::Blocks::give`]).
+fn blocks_give(cut: viewblocks::Cut, len: u64) {
+    BLOCKS_HELD.fetch_sub(len, Ordering::Relaxed);
+    let mark = spare_mark();
+    view_blocks().give(cut, mark);
+}
+
+/// Lets go of the blocks empty for long enough ([`viewblocks::Blocks::let_go`])
+/// with no lock of the blocks held: each is retired (dropped once nothing
+/// running names it).
+pub(crate) fn blocks_let_go(now: u64) {
+    let gone = {
+        let mut blocks = view_blocks();
+        blocks.settle(now, spare_landed);
+        let gone = blocks.let_go(now);
+        BLOCKS_NOW.store(blocks.count() as u64, Ordering::Relaxed);
+        gone
+    };
+    for memory in gone {
+        crate::host::retire_resource(memory.buffer);
+    }
+}
+
+/// Copies of views' own bytes since the start: cut from blocks, and buffers
+/// of their own made for the others; and the blocks there are now and their
+/// bytes ([`view_bytes_pool`]).
+pub(crate) fn view_blocks_counts() -> [u64; 4] {
+    let blocks = BLOCKS_NOW.load(Ordering::Relaxed);
+    [
+        IN_BLOCKS.load(Ordering::Relaxed),
+        OWN_BUFFERS.load(Ordering::Relaxed),
+        blocks,
+        blocks * viewblocks::BLOCK,
+    ]
+}
+
+/// The bytes of the blocks not held by live copies cut from them: for the
+/// memory map, beside the copies' own bytes.
+fn blocks_slack() -> u64 {
+    (BLOCKS_NOW.load(Ordering::Relaxed) * viewblocks::BLOCK).saturating_sub(BLOCKS_HELD.load(Ordering::Relaxed))
+}
 
 /// Whether the buffer of a copy of a view's own bytes ([`exact`]) that is let
 /// go of is kept for the next such copy (`VICTORY_VIEW_BYTES_REUSE`, on unless
@@ -7154,10 +7340,14 @@ fn exact_size(len: u64, reuse: bool) -> u64 {
     if reuse { len.max(1).next_multiple_of(64 << 10) } else { len.next_multiple_of(256) }
 }
 
-/// The bytes of the buffer a new copy of a view's `len` bytes has
-/// ([`exact_size`] as the switch is now), for tests elsewhere.
+/// The bytes of the buffer a new copy of a view's `len` bytes has: a
+/// block's if it is cut from one ([`view_bytes_pool`]), else [`exact_size`]
+/// as the switch is now; for tests elsewhere.
 #[cfg(test)]
 pub(crate) fn exact_width(len: u64) -> u64 {
+    if view_bytes_pool() && viewblocks::Blocks::<BlockMemory>::size_of(len).is_some() {
+        return viewblocks::BLOCK;
+    }
     exact_size(len, view_bytes_reuse())
 }
 
@@ -7268,17 +7458,65 @@ impl<B> SpareBuffers<B> {
 
 static EXACT_SPARE: Mutex<SpareBuffers> = Mutex::new(SpareBuffers(Vec::new()));
 
+/// Tests that make copies of views' own bytes ([`exact`]) take this: they
+/// share the process's copies, spare buffers and blocks, and one's asks let
+/// go of another's copies.
+#[cfg(test)]
+pub(crate) fn view_copies_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Tests: while it lives, copies of views' own bytes made on this thread
+/// are cut from blocks or not as asked ([`view_bytes_pool`]), and every
+/// submission has landed for what this thread lets go of and takes again.
+#[cfg(test)]
+pub(crate) struct TestViewCopies;
+
+#[cfg(test)]
+impl TestViewCopies {
+    pub(crate) fn set(pool: bool) -> TestViewCopies {
+        TEST_POOL.set(Some(pool));
+        TEST_SUBMISSIONS.set(Some((0, u64::MAX)));
+        TestViewCopies
+    }
+}
+
+/// Tests: the copies of views' own bytes kept for title memory in
+/// `[from, to)` are let go of (memory of a test that went may be another's
+/// now, at the same addresses).
+#[cfg(test)]
+pub(crate) fn forget_copies_in(from: u64, to: u64) {
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.retain(|&(start, _), _| start < from || start >= to);
+}
+
+/// Tests: whether the range at `start` of the block whose buffer is `block`
+/// (its raw address) is free, once what this thread let go of has landed.
+#[cfg(test)]
+pub(crate) fn range_free(block: usize, start: u64) -> bool {
+    use windows::core::Interface;
+    let mut blocks = view_blocks();
+    blocks.settle(crate::host::now_ms(), spare_landed);
+    blocks.is_free(|m| m.buffer.as_raw() as usize == block, start)
+}
+
+#[cfg(test)]
+impl Drop for TestViewCopies {
+    fn drop(&mut self) {
+        TEST_POOL.set(None);
+        TEST_SUBMISSIONS.set(None);
+    }
+}
+
 #[cfg(test)]
 mod spare_view_buffers {
-    use super::{SpareBuffer, SpareBuffers, TEST_SUBMISSIONS, exact_size};
+    use super::{SpareBuffer, SpareBuffers, TEST_POOL, TEST_SUBMISSIONS, exact_size};
     use std::sync::atomic::Ordering::Relaxed;
 
     fn spare(size: u64, mark: u64, id: u32) -> SpareBuffer<u32> {
         SpareBuffer { size, buffer: id, data: std::ptr::null_mut(), gpu: 0, mark, ready: None }
     }
-
-    /// One at a time: they share the process's copies and spare buffers.
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Copies of views' own bytes take buffers of whole 64 KiB, as a
     /// committed buffer takes of memory anyway; off, as before.
@@ -7335,11 +7573,13 @@ mod spare_view_buffers {
     /// one's card address is its buffer's.
     #[test]
     fn copies_of_views_come_on_buffers_let_go_of() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::view_copies_lock();
         let Some(host) = crate::host::host() else { return };
         if !super::view_bytes_reuse() {
             return;
         }
+        // Buffers of their own (`VICTORY_VIEW_BYTES_POOL=0`).
+        TEST_POOL.set(Some(false));
         // Everything has landed.
         TEST_SUBMISSIONS.set(Some((0, u64::MAX)));
         let before = super::EXACT_REUSED.load(Relaxed);
@@ -7352,6 +7592,7 @@ mod spare_view_buffers {
             assert_eq!(copy.gpu(base + i * 0x100), unsafe { copy.buffer.GetGPUVirtualAddress() });
         }
         TEST_SUBMISSIONS.set(None);
+        TEST_POOL.set(None);
         assert!(super::EXACT_REUSED.load(Relaxed) > before + 200, "buffers let go of are used again");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
@@ -7364,10 +7605,12 @@ mod spare_view_buffers {
     #[test]
     fn a_buffer_a_flight_may_read_is_not_handed_out() {
         use windows::core::Interface;
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::view_copies_lock();
         if crate::host::host().is_none() || !super::view_bytes_reuse() {
             return;
         }
+        // Buffers of their own (`VICTORY_VIEW_BYTES_POOL=0`).
+        TEST_POOL.set(Some(false));
         let base = 0x7d00_0000_0000u64;
         let lag = (0..).find(|&n| crate::host::landed_by(1, 1 + n)).unwrap();
         // Submission 100 begun, 50 finished.
@@ -7407,6 +7650,7 @@ mod spare_view_buffers {
             assert_ne!(next(), held_buffer, "a buffer a list holds is another copy's");
         }
         TEST_SUBMISSIONS.set(None);
+        TEST_POOL.set(None);
         assert!(spare_of(flown).is_none_or(|ready| ready.is_some()), "free once its submissions landed");
         assert!(super::EXACT_REUSED.load(Relaxed) > before, "once landed, buffers are used again");
         drop(held);
@@ -7417,6 +7661,8 @@ mod spare_view_buffers {
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
+    // (Blocks emptied go with no copy made, too.)
+    blocks_let_go(crate::host::now_ms());
     let [asked, made, refused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
@@ -7425,17 +7671,20 @@ pub(crate) fn exact_line(frames: f64) {
         let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
         (guard.1.len(), exact_bytes(&guard.1))
     };
+    let [in_blocks, own_buffers, blocks, block_bytes] = view_blocks_counts();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept ({:.1} MB), {:.1} \
          refused per frame for the limit (VICTORY_VIEW_BYTES_MB); since the start {} of {} copies made on a buffer let go \
-         of before, no new memory (VICTORY_VIEW_BYTES_REUSE=0: none)",
+         of before, no new memory (VICTORY_VIEW_BYTES_REUSE=0: none), {in_blocks} cut from blocks of which there are \
+         {blocks} now ({:.1} MB; VICTORY_VIEW_BYTES_POOL=0: none), and {own_buffers} buffers of their own made",
         asked as f64 / frames,
         made as f64 / frames,
         bytes as f64 / 1e6,
         refused as f64 / frames,
         EXACT_REUSED.load(Ordering::Relaxed),
-        OWN_MADE.load(Ordering::Relaxed)
+        OWN_MADE.load(Ordering::Relaxed),
+        block_bytes as f64 / 1e6,
     );
 }
 

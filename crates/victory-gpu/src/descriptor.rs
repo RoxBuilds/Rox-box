@@ -1651,6 +1651,69 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether a placed view keeps only the words its descriptions use
+/// ([`placed_resource_words`], [`used_view_words`]). A title may leave the
+/// padding of the resource description and the unused part of the view
+/// description unwritten, so one view came with ever new bytes there: each
+/// was a new shape ([`Shape`]) and, once the shapes were full, a table entry
+/// kept for the run, and the host took the same view for a different one.
+///
+/// `VICTORY_PLACED_VIEW_WORDS`: on unless `0`; `0` keeps every word as the
+/// title passed it, as before. Ported from trustno1-coder/VIctory-NVIDIA
+/// 4eead67 (from JMAN730/project-flamingo b1e0cd1d), 144aca0 and 8bff6c2.
+fn placed_words_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_VIEW_WORDS").is_none_or(|v| v != "0"))
+}
+
+/// The words of a placed view's resource description, its padding zero
+/// unless [`placed_words_only`] is off: word 1 (after the dimension, before
+/// the 8-byte alignment) and word 13 (after the flags) belong to no field.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    let mut d = words(desc)?;
+    if placed_words_only() {
+        (d[1], d[13]) = (0, 0);
+    }
+    Some(d)
+}
+
+/// The words of a placed view's description, those its kind does not use
+/// zero unless [`placed_words_only`] is off ([`used_view_words`]).
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let d = words(desc)?;
+    Some(if placed_words_only() { used_view_words(d, unordered) } else { d })
+}
+
+/// A placed view's description with the words its kind does not use set to
+/// zero. The first ten words are the host's view description: for a shader
+/// resource view the format, the dimension, the component mapping, a word of
+/// padding (the union that follows starts on 8 bytes) and the union's six
+/// words; for an unordered access view the format, the dimension and the
+/// union's eight words. Each dimension uses only the head of the union.
+/// Words 10 and on (the address and the console's own fields) are kept, and
+/// so is every word of an unknown dimension.
+fn used_view_words(mut d: [u32; 16], unordered: bool) -> [u32; 16] {
+    // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    d
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1660,7 +1723,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1671,7 +1734,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2133,6 +2196,116 @@ mod tests {
         assert_eq!(ownerless_cap_of(Some("many")), 0);
     }
 
+    /// Two placed views alike but for the padding of the resource
+    /// description are one record; a used field still tells them apart.
+    #[test]
+    fn placed_views_share_resources_across_description_padding() {
+        if !placed_words_only() {
+            return;
+        }
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let view_desc = [0u32; 16];
+        let null = std::ptr::null();
+        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        let expected = resource;
+        for (unordered, create) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
+            (true, create_placed_uav),
+        ] {
+            create(null, &expected, &view_desc, handle);
+            let first = slot;
+            resource[1] = 0xaaaa_aaaa;
+            resource[13] = 0xbbbb_bbbb;
+            create(null, &resource, &view_desc, handle);
+            assert_eq!(slot, first);
+            assert_eq!(view(handle), Some(View::Placed(unordered, expected, view_desc)));
+            let mut other = resource;
+            other[12] = 4;
+            create(null, &other, &view_desc, handle);
+            assert_ne!(slot, first);
+        }
+    }
+
+    /// Two placed views alike but for the words their kind does not use
+    /// (the padding after the component mapping, the union's unused tail)
+    /// are one record; a used word still tells them apart.
+    #[test]
+    fn placed_views_ignore_unused_view_words() {
+        if !placed_words_only() {
+            return;
+        }
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        // A structured buffer view: words 4-5 first element, 6 count, 7
+        // stride, 8 flags; 3 and 9 are not used.
+        let srv = [0, 1, 0x1688, 0, 16, 0, 64, 16, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        // An unordered buffer view: words 2-3 first element, 4 count, 5
+        // stride, 6-7 counter offset, 8 flags; 9 is not used.
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        for (unordered, create, desc, unused, used) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), srv, [3usize, 9], 6usize),
+            (true, create_placed_uav, uav, [9, 9], 4),
+        ] {
+            create(null, &resource, &desc, handle);
+            let first = slot;
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+            let mut noisy = desc;
+            for w in unused {
+                noisy[w] = 0xdead_beef;
+            }
+            create(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "unused words left out");
+            let mut other = desc;
+            other[used] += 1;
+            create(null, &resource, &other, handle);
+            assert_ne!(slot, first, "a used word counts");
+        }
+        // A 2D texture view uses four words of the union (4-7): 8 and 9 go.
+        let mut tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        create_placed_srv(null, &resource, &tex, handle);
+        tex[3] = 0;
+        (tex[8], tex[9]) = (0, 0);
+        assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
+    }
+
+    /// The rule by dimension. With `VICTORY_PLACED_VIEW_WORDS=0`
+    /// [`placed_view_words`] and [`placed_resource_words`] skip it and keep
+    /// every word as passed; an unknown dimension keeps all either way.
+    #[test]
+    fn unused_view_words_by_dimension() {
+        let noisy: [u32; 16] = std::array::from_fn(|k| 0x100 + k as u32);
+        let with = |dimension: u32| {
+            let mut d = noisy;
+            d[1] = dimension;
+            d
+        };
+        // Shader resource views: a 2D texture keeps words 4-7, a cube array 4-8.
+        let tex = used_view_words(with(4), false);
+        assert_eq!((tex[3], &tex[4..8], &tex[8..10]), (0, &noisy[4..8], &[0, 0][..]));
+        assert_eq!(&tex[10..], &noisy[10..]);
+        let cubes = used_view_words(with(10), false);
+        assert_eq!((&cubes[4..9], cubes[9]), (&noisy[4..9], 0));
+        // Unordered views: no padding word; a 2D texture keeps words 2-3.
+        let uav = used_view_words(with(4), true);
+        assert_eq!((&uav[2..4], &uav[4..10]), (&noisy[2..4], &[0; 6][..]));
+        // Unknown dimensions (0, and past the enumeration) keep every word.
+        for (dimension, unordered) in [(0, false), (0, true), (12, false), (9, true), (0x7a70_0001, false)] {
+            assert_eq!(used_view_words(with(dimension), unordered), with(dimension));
+        }
+        // Off: the words as the title passed them.
+        let passed: [u32; 14] = std::array::from_fn(|k| 0x200 + k as u32);
+        let kept = placed_resource_words(&passed).unwrap();
+        if placed_words_only() {
+            assert_eq!((kept[1], kept[13], &kept[2..13]), (0, 0, &passed[2..13]));
+        } else {
+            assert_eq!(kept, passed);
+            assert_eq!(placed_view_words(&with(4), false), Some(with(4)));
+        }
+    }
+
     /// The leak fixed here: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -2144,8 +2317,9 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses; words 1 and
+        // 13 are the description's padding, which placed views keep as zero.
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),

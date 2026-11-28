@@ -257,6 +257,8 @@ pub(crate) enum NewMemory {
     /// The same for a copy of a buffer view's own bytes
     /// (`crate::shadow::exact`, [`SharedAs`]).
     ViewBytes,
+    /// A block such copies are cut from (`VICTORY_VIEW_BYTES_POOL`).
+    ViewBlock,
     /// A buffer of the card's memory the CPU maps.
     CardMapped,
     /// A buffer of the card's own memory ([`Host::uav_buffer`]).
@@ -264,13 +266,14 @@ pub(crate) enum NewMemory {
 }
 
 impl NewMemory {
-    const ALL: [NewMemory; 8] = [
+    const ALL: [NewMemory; 9] = [
         NewMemory::TextureBlock,
         NewMemory::Texture,
         NewMemory::Twin,
         NewMemory::Upload,
         NewMemory::Shared,
         NewMemory::ViewBytes,
+        NewMemory::ViewBlock,
         NewMemory::CardMapped,
         NewMemory::CardBuffer,
     ];
@@ -283,6 +286,7 @@ impl NewMemory {
             NewMemory::Upload => "upload buffers",
             NewMemory::Shared => "other buffers of shared memory",
             NewMemory::ViewBytes => "copies of views' own bytes",
+            NewMemory::ViewBlock => "blocks of copies of views' own bytes",
             NewMemory::CardMapped => "card buffers the CPU maps",
             NewMemory::CardBuffer => "card buffers",
         }
@@ -313,8 +317,8 @@ impl Drop for SharedAs {
 
 /// Per [`NewMemory`] kind: the waits of [`resident`] and of [`mapped`], each
 /// as times and microseconds.
-static WAITS_BY: [[std::sync::atomic::AtomicU64; 4]; 8] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 8];
+static WAITS_BY: [[std::sync::atomic::AtomicU64; 4]; NewMemory::ALL.len()] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; NewMemory::ALL.len()];
 
 /// Notes a wait for `kind` of `us` microseconds: of [`resident`] (`which`
 /// 0) or of [`mapped`] (1).
@@ -3761,6 +3765,9 @@ struct Deferred {
     /// Upload buffers of movie planes ([`HostList::plane_upload`]) and their bytes, held until the list is reset
     /// and then given back to the scratch chunks.
     plane_uploads: Vec<(Chunk, u64)>,
+    /// Title textures whose upload the list's prelude records if the check
+    /// at submission finds it due (`crate::texture::prelude_uploads`).
+    prelude_uploads: Vec<crate::texture::PreludeUpload>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -7733,7 +7740,7 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&mut batch) {
                 lists.push(Some(prelude));
             }
             // A list that could not close for want of memory is left out
@@ -8839,14 +8846,20 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// from the other, if a list submitted earlier left it behind. Title
+    /// textures whose upload is decided at submission
+    /// ([`HostList::prelude_uploads`], `crate::texture::prelude_uploads`; none
+    /// unless `VICTORY_PRELUDE_UPLOADS=1`) are copied into their host copies
+    /// here, right before the list runs (trustno1-coder/VIctory-NVIDIA
+    /// 91df493, from Belobug/VIctory-Belobug-AMD 5d6bd84).
+    fn prelude(&self, batch: &mut Batch) -> Option<ID3D12CommandList> {
         if self.dropped.load(Ordering::Relaxed) {
             return None;
         }
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        let uploads = self.prelude_uploads(batch);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -8855,6 +8868,10 @@ impl HostList {
         // were, if the list is dropped for want of memory (it then does not
         // run, and nothing it would have changed has changed).
         let mut undo: Vec<Box<dyn FnOnce()>> = Vec::new();
+        for (upload, first) in &uploads {
+            let (upload, first) = (upload.clone(), *first);
+            undo.push(Box::new(move || upload.unclaim(first)));
+        }
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
@@ -8908,6 +8925,38 @@ impl HostList {
                 }
             }
         }
+        // The uploads decided at submission: each host copy to the copy
+        // destination state, and from there to the state the list starts
+        // with (back to its real state if the list does not use it). A
+        // texture cut from a block may lie where another did: what the card
+        // holds of that one is done with before the first upload into this
+        // one (`crate::texture::PreludeUpload::aliasing`).
+        let mut aliasing = Vec::new();
+        for (upload, first_upload) in &uploads {
+            let copy = &upload.copy;
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if upload.aliasing(*first_upload) {
+                aliasing.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::ManuallyDrop::new(None),
+                            // SAFETY: a borrowed pointer the barrier never releases.
+                            pResourceAfter: unsafe { std::mem::transmute_copy(&copy.texture) },
+                        }),
+                    },
+                });
+            }
+            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+            copying.insert(key, COPY_DEST);
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let copy_back = copy.clone();
@@ -8916,7 +8965,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let mut ran_out = false;
@@ -8964,6 +9013,9 @@ impl HostList {
         let recorded = oom_retry_as("recording a state prelude", oom_inject(), || unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if !aliasing.is_empty() {
+                    list.ResourceBarrier(&aliasing);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -8974,6 +9026,9 @@ impl HostList {
                     {
                         twins::plane_back_from_source(list, &depth.texture, &plane.texture);
                     }
+                }
+                for (upload, _) in &uploads {
+                    upload.record(list);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -8999,6 +9054,9 @@ impl HostList {
                 return None;
             }
             fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        for (upload, _) in &uploads {
+            upload.recorded();
         }
         list.cast().ok()
     }
@@ -9623,6 +9681,30 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// [`HostList::defer_texture`] of a texture whose upload the list's
+    /// prelude records if the check finds it due
+    /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
+    pub(crate) fn defer_prelude_upload(&self, upload: crate::texture::PreludeUpload) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Texture(upload.staging()));
+        deferred.prelude_uploads.push(upload);
+    }
+
+    /// At submission, after the list's steps: the textures whose upload its
+    /// prelude records, each with whether it is the first upload into its
+    /// host copy, claimed ([`crate::texture::PreludeUpload::claim`]). Their
+    /// staging buffers are refreshed first (those the submission's steps
+    /// left pending). Ported from trustno1-coder/VIctory-NVIDIA 91df493 (from
+    /// Belobug/VIctory-Belobug-AMD 5d6bd84).
+    fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+        let waiting = self.deferred().prelude_uploads.clone();
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+        batch.refresh_textures();
+        waiting.into_iter().filter_map(|upload| upload.claim().map(|first| (upload, first))).collect()
     }
 
     /// A buffer of `size` bytes that this list alone reads its copy from, and a step that fills it from title
@@ -11322,7 +11404,7 @@ impl Meter {
                     "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
                      {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
-                     as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
+                     as read through a table ({reread} by a read after the first of their frame, VICTORY_TABLED_REREAD=1), {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
                      {} made slots found unmapped and made null",
@@ -11333,7 +11415,8 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    reread = crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed),
                 );
             }
             if crate::resource::held_only() {
@@ -11394,6 +11477,13 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            if crate::descriptor::host::show_new_later() {
+                tracing::info!(
+                    "slots of textures made while lists sent before them ran, shown once those had run \
+                     (VICTORY_SHOW_NEW_LATER=1), since the start: {}",
+                    crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -11403,7 +11493,9 @@ impl Meter {
                  {textures_ms:.1}, {past_ms:.1} of it past the pass's time; the buffer views {views_ms:.1}, on the \
                  thread beside with VICTORY_HEAP_PASS_ASIDE);                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 raw views cut (past the end, shortened, under a dword, unaligned) so far: {raw_cuts:?}",
+                raw_cuts = crate::descriptor::host::raw_view_counts(),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -11655,6 +11747,9 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // A picture of the run every few seconds (`shots.rs`), in every build.
+            let shot = crate::shots::due();
+            let read_now = read_now || shot.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -11681,6 +11776,7 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            let shot = shot.and_then(|seconds| Some((seconds, crate::shots::take(&self.device, list, texture)?)));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -11722,6 +11818,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            if let Some((seconds, (buffer, footprint))) = shot {
+                crate::shots::save(seconds, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);

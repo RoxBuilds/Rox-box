@@ -15,6 +15,9 @@ pub use cache::{Cache, CacheKey};
 /// The run report, for victory-gpu, whose one path to victory-core this
 /// crate is (a dependency of its own would change the lock file).
 pub use victory_core::report;
+/// The rule that nothing derived from a title is written inside the source
+/// tree, for victory-gpu's pictures of a run.
+pub use victory_core::ensure_outside_repo;
 
 /// A deterministic transformation of one input into one output.
 pub trait Converter: Send + Sync {

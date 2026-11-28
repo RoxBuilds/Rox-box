@@ -113,6 +113,18 @@ behaviour before it.
   buffer let go of is handed to another copy only once every submission begun
   or queued then has finished and the bury lag after it (`VICTORY_BURY_LAG`),
   as `retire` would have dropped it; at most 16 MiB of them, 2 s after that.
+  Few came back that way: more were let go of during that wait than the
+  16 MiB keeps, the oldest (nearest their turn) first.
+- **Copies of views' own bytes cut from blocks** (`VICTORY_VIEW_BYTES_POOL`, on
+  everywhere). A copy of up to 64 KiB is a range of a block of 1 MiB of the
+  same memory instead of a buffer of its own: no buffer made, nothing made
+  resident or waited for, a few hundred bytes taken instead of 64 KiB. A range
+  begins on a multiple of 768 bytes (16, 256 and every element a typed view
+  has, 12 bytes among them), so views take it as they took a buffer's start;
+  the last 64 KiB of a block are never handed out. A range goes back when its
+  copy goes (slots hold such copies themselves, as they held a buffer), and is
+  handed out again after the same wait as a buffer above; a block empty for
+  2 s goes, past the first empty one. Longer copies are buffers of their own.
 - The lines `new memory waited for` and `new card memory waited for until it
   is mapped` now say what the memory was (blocks of textures, textures of their
   own, depth twins, upload buffers, copies of views' own bytes, other buffers

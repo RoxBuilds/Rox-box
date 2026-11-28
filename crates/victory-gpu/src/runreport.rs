@@ -487,6 +487,10 @@ fn memory_map() {
     );
     set(Part::CardTextureTiles, crate::tiles::given_total());
     set(Part::DescriptorHeaps, crate::descriptor::host::HEAP_BYTES.load(Relaxed));
+    // `[memory.view_copies]` (their blocks' bytes are in the copies of title
+    // buffers above, `crate::shadow::report_memory`).
+    let [cut, own, blocks, bytes] = crate::shadow::view_blocks_counts();
+    report::view_copies_set(cut, own, blocks, bytes);
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };

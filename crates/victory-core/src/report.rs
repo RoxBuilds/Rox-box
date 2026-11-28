@@ -2094,6 +2094,42 @@ fn memory_map(d: &mut Doc, m: &MapSnapshot) {
 }
 
 // ---------------------------------------------------------------------------
+// Copies of buffer views' own bytes (`[memory.view_copies]`): how many were
+// cut from blocks and how many were buffers of their own, and the blocks.
+// Given by the GPU side as it samples its counters (`view_copies_set`); left
+// out of the report until given.
+
+/// Copies cut from blocks and buffers of their own made, since the start;
+/// blocks now and their bytes ([`NOT_KNOWN`]: not given).
+static VIEW_COPIES: [AtomicU64; 4] = [const { AtomicU64::new(NOT_KNOWN) }; 4];
+
+/// The copies of buffer views' own bytes as counted now: `cut` from blocks
+/// and `own` buffers of their own made since the start, `blocks` there are
+/// now and their `bytes`.
+pub fn view_copies_set(cut: u64, own: u64, blocks: u64, bytes: u64) {
+    for (at, n) in VIEW_COPIES.iter().zip([cut, own, blocks, bytes]) {
+        at.store(n.min(NOT_KNOWN - 1), Relaxed);
+    }
+}
+
+fn view_copies_take() -> Option<[u64; 4]> {
+    let v: [u64; 4] = std::array::from_fn(|i| VIEW_COPIES[i].load(Relaxed));
+    (!v.contains(&NOT_KNOWN)).then_some(v)
+}
+
+/// `[memory.view_copies]`, if given.
+fn view_copies(d: &mut Doc, v: Option<[u64; 4]>) {
+    let Some([cut, own, blocks, bytes]) = v else { return };
+    d.table("memory.view_copies");
+    d.comment("copies of buffer views' own bytes since the start: cut from blocks (VICTORY_VIEW_BYTES_POOL), buffers of their own made");
+    d.int("cut_from_blocks", cut);
+    d.int("own_buffers_made", own);
+    d.comment("the blocks they are cut from now, and their MiB");
+    d.int("blocks", blocks);
+    d.int("blocks_mib", (bytes + (1 << 19)) >> 20);
+}
+
+// ---------------------------------------------------------------------------
 // Rendering.
 
 /// Everything a report says, taken at once.
@@ -2746,6 +2782,7 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
 
     memory_views(d, s);
     memory_map(d, &s.map);
+    view_copies(d, view_copies_take());
 
     d.table("textures");
     d.comment("textures picked by index (from the view heap by shaders), since the start");
@@ -2934,6 +2971,23 @@ mod tests {
         let table: toml::Table = toml::from_str(&d.out).unwrap_or_else(|e| panic!("{e}
 {}", d.out));
         table["memory"].as_table().expect("a table").clone()
+    }
+
+    /// `[memory.view_copies]` says its numbers once they are given, and is
+    /// left out before.
+    #[test]
+    fn the_view_copies_say_their_numbers_once_given() {
+        let mut d = Doc { out: String::new(), host: false };
+        view_copies(&mut d, None);
+        assert!(d.out.is_empty());
+        view_copies(&mut d, Some([48_000, 30, 14, 14 * MIB]));
+        let table: toml::Table = toml::from_str(&d.out).unwrap_or_else(|e| panic!("{e}\n{}", d.out));
+        let v = table["memory"]["view_copies"].as_table().expect("a table");
+        assert_eq!(v["cut_from_blocks"].as_integer(), Some(48_000));
+        assert_eq!(v["own_buffers_made"].as_integer(), Some(30));
+        assert_eq!(v["blocks"].as_integer(), Some(14));
+        assert_eq!(v["blocks_mib"].as_integer(), Some(14));
+        assert_eq!(v.len(), 4);
     }
 
     #[test]

@@ -786,10 +786,43 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Whether the rotation field (control bits 4:3) is read only in modes 4 and
+/// 5, the only BC7 modes that have one. In the other modes those bits belong
+/// to nothing: read as a rotation, they swapped channel precisions and
+/// dropped the p-bit, so the block's colours came out wrong (and a mode
+/// without alpha bits could shift by too much).
+///
+/// `VICTORY_BC7_ROTATION_MODES`: on unless `0`; `0` reads the field in every
+/// mode, as before. Ported from trustno1-coder/VIctory-NVIDIA 6726920 (from
+/// fxceless/victory-fork 06702fe8, after upstream VIctory #3111).
+fn rotation_in_its_modes_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BC7_ROTATION_MODES").is_none_or(|v| v != "0"))
+}
+
+/// The channel rotation of a control word: 0 (none) or the channel, plus
+/// one, that trades places with alpha. `its_modes_only`: see
+/// [`rotation_in_its_modes_only`].
+fn rotation_with(ctrl: u16, its_modes_only: bool) -> usize {
+    if !its_modes_only || matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
+fn rotation(ctrl: u16) -> usize {
+    rotation_with(ctrl, rotation_in_its_modes_only())
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    bc7_precision_with(ctrl, rotation(ctrl))
+}
+
+fn bc7_precision_with(ctrl: u16, rot: usize) -> [u8; 4] {
+    let mode = ctrl & 7;
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -894,7 +927,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1405,6 +1438,110 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    /// A table file whose BC7 control code 0 is `ctrl`.
+    fn tables_with_ctrl(ctrl: u16) -> Tables {
+        const CTRL7_AT: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        let mut raw = tables();
+        raw[CTRL7_AT..CTRL7_AT + 2].copy_from_slice(&ctrl.to_le_bytes());
+        let t = Tables::parse(&raw).unwrap();
+        assert_eq!(t.ctrl7[0], ctrl);
+        t
+    }
+
+    const BC7_LANES: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+
+    fn bc7_decode_one(ctrl: u16, record: &[u8]) -> [u8; 16] {
+        let t = tables_with_ctrl(ctrl);
+        let src = stream(&t, &BC7_LANES, 2, &[record.to_vec()]);
+        let mut dst = [0u8; 16];
+        decode(7, &src, &mut dst, &t).unwrap();
+        dst
+    }
+
+    #[test]
+    fn bc7_rotation_is_read_only_in_modes_4_and_5() {
+        // (as the decoder runs unless VICTORY_BC7_ROTATION_MODES=0)
+        if !rotation_in_its_modes_only() {
+            return;
+        }
+        let mut record = vec![0u8; 32];
+        for (i, &v) in [11, 23, 5, 19, 13, 29, 7, 17, 3, 25, 9, 21, 15, 31, 1, 12].iter().enumerate() {
+            record[4 + i] = zigzag(v);
+        }
+        record[20] = zigzag(6);
+        record[21] = zigzag(14);
+
+        // A mode without a rotation field: bits 4:3 change nothing.
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let plain = subsets << 6 | mode;
+            let want = bc7_decode_one(plain, &record);
+            for rot in 1..=3u16 {
+                let ctrl = plain | rot << 3;
+                assert_eq!(bc7_decode_one(ctrl, &record), want, "mode {mode} rot {rot}");
+                assert_eq!(bc7_precision(ctrl), bc7_precision(plain), "mode {mode} rot {rot}");
+            }
+        }
+
+        // Modes 4 and 5: rotation swaps alpha with channel rot - 1.
+        for (mode, bits) in [(4u16, [5u8, 5, 5, 6]), (5, [7u8, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let mut want = bits;
+                want.swap(3, rot - 1);
+                assert_eq!(bc7_precision(1 << 6 | (rot as u16) << 3 | mode), want, "mode {mode} rot {rot}");
+            }
+            // rot 1 (red and alpha trade places): the block as written.
+            let ctrl = 1 << 6 | 1 << 3 | mode;
+            let mut s = vec![0u8; 32];
+            for (i, v) in [0x21, 0x12, 0x05, 0x06, 0x09, 0x0a, 0x0d, 0x0e].into_iter().enumerate() {
+                s[4 + i] = zigzag(v);
+            }
+            let (color, alpha) = (u32::from(bits[0]), u32::from(bits[3]));
+            let mut w = Bits::default();
+            w.put(1 << mode, u32::from(mode) + 1);
+            w.put(1, 2); // rotation 1
+            if mode == 4 {
+                w.put(0, 1); // index selection
+            }
+            // Channels in the order R G B A after the swap: the stored alpha
+            // pair is red, the stored red pair is alpha.
+            for (v, n) in [
+                (0x0d, color),
+                (0x0e, color),
+                (0x05, color),
+                (0x06, color),
+                (0x09, color),
+                (0x0a, color),
+                (0x21, alpha),
+                (0x12, alpha),
+            ] {
+                w.put(v, n);
+            }
+            assert_eq!(bc7_decode_one(ctrl, &s), w.v.to_le_bytes(), "mode {mode} rot 1");
+        }
+    }
+
+    #[test]
+    fn bc7_rotation_in_every_mode_when_switched_back() {
+        // VICTORY_BC7_ROTATION_MODES=0: the field is read whatever the mode.
+        for mode in 0..8u16 {
+            for rot in 0..=3u16 {
+                let ctrl = 1 << 6 | rot << 3 | mode;
+                assert_eq!(rotation_with(ctrl, false), usize::from(rot));
+                let fixed = usize::from(rot) * usize::from(matches!(mode, 4 | 5));
+                assert_eq!(rotation_with(ctrl, true), fixed);
+            }
+        }
+        // Mode 2 with bits 4:3 = 2: the old reading swapped blue with alpha
+        // (no alpha bits), the fixed one keeps the mode's own precisions.
+        let ctrl = 2 << 6 | 2 << 3 | 2;
+        assert_eq!(bc7_precision_with(ctrl, rotation_with(ctrl, false)), [5, 0, 5, 5]);
+        assert_eq!(bc7_precision_with(ctrl, rotation_with(ctrl, true)), [5, 5, 5, 0]);
+        // Mode 6: the old reading also dropped the p-bit.
+        let ctrl = 1 << 6 | 1 << 3 | 6;
+        assert_eq!(bc7_precision_with(ctrl, rotation_with(ctrl, false)), [7, 7, 7, 7]);
+        assert_eq!(bc7_precision_with(ctrl, rotation_with(ctrl, true)), [8, 7, 7, 7]);
     }
 
     #[test]

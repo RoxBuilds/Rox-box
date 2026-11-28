@@ -701,11 +701,67 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
 
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let raw = texture.as_raw() as usize;
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+            recent.pop_front();
+        }
+        recent.push_back((raw, now));
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    if crate::descriptor::host::show_new_later() {
+        let (begun, finished) = crate::host::submissions();
+        UNSEEN.note(raw, begun, finished);
+    }
+}
+
+/// Pooled textures made while submissions begun before them may still run:
+/// the submissions begun when each was made (with
+/// `crate::descriptor::host::show_new_later` only). Ported from
+/// trustno1-coder/VIctory-NVIDIA ee3fb52 (from Belobug/VIctory-Belobug-AMD
+/// 4cd2d13).
+static UNSEEN: Unseen = Unseen::new();
+
+/// Textures by their raw pointer, each with the submissions begun when it
+/// was made, and the newest of those numbers (nothing to look up once that
+/// has finished).
+struct Unseen {
+    made: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>>,
+    newest: AtomicU64,
+}
+
+impl Unseen {
+    const fn new() -> Unseen {
+        Unseen { made: std::sync::LazyLock::new(Default::default), newest: AtomicU64::new(0) }
+    }
+
+    /// The texture `raw` made with `begun` submissions begun, `finished`
+    /// finished.
+    fn note(&self, raw: usize, begun: u64, finished: u64) {
+        self.newest.fetch_max(begun, Ordering::Relaxed);
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Those every submission begun before them has left behind are no
+        // one's concern any more (and a raw pointer may come again).
+        made.retain(|_, b| *b > finished);
+        made.insert(raw, begun);
+    }
+
+    /// The submissions begun when `raw` was made, if not all have finished.
+    fn begun_before(&self, raw: usize, finished: u64) -> Option<u64> {
+        if self.newest.load(Ordering::Relaxed) <= finished {
+            return None;
+        }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(&raw).copied().filter(|&begun| begun > finished)
+    }
+}
+
+/// The submissions begun when `texture` was made in a block, if one of
+/// those may still be on the card: lists already sent then must not find it
+/// in a slot they read by index (`crate::descriptor::host::show_new_later`;
+/// off, nothing is noted and this is always `None`).
+pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
+    UNSEEN.begun_before(texture.as_raw() as usize, crate::host::submissions().1)
 }
 
 /// What a texture cut from a block carries, the object that gives its piece
@@ -849,6 +905,29 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture made while submissions run is held back until the newest of
+    /// those begun then has finished; one made with nothing running is not;
+    /// with nothing noted (`VICTORY_SHOW_NEW_LATER` off) none is.
+    #[test]
+    fn textures_made_while_submissions_run_wait_for_them() {
+        let unseen = Unseen::new();
+        assert_eq!(unseen.begun_before(0x1000, 0), None, "nothing noted: the switch off");
+        // Made with submissions 1-5 begun and 3 finished.
+        unseen.note(0x1000, 5, 3);
+        assert_eq!(unseen.begun_before(0x1000, 3), Some(5));
+        assert_eq!(unseen.begun_before(0x1000, 4), Some(5));
+        assert_eq!(unseen.begun_before(0x2000, 4), None, "another texture");
+        assert_eq!(unseen.begun_before(0x1000, 5), None, "all of them finished");
+        // Made with nothing running: never held.
+        unseen.note(0x3000, 7, 7);
+        assert_eq!(unseen.begun_before(0x3000, 7), None);
+        // Those left behind are forgotten when the next is noted (the
+        // pointer may come again for another texture).
+        unseen.note(0x4000, 9, 8);
+        assert!(!unseen.made.lock().unwrap().contains_key(&0x1000));
+        assert_eq!(unseen.begun_before(0x4000, 8), Some(9));
+    }
 
     #[test]
     fn growth_is_refused_inside_its_window_only() {

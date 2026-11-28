@@ -45,6 +45,7 @@ do something only in a diagnostics build.
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves ranges of the title image to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE=<dir>` with `VICTORY_CAPTURE_EVERY_S=<seconds>` | in any build, not only diagnostics: a half-size picture of the presented frame every that many seconds as `shot-<seconds>s.png` (seconds counted from the first presented frame), at most 120 per run, in a subfolder of `<dir>` named by the run's start in UTC digits (earlier runs' files are left alone). `play.ps1 -Shots <seconds>` sets both with `<data_dir>\shots`. Unset, it costs nothing; set, the frame it takes waits for the card once. A folder inside the source tree is refused; any failure is logged once and ends the pictures, never the run. The pictures are not in the run report |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |

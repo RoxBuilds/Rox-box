@@ -218,6 +218,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[memory.pressure]`** | How short memory ran: the lowest free memory and commit headroom, time at each governor level, the card past its budget, the commit guard, the waits for new memory ([below](#reading-memory-pressure-and-textures)) |
 | **`[memory.views]`** | The runtime's views of title pages and the descriptor table's entries of views without a resource, since the start ([below](#reading-memoryviews)) |
 | **`[memory.map]`**, **`[memory.map.peak]`** | Where the process's memory is, by our own categories, in MiB, as of the report (sampled each time it is written) and the most each held ([below](#reading-the-memory-map)) |
+| **`[memory.view_copies]`** | Copies of buffer views' own bytes (views that begin off their copy's elements) since the start: `cut_from_blocks` (`VICTORY_VIEW_BYTES_POOL`), `own_buffers_made` (each a new buffer of the PC's memory the card shares, made resident and waited for); and the blocks they are cut from now, `blocks` and `blocks_mib`. With the pool on, `own_buffers_made` is the few copies longer than 64 KiB; with it off, every copy not made on a buffer let go of before. The blocks' bytes no copy holds are counted in `[memory.map]`'s `title_buffer_copies_mib` |
 | **`[textures]`** | Textures shaders pick from the view heap by index: uploads, slots waiting for their memory, a full card; texture refreshes per frame ([below](#reading-memory-pressure-and-textures)) |
 | **`[unimplemented]`** | `methods_called` (distinct), `methods_lost` (calls that found the table full), `pipelines_gone_without` (calls of the device's pipeline creation methods that are not implemented, `DeserializeGraphicsPipelineStateX` and `DeserializeComputePipelineStateX` at 0x1c8 and 0x218: each a pipeline the title did not get that way), `imports_named`, `imports_other` and `imports_other_calls`; then one `[[unimplemented.method]]` per D3D12.X method not written yet that was called, those two included (`interface`, `offset` in its function table, `calls`) and one `[[unimplemented.import]]` per named import (`name`, `calls`) |
 
@@ -299,7 +300,7 @@ counted and empty is `0`. Nothing here is a name, an address or a path.
 | `unaccounted_mib` | `process_private_commit_mib` less `accounted_total_mib` (0 if the categories add up to more): what the map does not explain, such as the driver's memory, the title's own heaps (its `HeapAlloc`s and stacks, apart from the pages it committed) and allocations we do not count | The difference |
 | `title_committed_mib` | Host pages the title committed through its `VirtualAlloc`s, each counted once, less what it freed (the figure the title is told it uses). Left out with `VICTORY_TITLE_USED=counter` or `=process` | Exact |
 | `title_default_blocks_mib` | Blocks the title took from the default heap | Exact |
-| `title_buffer_copies_mib` | Host copies of title buffers: bytes of copies alive less the windows' lengths | Estimate (a copy only a list still holds, whose window is gone from the table, counts here) |
+| `title_buffer_copies_mib` | Host copies of title buffers: bytes of copies alive less the windows' lengths, and the bytes of the blocks copies of views' own bytes are cut from that no copy holds (`[memory.view_copies]`) | Estimate (a copy only a list still holds, whose window is gone from the table, counts here) |
 | `windows_of_title_memory_mib` | Host copies of windows of title memory outside buffers (not sparse: those hold tiles on the card) | Exact lengths; the table is read without waiting, the last figure stands if it is being written |
 | `snapshot_buffers_mib` | Snapshot buffers kept for reuse (capacity) | Exact, as above |
 | `list_scratch_mib` | Scratch chunks of host lists alive (held, spare and reserve) | Exact |
@@ -695,6 +696,14 @@ card_buffer_copies_mib = 800
 card_sparse_tiles_mib = 1500
 descriptor_heaps_mib = 96
 host_lists_alive = 700
+
+[memory.view_copies]
+# copies of buffer views' own bytes since the start: cut from blocks (VICTORY_VIEW_BYTES_POOL), buffers of their own made
+cut_from_blocks = 48000
+own_buffers_made = 30
+# the blocks they are cut from now, and their MiB
+blocks = 14
+blocks_mib = 14
 
 [textures]
 # textures picked by index (from the view heap by shaders), since the start

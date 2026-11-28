@@ -26,9 +26,17 @@ shader lowering concepts from upstream contributors:
   writes (the run-wise merge credited in `crates/victory-gpu/src/shadow.rs`,
   upstream VIctory #2009)
 - **trustno1-coder/VIctory-NVIDIA** (`GPL-3.0-or-later`) — shader writes into
-  write-combined memory left on the card, and the descriptor-heap record
-  sync switches (several by way of Belobug/VIctory-Belobug-AMD), credited per
-  commit where they were ported
+  write-combined memory left on the card, HID gamepad input (by Blitzball996
+  there), and the descriptor-heap record
+  sync switches (several by way of Belobug/VIctory-Belobug-AMD); picture
+  fixes: the BC7 rotation field of compressed textures, the words placed
+  views keep (from JMAN730/project-flamingo), raw buffer views kept inside
+  their buffer (from fxceless/victory-fork by way of CuteBooty/victory-8gb),
+  the order texture uploads and slots are shown in and the texture queue's
+  marks, the console's early depth test, a stand-in for reflections without
+  rays and the ambient stand-in's colour filter, and console threads given
+  from a group counter (from Vice-Tay); credited per commit where they were
+  ported
 
 Individual upstream changes are credited where they were adapted, in code
 comments of the form "after upstream ..." with the upstream commit or pull
