@@ -30,28 +30,40 @@ card, without device losses, with the picture the title intends.
 
 ## Where we are
 
-Honest numbers, in relative terms:
+Honest numbers, from run reports of one large open-world title on an 8 GB /
+32-lane laptop card in a 16 GB PC, the smaller console model at 1080p:
 
-- It starts some titles and reaches gameplay. Frame rates are in the low
-  double digits on a high-end 64-lane desktop card with plenty of memory, and
-  in the low single digits on 8 GB / 32-lane cards in PCs with little RAM.
-- The published build has been run end to end on a title on a 32-lane card:
-  it reaches the world, slowly and with a picture that is wrong in places. Its
-  report says where the frame goes: the card busy most of the time, the
-  submitting side waiting for it for one main cause, and a PC out of physical
-  memory ([docs/findings.md](docs/findings.md)). A report from a 64-lane card
-  is still wanted.
+- It reaches gameplay, saves, takes a controller and exits cleanly. In
+  interiors a frame takes about 60-70 ms (15 fps); in a large open area the
+  PC ran out of memory and frames took 150-700 ms. The steady frame of the
+  last long run was 100 ms.
+- Where the frame goes: the card is busy about half of it (~45 ms); the
+  thread that prepares each submission is the frame (55-65 ms), and in the
+  open area the card's memory went past its budget (10 GB on 7 GB), which
+  the system answered by moving memory into the PC's.
+- Faults seen in pictures of runs: speckled hair and soft shadows, noise and
+  aliasing (a console upscaler left out for a cheaper one), objects
+  disappearing (draws left out for want of descriptor slots), blocky or
+  foreign textures (card memory full), and light and fog wrong where the
+  title's own ray tracing is left out.
+- Since that run, and **not yet confirmed by a run of a title**: the card's
+  memory is compacted when it nears its budget; draws wait for descriptor
+  slots instead of being dropped; a title's FidelityFX upscale runs as FSR
+  3.1 from a DLL the user supplies (docs/upscaling.md); rays miss cleanly
+  while the structure builder is left out; five cuts to the preparing
+  thread; the graphics card chosen is the high-performance one, not
+  Windows' default.
+- The product: one per-user installer (no administrator rights) or a zip,
+  a launcher with toggles instead of switch text, `victory play` with no
+  script in between, one-click log export with personal details taken out.
+  The installer, the installed engine's self-test on a real card and the
+  uninstall are tested; CI installs into a folder with spaces and non-ASCII
+  letters on every change.
 - The path every player takes is tested without a title: a self-test of five
   stages and a demo title of our own source, run by `victory run` in the
   tests and in CI on the software adapter.
-- A run can be shared: every run and every self-test writes a report of
-  numbers and our own words, and two reports compare with one command.
-- Setup needs no terminal and no file editing; shaders and pipelines are
-  prepared by the launcher.
-- Changes made from that first report (small-card texture policy, the wait
-  for unwatched memory, a title's own command line and exits) are tested on
-  synthetic data and on the demo title; **runs of a title have not confirmed
-  them yet**.
+- Wanted: reports from AMD and Intel cards, from laptops with two GPUs, and
+  from 12-24 GB cards.
 
 ## Strategy
 
