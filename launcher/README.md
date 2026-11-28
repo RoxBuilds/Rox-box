@@ -26,10 +26,12 @@ next to `victory.exe`, `play.cmd` and `play.ps1` (or from the source tree).
   created"); the last one stays in the footer.
 
 Nothing has a Save button. A toggle, a title chosen, a size: each is kept the
-moment it changes, in `local\launcher.toml`. `victory.toml` is kept naming the
-active title by itself, when a title is added, chosen or played: only its
-`game_dir` line is written, every other line stays, and a copy
+moment it changes, in `local\launcher.toml`. In a release folder `victory.toml`
+is kept naming the active title by itself, when a title is added, chosen or
+played: only its `game_dir` line is written, every other line stays, and a copy
 `victory.toml.bak-<time>` is kept when it changes, as `play.cmd -Setup` does.
+In a source tree the file is the developer's own: choosing a title does not
+touch it; PLAY writes it, and so does a button in Settings.
 
 ## What each part runs
 
@@ -78,8 +80,12 @@ Off unless switched on in Settings. After a session ends (and on **Back up
 now**) the save folder is packed into `saves-<date>-<time>.zip` in the backup
 folder, by `tar.exe`, and only the newest few are kept (5 unless changed; 0
 keeps all). Only files with that name are ever removed. The save folder is the
-one you name; when you name none it is the engine's data folder (`data_dir` as
-`victory config` states it). The launcher knows no title's own save folder.
+one you name. When you name none, it is a `saves` folder inside the engine's
+data folder (`data_dir` as `victory config` states it) if there is one, else
+that data folder itself, and then only if it holds no more than 250 MB: the
+data folder can hold logs, reports and pictures as well, so a large one is not
+packed unasked, and the launcher says to name your save folder instead. The
+launcher knows no title's own save folder.
 
 ## Accessibility
 

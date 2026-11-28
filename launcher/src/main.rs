@@ -117,6 +117,16 @@ fn reset_pipeline_cache(cache_dir: &Path) -> std::io::Result<(usize, u64)> {
     Ok((files, bytes))
 }
 
+/// Whether `victory.toml` is written now: by itself in a release folder, and
+/// only when it was asked for in a source tree.
+fn writes_config(layout: Option<Layout>, asked: bool) -> bool {
+    match layout {
+        Some(Layout::Release) => true,
+        Some(Layout::Source) => asked,
+        None => false,
+    }
+}
+
 /// `m:ss` of a number of seconds.
 fn clock(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -286,9 +296,15 @@ impl App {
         command.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
     }
 
-    /// Keeps `victory.toml` naming the active title: no button to press.
+    /// Keeps `victory.toml` naming the active title. In a release folder that
+    /// happens by itself, when a title is added, chosen or played. In a source
+    /// tree the file is a developer's own: it is written only when asked for
+    /// (`asked`: PLAY, or the button in Settings), never by choosing a title.
     /// Every other line of the file stays, and a copy is kept when it changes.
-    fn sync_config(&mut self) {
+    fn sync_config(&mut self, asked: bool) {
+        if !writes_config(self.home.as_ref().map(|h| h.layout), asked) {
+            return;
+        }
         let (Some(home), Some(active)) = (&self.home, &self.lib.active) else { return };
         match config::write_game_dir(&home.config_file(), active) {
             Ok(done) if done.contains("already") => {}
@@ -301,7 +317,7 @@ impl App {
         let Some(home) = &self.home else { return };
         let script = home.play_script();
         let source = self.source_tree();
-        self.sync_config();
+        self.sync_config(true);
         if self.lib.prepare {
             self.queue.push_back(runner::play(&script, &self.lib, source, true));
         }
@@ -471,14 +487,14 @@ impl App {
             return;
         };
         self.lib.add(&folder);
-        self.sync_config();
+        self.sync_config(false);
         self.toast(Mark::Ok, format!("{} added to the library.", title_name(&folder)));
         self.enqueue_victory(Kind::Check, &["check"]);
     }
 
     fn activate(&mut self, title: String) {
         self.lib.active = Some(title);
-        self.sync_config();
+        self.sync_config(false);
         self.enqueue_victory(Kind::Check, &["check"]);
     }
 
@@ -505,24 +521,34 @@ impl App {
         self.home.as_ref().map(|h| h.root.join("local").join("backups"))
     }
 
-    /// What is packed: the folder named in Settings, else the engine's data folder.
-    fn save_dir(&self) -> Option<PathBuf> {
+    /// What is packed, and whether the person named it: the folder named in
+    /// Settings, else what [`backup::default_source`] finds in the engine's data folder.
+    fn save_dir(&self) -> Option<(PathBuf, bool)> {
         if !self.lib.save_dir.trim().is_empty() {
-            return Some(PathBuf::from(self.lib.save_dir.trim()));
+            return Some((PathBuf::from(self.lib.save_dir.trim()), true));
         }
-        config_value(&self.engine_config(), "data_dir")
+        config_value(&self.engine_config(), "data_dir").map(|data| (backup::default_source(&data), false))
     }
 
     fn backup_now(&mut self) {
         if self.backing_up.is_some() {
             return;
         }
-        let (Some(saves), Some(dir)) = (self.save_dir(), self.backup_dir()) else {
+        let (Some((saves, named)), Some(dir)) = (self.save_dir(), self.backup_dir()) else {
             self.toast(Mark::Warn, "No backup: the save folder is not known. Name it in Settings.");
             return;
         };
         if !saves.is_dir() {
             self.toast(Mark::Warn, "No backup: the save folder does not exist yet.");
+            return;
+        }
+        // A folder nobody named is not packed when it is large: the engine's
+        // data folder can hold far more than saves (logs, reports, pictures).
+        if !named && backup::folder_size(&saves, backup::UNASKED_LIMIT) > backup::UNASKED_LIMIT {
+            self.toast(
+                Mark::Warn,
+                format!("No backup: the engine's data folder holds more than {}, so it is not packed whole. Name your save folder in Settings, Auto-backups.", megabytes(backup::UNASKED_LIMIT)),
+            );
             return;
         }
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1427,7 +1453,7 @@ impl App {
             });
             ui.add_space(8.0);
             let (save, backup) = (self.lib.save_dir.clone(), self.lib.backup_dir.clone());
-            if self.folder_row(ui, ctx, "Save folder", &save, "the engine's data folder (data_dir, as `victory config` states it)", Pick::SaveDir) {
+            if self.folder_row(ui, ctx, "Save folder", &save, "not named: a saves folder in the engine's data folder, else that folder if it is under 250 MB", Pick::SaveDir) {
                 self.lib.save_dir.clear();
             }
             ui.add_space(6.0);
@@ -1440,7 +1466,7 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.lib.backup_keep).range(0..=99).speed(0.1));
                 ui.label(RichText::new(if self.lib.backup_keep == 0 { "(0: every backup is kept)" } else { "zip(s); older ones of the launcher's own are removed" }).color(theme::dim()).small());
             });
-            ui.label(RichText::new("Each backup is one saves-<date>-<time>.zip of the whole save folder. Only files with that name are ever removed.").color(theme::dim()).small());
+            ui.label(RichText::new("Each backup is one saves-<date>-<time>.zip of the whole save folder. Only files with that name are ever removed. A folder you did not name is not packed when it holds more than 250 MB: name your save folder then.").color(theme::dim()).small());
         });
 
         theme::section(ui, "Accessibility");
@@ -1494,15 +1520,23 @@ impl App {
                 ui.label(RichText::new("GPL-3.0-or-later").color(theme::faint()).small());
             });
             let default = self.home.as_ref().and_then(|h| std::fs::read_to_string(h.config_file()).ok()).and_then(|t| config::game_dir_of(&t));
+            let in_sync = default.is_some() && default.as_deref() == self.lib.active.as_deref();
+            let source = self.source_tree();
             ui.label(
-                RichText::new(match (&default, default.is_some() && default.as_deref() == self.lib.active.as_deref()) {
-                    (_, true) => "victory.toml names the active title: it is kept so by itself (game_dir only; a copy of the file is kept when it changes).",
-                    (Some(_), false) => "victory.toml names another folder; it follows the next title you choose or play.",
-                    (None, _) => "victory.toml names no folder yet; it will, with the first title.",
+                RichText::new(match (&default, in_sync, source) {
+                    (_, true, false) => "victory.toml names the active title: it is kept so by itself (game_dir only; a copy of the file is kept when it changes).",
+                    (_, true, true) => "victory.toml names the active title.",
+                    (Some(_), false, false) => "victory.toml names another folder; it follows the next title you choose or play.",
+                    (None, _, false) => "victory.toml names no folder yet; it will, with the first title.",
+                    (_, false, true) => "This is a source tree: victory.toml is yours, and choosing a title does not change it. PLAY writes it (game_dir only, a copy kept), and so does the button here. Every command is about the active title all the same.",
                 })
                 .color(theme::dim())
                 .small(),
             );
+            if source && !in_sync && theme::button(ui, "Write active title to victory.toml", self.lib.active.is_some()).clicked() {
+                self.sync_config(true);
+                self.toast(Mark::Ok, "victory.toml names the active title now.");
+            }
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 let home = self.home.clone();
@@ -1592,6 +1626,15 @@ mod tests {
         assert_eq!(clock(754), "12:34");
         assert_eq!(title_name("D:\\Titles\\My Title"), "My Title");
         assert_eq!(megabytes(4_515_465), "4.3 MB");
+    }
+
+    #[test]
+    fn victory_toml_is_written_unasked_only_in_a_release_folder() {
+        assert!(writes_config(Some(Layout::Release), false));
+        assert!(writes_config(Some(Layout::Release), true));
+        assert!(!writes_config(Some(Layout::Source), false), "choosing a title in a checkout leaves the developer's file alone");
+        assert!(writes_config(Some(Layout::Source), true), "PLAY and the button write it");
+        assert!(!writes_config(None, true));
     }
 
     #[test]

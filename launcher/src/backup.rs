@@ -15,6 +15,37 @@ use crate::runner::{Kind, Spec};
 const PREFIX: &str = "saves-";
 const SUFFIX: &str = ".zip";
 
+/// The most a folder nobody named may hold and still be packed (250 MB).
+pub const UNASKED_LIMIT: u64 = 250 * 1024 * 1024;
+
+/// What is packed when no folder is named: a `saves` folder in the engine's
+/// data folder if there is one, else the data folder itself (which
+/// [`UNASKED_LIMIT`] then guards).
+pub fn default_source(data_dir: &Path) -> PathBuf {
+    let saves = data_dir.join("saves");
+    if saves.is_dir() { saves } else { data_dir.to_path_buf() }
+}
+
+/// The bytes of the files under `dir`, counted until they pass `stop_past`
+/// (a large folder is not walked to its end to learn that it is large).
+pub fn folder_size(dir: &Path, stop_past: u64) -> u64 {
+    let mut total = 0;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(next) = todo.pop() {
+        for entry in std::fs::read_dir(&next).into_iter().flatten().filter_map(|e| e.ok()) {
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => todo.push(entry.path()),
+                Ok(meta) => total += meta.len(),
+                Err(_) => {}
+            }
+            if total > stop_past {
+                return total;
+            }
+        }
+    }
+    total
+}
+
 /// The file a backup made at `stamp` goes to.
 pub fn file_for(backup_dir: &Path, stamp: &str) -> PathBuf {
     backup_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"))
@@ -79,6 +110,22 @@ mod tests {
         assert!(to_remove(&names, 4).is_empty());
         assert!(to_remove(&names, 0).is_empty(), "0 keeps every backup");
         assert_eq!(file_for(Path::new("D:\\b"), "20261128-101500"), PathBuf::from("D:\\b\\saves-20261128-101500.zip"));
+    }
+
+    #[test]
+    fn a_saves_folder_is_preferred_and_sizes_are_counted() {
+        let data = std::env::temp_dir().join(format!("roxbox-launcher-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(data.join("reports").join("deep")).unwrap();
+        std::fs::write(data.join("reports").join("deep").join("a.txt"), vec![1u8; 3000]).unwrap();
+        std::fs::write(data.join("b.bin"), vec![2u8; 2000]).unwrap();
+        assert_eq!(default_source(&data), data, "no saves folder: the data folder itself");
+        assert_eq!(folder_size(&data, u64::MAX), 5000);
+        assert!(folder_size(&data, 1000) > 1000, "counting stops once the limit is passed");
+        assert_eq!(folder_size(&data.join("nowhere"), u64::MAX), 0);
+        std::fs::create_dir_all(data.join("saves")).unwrap();
+        assert_eq!(default_source(&data), data.join("saves"));
+        assert_eq!(UNASKED_LIMIT, 262_144_000);
     }
 
     #[test]
