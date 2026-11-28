@@ -744,6 +744,31 @@ fn heap_recheck_aliased() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_ALIASED").is_none_or(|v| v != "0"))
 }
 
+/// Whether the title shows any page of `[start, end)` at other addresses too
+/// ([`heap_recheck_aliased`]).
+fn shown_elsewhere(start: usize, end: usize) -> bool {
+    if aliased_quick() {
+        crate::inplace::any_shown_elsewhere(start, end)
+    } else {
+        !crate::inplace::shown_elsewhere(start, end).is_empty()
+    }
+}
+
+/// Whether the look at an uploaded texture that found it unchanged asks only
+/// whether any of its pages are shown elsewhere, and stops at the first
+/// (`VICTORY_ALIASED_QUICK`, on unless `0`; `0`: the list of all such pages
+/// and their other addresses is made, and only its emptiness looked at, as
+/// before).
+///
+/// That list was made at every such look, thousands a frame: in a profile of
+/// a run in an open area 9 ms a frame of the threads that record lists (all
+/// of them), a third of it gathering the vectors; and a texture that is shown
+/// elsewhere is known by its first such page. The answer is the same either
+/// way.
+fn aliased_quick() -> bool {
+    crate::toggled!("VICTORY_ALIASED_QUICK")
+}
+
 /// After the `looks`-th look at an uploaded texture picked by index found
 /// its memory as it was: the frames to the next look and the count of looks
 /// then, or `None` if it is done. `aliased`: its pages are shown at other
@@ -2725,8 +2750,7 @@ impl State {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     // (Its pages shown at other addresses too: looked at
                     // for good, every few frames, [`heap_recheck_aliased`].)
-                    let aliased = heap_recheck_aliased()
-                        && !crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize).is_empty();
+                    let aliased = heap_recheck_aliased() && shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
                     match next_look(looks, aliased) {
                         Some((wait, looks)) => {
                             if aliased {

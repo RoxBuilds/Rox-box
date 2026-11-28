@@ -273,6 +273,7 @@ are left out (rather than written as zeros).
 | `submitting_thread_stood_ms` | "the submitting thread stood waiting for the card N ms" | The submitting thread blocked on the card; with a low `card_busy_pct`, the waits themselves are the cost |
 | `heap_buffer_passes`, `heap_buffer_ms` | "heap buffers N passes N ms": passes over the view heap for shaders that pick views by index; with the buffer views' pass on a thread beside (the default) the ms are its texture side, which takes a share of the frame (`VICTORY_TEXTURE_STAGE_SHARE`); the line splits them | Many or slow passes: big heaps rescanned often, or many textures made and staged; a tenth of the frame is the share at work |
 | `send_memory_made_ms` | "their memory made new ... ms" in the line of bytes sent up: memory for submissions' sends made on the submitting thread because no spare one fitted, with its wait until it was resident (`VICTORY_SEND_KEEP_PEAK` keeps what submissions held lately) | The submitting thread makes and waits for new memory each frame: the spare memory is let go of and made again, or the PC is short of memory |
+| `write_watch_askings`, `write_watch_mib`, `write_watch_pages_found`, `write_watch_ms` | the line "write-watch askings per frame", which splits them: the submissions' own (one asking each, `VICTORY_ASK_ONCE`) and the others, and of each those that found nothing written | Questions to Windows of which title pages were written (all threads): many MiB with few pages found is time walking page tables; many pages found in many askings is time telling every processor to forget them |
 
 `[frame_time.waits]` (and its `.steady`) splits the waiting in settles of
 submissions sent ahead (`VICTORY_LATE_WAIT` or the relay; all 0 when
@@ -652,6 +653,10 @@ submitting_thread_stood_ms = 7.00
 heap_buffer_passes = 2.00
 heap_buffer_ms = 0.40
 send_memory_made_ms = 0.00
+write_watch_askings = 0.00
+write_watch_mib = 0.00
+write_watch_pages_found = 0.00
+write_watch_ms = 0.00
 
 [frame_time.steady]
 from_s = 40.00
@@ -672,6 +677,10 @@ submitting_thread_stood_ms = 7.30
 heap_buffer_passes = 2.00
 heap_buffer_ms = 0.30
 send_memory_made_ms = 0.00
+write_watch_askings = 0.00
+write_watch_mib = 0.00
+write_watch_pages_found = 0.00
+write_watch_ms = 0.00
 
 [frame_time.waits]
 # ms per frame the waiting for the card in settles took, by what settled, whole run

@@ -681,6 +681,24 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// Whether [`shown_elsewhere`] would name any page of `[start, end)`: the
+/// first found answers, and nothing is gathered.
+pub(crate) fn any_shown_elsewhere(start: usize, end: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    v.views.range(first.unwrap_or(start)..end).any(|(&base, &(bytes, section, offset))| {
+        let from = start.max(base) & !(K64 - 1);
+        (from..end.min(base + bytes)).step_by(K64).any(|page| {
+            v.pages
+                .get(&(section, offset + (page - base) as u64))
+                .is_some_and(|shown| (2..=crate::watch::MANY_VIEWS).contains(&shown.len()))
+        })
+    })
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
@@ -1721,6 +1739,34 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// The quick question whether a range has a page shown elsewhere answers
+    /// as the full list does, for every range over views shown once, twice
+    /// and not at all.
+    #[test]
+    fn any_shown_elsewhere_answers_as_the_list() {
+        let _views = crate::test_views_lock();
+        let at = 0x7_8000_0000usize;
+        let section = 4242;
+        // Pages 0-3 of the section at `at`; page 2 of it again at `at + 8`,
+        // and pages 5-6 at `at + 5` alone; nothing at 4 and 7.
+        title_memory_view(at, 4 * K64, section, 0);
+        title_memory_view(at + 5 * K64, 2 * K64, section, 10 * K64 as u64);
+        title_memory_view(at + 8 * K64, K64, section, 2 * K64 as u64);
+        let mut some = 0;
+        for from in 0..10 {
+            for to in from..=10 {
+                for (a, b) in [(at + from * K64, at + to * K64), (at + from * K64 + 100, at + to * K64 + 100)] {
+                    let listed = !shown_elsewhere(a, b).is_empty();
+                    assert_eq!(any_shown_elsewhere(a, b), listed, "{from}..{to}");
+                    some += usize::from(listed);
+                }
+            }
+        }
+        assert!(some > 0 && some < 110, "{some}");
+        views_gone(at, 9 * K64);
+        assert!(!any_shown_elsewhere(at, at + 9 * K64));
     }
 
     /// What the runtime forgets when memory is mapped anew.

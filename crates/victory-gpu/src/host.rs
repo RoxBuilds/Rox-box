@@ -71,7 +71,129 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+static RETIRED: Retirements<Retired> = Retirements::new();
+
+/// How many lines [`Retirements`] keeps.
+const RETIRE_LINES: usize = 16;
+
+/// What waits for submissions to finish, by the submission count each waits
+/// for: a line per thread that lets things go (threads share lines when
+/// there are more of them), each in the order its thread let them go.
+pub(crate) struct Retirements<T> {
+    lines: [Mutex<std::collections::VecDeque<(u64, T)>>; RETIRE_LINES],
+}
+
+impl<T> Retirements<T> {
+    pub(crate) const fn new() -> Self {
+        Retirements { lines: [const { Mutex::new(std::collections::VecDeque::new()) }; RETIRE_LINES] }
+    }
+
+    /// The line of the calling thread.
+    fn mine(&self) -> &Mutex<std::collections::VecDeque<(u64, T)>> {
+        thread_local! {
+            static LINE: usize = {
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed) % RETIRE_LINES
+            };
+        }
+        let line = if retire_lines() { LINE.with(|l| *l) } else { 0 };
+        &self.lines[line]
+    }
+
+    /// `what` waits for submission `mark` to finish.
+    pub(crate) fn push(&self, mark: u64, what: T) {
+        self.mine().lock().unwrap_or_else(|e| e.into_inner()).push_back((mark, what));
+    }
+
+    /// What waits for submissions up to `finished`, taken out of the lines:
+    /// of each line what lies before its first entry that waits for a later
+    /// one (as in the one line before, where threads overtook each other).
+    pub(crate) fn take_up_to(&self, finished: u64) -> Vec<(u64, T)> {
+        let mut done = Vec::new();
+        for line in &self.lines {
+            let mut line = line.lock().unwrap_or_else(|e| e.into_inner());
+            let n = line.iter().take_while(|(at, _)| *at <= finished).count();
+            done.extend(line.drain(..n));
+        }
+        done
+    }
+
+    /// Calls `each` with what waits, line by line; `None` if a line is busy.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn try_each(&self, mut each: impl FnMut(&T)) -> Option<u64> {
+        let mut n = 0;
+        for line in &self.lines {
+            let line = match line.try_lock() {
+                Ok(line) => line,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            n += line.len() as u64;
+            line.iter().for_each(|(_, what)| each(what));
+        }
+        Some(n)
+    }
+}
+
+/// Whether what waits for submissions to finish ([`retire`]) is kept in a
+/// line per thread that lets things go (`VICTORY_RETIRE_LINES`, on unless
+/// `0`; `0`: one line for all, as before).
+///
+/// One line for all was a lock every thread letting go of something took,
+/// tens of thousands of times a frame, from the threads that translate lists
+/// above all (a descriptor slot's old resource): in profiles of runs on a PC
+/// short of memory they waited 8-10 ms a frame (all of them) for it, and
+/// spent 5 ms more inside it. Nothing goes earlier either way: a line gives
+/// up only what waits for submissions that have finished.
+fn retire_lines() -> bool {
+    crate::toggled!("VICTORY_RETIRE_LINES")
+}
+
+#[cfg(test)]
+mod retire_lines_tests {
+    use super::Retirements;
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+
+    /// Threads let go of things while submissions finish: nothing is taken
+    /// before the submission it waits for has finished, and everything is
+    /// taken once all have, each once.
+    #[test]
+    fn nothing_goes_early_and_nothing_is_lost() {
+        static LINES: Retirements<(usize, u64)> = Retirements::new();
+        static STARTED: AtomicU64 = AtomicU64::new(0);
+        const THREADS: usize = 12;
+        const EACH: u64 = 20_000;
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        if i % 64 == 0 {
+                            STARTED.fetch_add(1, SeqCst);
+                        }
+                        LINES.push(STARTED.load(SeqCst), (t, i));
+                    }
+                })
+            })
+            .collect();
+        let mut taken = Vec::new();
+        while !threads.iter().all(|t| t.is_finished()) {
+            // Submissions up to some way behind the newest have finished.
+            let finished = STARTED.load(SeqCst).saturating_sub(3);
+            for (mark, what) in LINES.take_up_to(finished) {
+                assert!(mark <= finished, "taken at {finished}, waiting for {mark}");
+                taken.push(what);
+            }
+        }
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        taken.extend(LINES.take_up_to(u64::MAX).into_iter().map(|(_, what)| what));
+        assert_eq!(taken.len(), THREADS * EACH as usize);
+        taken.sort_unstable();
+        taken.dedup();
+        assert_eq!(taken.len(), THREADS * EACH as usize, "each once");
+        assert!(LINES.take_up_to(u64::MAX).is_empty());
+    }
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1184,10 +1306,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    RETIRED.push(started, Retired::Any(Box::new(object)));
 }
 
 /// The number [`retire`] would give something let go now: the newest
@@ -1219,7 +1338,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    RETIRED.push(started, Retired::Resource(object));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -1239,14 +1358,10 @@ fn bury_lag() -> u64 {
 /// its own (`grave`, `VICTORY_BURY_ASIDE`; `0`: here, as before).
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
-        retired.drain(..n).collect()
-    };
+    let done = RETIRED.take_up_to(finished);
+    if done.is_empty() {
+        return;
+    }
     grave::bury(done);
 }
 
@@ -11729,6 +11844,7 @@ impl Meter {
         late_line(frames);
         moved_line(frames);
         sweep_line(frames);
+        crate::watch::kernel_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         gpu_split::line(frames);

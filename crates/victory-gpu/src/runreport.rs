@@ -303,6 +303,19 @@ pub(crate) fn send_memory_made(us: u64) {
     }
 }
 
+/// The write watch's kernel askings since the frame line's last second
+/// (`watch::kernel_line`; not per frame): askings, KiB asked about, pages
+/// found written, nanoseconds. shortcut: the run's last part of a second
+/// ([`last_meters`]) is left out.
+pub(crate) fn write_watch(all: [u64; 4]) {
+    report::figures(&[
+        (Figure::WriteWatchAskings, all[0]),
+        (Figure::WriteWatchKib, all[1]),
+        (Figure::WriteWatchPages, all[2]),
+        (Figure::WriteWatchUs, all[3] / 1000),
+    ]);
+}
+
 /// Passes over the heap's buffer views per frame, and their ms.
 pub(crate) fn heap_buffers(frames: f64, passes: f64, ms: f64) {
     report::figures(&[

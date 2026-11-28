@@ -255,7 +255,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -276,6 +275,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         if failed {
             return None;
         }
+        counted(last - first, count, started.elapsed().as_nanos() as u64);
         #[cfg(feature = "diagnostics")]
         {
             tally(12, count as u64);
@@ -296,6 +296,69 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         }
         Some(pages)
     })
+}
+
+/// Since the last frame line: the kernel's answers ([`kernel_written`]) to a
+/// submission's one asking ([`ask_once`], first) and to the others: askings,
+/// KiB asked about, pages found written, nanoseconds; then of the askings
+/// that found nothing written: askings, KiB, nanoseconds. What an asking
+/// costs is the page tables it walks and, when it finds pages written, the
+/// processors told to forget them: these say which of the two a frame's
+/// askings spend their time on.
+static KERNEL: [[std::sync::atomic::AtomicU64; 7]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 2];
+
+thread_local! {
+    /// The thread makes a submission's one asking ([`ask_once`]).
+    static ONCE_ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`KERNEL`]: an answer for `pages` of [`PAGE`] that found `found` 4 KiB
+/// pages written, in `ns`.
+fn counted(pages: usize, found: usize, ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = &KERNEL[usize::from(!ONCE_ASKING.get())];
+    let kib = (pages * (PAGE >> 10)) as u64;
+    k[0].fetch_add(1, Relaxed);
+    k[1].fetch_add(kib, Relaxed);
+    k[2].fetch_add(found as u64, Relaxed);
+    k[3].fetch_add(ns, Relaxed);
+    if found == 0 {
+        k[4].fetch_add(1, Relaxed);
+        k[5].fetch_add(kib, Relaxed);
+        k[6].fetch_add(ns, Relaxed);
+    }
+}
+
+/// For the frame-rate line, and the run report: [`KERNEL`], per frame.
+pub(crate) fn kernel_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = KERNEL.each_ref().map(|k| k.each_ref().map(|n| n.swap(0, Relaxed)));
+    let all: [u64; 4] = std::array::from_fn(|i| k[0][i] + k[1][i]);
+    if all[0] == 0 {
+        return;
+    }
+    crate::runreport::write_watch(all);
+    let f = |n: u64| n as f64 / frames;
+    let mib = |kib: u64| kib as f64 / 1024.0 / frames;
+    let ms = |ns: u64| ns as f64 / 1e6 / frames;
+    tracing::info!(
+        "write-watch askings per frame: the submissions' own {:.1} over {:.0} MiB finding {:.0} pages written, {:.2} ms          ({:.1} of them finding none, over {:.0} MiB, {:.2} ms); the others {:.1} over {:.0} MiB finding {:.0} pages, {:.2} ms          ({:.1} finding none, over {:.0} MiB, {:.2} ms)",
+        f(k[0][0]),
+        mib(k[0][1]),
+        f(k[0][2]),
+        ms(k[0][3]),
+        f(k[0][4]),
+        mib(k[0][5]),
+        ms(k[0][6]),
+        f(k[1][0]),
+        mib(k[1][1]),
+        f(k[1][2]),
+        ms(k[1][3]),
+        f(k[1][4]),
+        mib(k[1][5]),
+        ms(k[1][6]),
+    );
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -534,8 +597,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    ONCE_ASKING.set(true);
     ask_ahead(ranges);
     ask_rest(ranges);
+    ONCE_ASKING.set(false);
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the

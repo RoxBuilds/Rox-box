@@ -181,26 +181,19 @@ impl Host {
     /// (`crate::book::census`) finds; `None` while the list is busy.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn buried(&self) -> Option<(u64, Vec<usize>)> {
-        let retired = match super::RETIRED.try_lock() {
-            Ok(retired) => retired,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
         let mut raws = Vec::new();
-        for (_, what) in retired.iter() {
-            match what {
-                super::Retired::Resource(resource) => raws.push(resource.as_raw() as usize),
-                super::Retired::Any(any) => {
-                    if let Some(shadow) = any.downcast_ref::<std::sync::Arc<crate::shadow::Shadow>>() {
-                        raws.push(shadow.buffer.as_raw() as usize);
-                        if let Some((Some(staging), _, _)) = shadow.card_sides() {
-                            raws.push(staging.as_raw() as usize);
-                        }
+        let n = super::RETIRED.try_each(|what| match what {
+            super::Retired::Resource(resource) => raws.push(resource.as_raw() as usize),
+            super::Retired::Any(any) => {
+                if let Some(shadow) = any.downcast_ref::<std::sync::Arc<crate::shadow::Shadow>>() {
+                    raws.push(shadow.buffer.as_raw() as usize);
+                    if let Some((Some(staging), _, _)) = shadow.card_sides() {
+                        raws.push(staging.as_raw() as usize);
                     }
                 }
             }
-        }
-        Some((retired.len() as u64, raws))
+        })?;
+        Some((n, raws))
     }
 }
 
