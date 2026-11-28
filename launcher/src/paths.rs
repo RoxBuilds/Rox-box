@@ -84,12 +84,19 @@ impl Home {
         self.root.join("target").join(build).join("victory.exe")
     }
 
-    /// victory.exe: beside the launcher, or of `build` (empty: the first
-    /// that is built, as play.ps1 chooses).
+    /// victory.exe: beside the launcher, or of `build` (empty: the newest
+    /// optimised build, a debug build only when there is no other: an old
+    /// `diag` left beside a fresh `release` would otherwise be chosen, with
+    /// its old code and pipelines warmed for another exe).
     pub fn victory(&self, build: &str) -> Option<PathBuf> {
         match self.layout {
             Layout::Release => Some(self.root.join("victory.exe")),
-            Layout::Source if build.is_empty() => self.builds().first().map(|b| self.victory_of(b)),
+            Layout::Source if build.is_empty() => {
+                let modified = |b: &&&str| std::fs::metadata(self.victory_of(b)).and_then(|m| m.modified()).ok();
+                let builds = self.builds();
+                let optimised = builds.iter().filter(|b| **b != "debug").max_by_key(modified);
+                optimised.or(builds.first()).map(|b| self.victory_of(b))
+            }
             Layout::Source => Some(self.victory_of(build)).filter(|p| p.is_file()),
         }
     }
@@ -129,6 +136,21 @@ mod tests {
         assert_eq!(home.builds(), ["release"]);
         assert!(home.victory("").is_some());
         assert!(home.victory("diag").is_none());
+
+        // With none chosen: the newest optimised build, not the first in the list; debug only alone.
+        let exe = |b: &str| source.join("target").join(b).join("victory.exe");
+        let make = |b: &str| {
+            std::fs::create_dir_all(exe(b).parent().unwrap()).unwrap();
+            std::fs::write(exe(b), b"").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        };
+        let _ = std::fs::remove_dir_all(source.join("target"));
+        make("debug");
+        assert_eq!(home.victory("").unwrap(), exe("debug"));
+        make("diag");
+        make("release");
+        make("debug");
+        assert_eq!(home.victory("").unwrap(), exe("release"), "an older diag and a newer debug lose to release");
 
         assert!(Home::at(&scratch("empty")).is_none());
     }
