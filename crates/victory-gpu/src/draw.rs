@@ -1445,6 +1445,10 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // Whether the node tests find structures (`crate::pipeline::structures_empty`).
+        if kind == victory_shader::emit::USER_BVH_EMPTY {
+            return u32::from(crate::pipeline::structures_empty());
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3186,6 +3190,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::runreport::hint(victory_pipeline::report::LeftOut::BuilderOff);
             crate::runreport::left_out(self.pipeline);
+            crate::pipeline::builder_left_out();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3220,6 +3225,9 @@ impl State {
                 crate::pipeline::builder_rests("one of its dispatches could not be bound");
             }
             return;
+        }
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_ran();
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -4421,7 +4429,12 @@ impl State {
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             crate::runreport::hint(victory_pipeline::report::LeftOut::BuilderOff);
+            crate::pipeline::builder_left_out();
             return false;
+        }
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            // (The builder is on: its structures are being built.)
+            crate::pipeline::builder_ran();
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;

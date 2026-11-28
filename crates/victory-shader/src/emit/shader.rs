@@ -100,6 +100,16 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes: not 0
+/// when no ray-tracing structure the program could walk has been built
+/// (the structure builder is left out and has not run). Asked for by every
+/// program with a ray-tracing node test (`image_bvh*_intersect_ray`), which
+/// then reads no node and returns what an empty node gives
+/// ([`crate::bvh::empty`]): a box node no child, a triangle a miss. So each
+/// walk ends at its first node and the ray misses, instead of following
+/// whatever lies in the structures' memory. 0 (and a host that does not set
+/// it): the nodes are tested.
+pub const USER_BVH_EMPTY: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

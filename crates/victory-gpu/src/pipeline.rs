@@ -292,6 +292,46 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// A dispatch of a builder pipeline was left out with the builder off
+/// ([`builder_left_out`]).
+#[cfg(windows)]
+static BUILDER_LEFT_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A dispatch of a builder pipeline was recorded to run ([`builder_ran`]).
+#[cfg(windows)]
+static BUILDER_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A dispatch of a builder pipeline is left out because the builder is off.
+#[cfg(windows)]
+pub(crate) fn builder_left_out() {
+    BUILDER_LEFT_OUT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A dispatch of a builder pipeline is recorded to run.
+#[cfg(windows)]
+pub(crate) fn builder_ran() {
+    BUILDER_RAN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether every ray-tracing node test returns an empty node's result
+/// (`VICTORY_BVH_EMPTY`, on unless `0`; `0`: the nodes are tested, as
+/// before): while a builder dispatch that writes the structures' nodes has
+/// been left out and none has run, no structure was built. (A builder
+/// dispatch is one of the pipelines [`Builder`] names.) Static ones stay
+/// packed as streamed in (the builder unpacks them in place), dynamic ones
+/// are never written: the programs that walk them read packed bytes, zeros
+/// or other data as nodes (hits at random distances, pointers anywhere).
+/// The test then reads no node (`victory_shader::emit::USER_BVH_EMPTY`):
+/// each ray misses at its first node and the title's own handling of a miss
+/// applies. Before any builder dispatch (a title without that builder) and
+/// once one has run, the nodes are tested. Read at every bind, not part of
+/// the translation: `VICTORY_AB` (diagnostics builds) can turn it on and
+/// off within a run.
+#[cfg(windows)]
+pub(crate) fn structures_empty() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    BUILDER_LEFT_OUT.load(Relaxed) && !BUILDER_RAN.load(Relaxed) && crate::toggled!("VICTORY_BVH_EMPTY")
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory,
 /// isolating guest memory from misplaced builder stores during debugging while

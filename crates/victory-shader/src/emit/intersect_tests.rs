@@ -502,7 +502,28 @@ impl Drop for Memory {
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
+    run_as(wide, descriptor, pointers, sort, false);
+}
+
+/// [`run`], with the host saying no structure has been built
+/// (`USER_BVH_EMPTY`) when `empty`: then every thread that runs the
+/// instruction must get [`bvh::empty`] of its node's kind, and the others
+/// keep their registers.
+fn run_as(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, empty: bool) {
     let (shader, res) = build(wide, descriptor).expect("the program lowers");
+    // The root constants: the program's user data, the host's word among
+    // them.
+    let mut constants = vec![0u32; shader.user_data_dwords() as usize];
+    let word = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_BVH_EMPTY))
+        .expect("a node test asks the host whether there are structures");
+    constants[word.index as usize] = u32::from(empty);
+    let wanted = |scene: &Scene, case: &Case| match case {
+        Some((_, kind, _)) if empty => bvh::empty(*kind),
+        _ => expected(scene, case, sort),
+    };
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
     // The reference must see a bit of everything, or the comparison
@@ -559,7 +580,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        roots: vec![(0, Root::Constants(constants.clone()))],
                         views: &[
                             View::Buffer {
                                 data: &data,
@@ -575,7 +596,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => wanted(&scene, c),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -643,6 +664,25 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
     run(false, descriptor, 0, true);
 }
 
+/// While the host says no structure has been built, every node test on the
+/// card returns an empty node's result, whatever lies in the nodes' memory
+/// (here: the scene's real nodes, which the same program finds with the word
+/// at 0 above), and the threads that do not run the instruction keep their
+/// registers.
+#[test]
+fn with_no_structure_built_every_node_test_on_the_card_is_an_empty_nodes() {
+    run_as(true, Descriptor::Table, u64::from(NODES), true, true);
+    run_as(false, Descriptor::Table, u64::from(NODES), true, true);
+    let memory = Memory::at(BASE);
+    run_as(true, WHOLE, BASE + u64::from(NODES), true, true);
+    drop(memory);
+    let base = 0x312_3456_7800u64;
+    let structure = base + u64::from(NODES);
+    let _memory = Memory::at(base);
+    let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32);
+    run_as(false, descriptor, 0, false, true);
+}
+
 #[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
@@ -669,6 +709,8 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        // And it asks whether there are structures at all.
+        assert!(shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_BVH_EMPTY)));
     }
 }
 

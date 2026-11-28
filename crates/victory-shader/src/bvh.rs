@@ -131,6 +131,20 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
     }
 }
 
+/// What the instruction returns, whatever the ray, for a node of an empty
+/// structure named by a pointer of this `kind`: a box node with no child
+/// (four [`NONE`]), a triangle that is missed ([`MISS`]; kinds 6 and 7 as
+/// [`intersect`] has them). The translation returns it, without reading the
+/// node, while the host says no structure has been built
+/// (`emit::USER_BVH_EMPTY`): a walk then finds nothing to go on to after its
+/// first node, and the ray misses.
+pub fn empty(kind: u32) -> [u32; 4] {
+    match kind & 7 {
+        4 | 5 => [NONE; 4],
+        _ => MISS.map(f32::to_bits),
+    }
+}
+
 /// A box node's four child pointers.
 pub fn children(words: &[u32; 28]) -> [u32; 4] {
     [words[0], words[1], words[2], words[3]]
@@ -670,6 +684,50 @@ pub(crate) mod tests {
         for k in [6, 7] {
             assert_eq!(intersect(&node, k, &ray, true), MISS.map(f32::to_bits));
         }
+    }
+
+    /// What [`empty`] gives is what the test gives for the nodes of a real
+    /// empty structure, for every ray: a box node whose children are all
+    /// "none", a triangle node of zeros (memory nothing was built in), a
+    /// triangle with no area. So a title's walk of it ends as it would on an
+    /// empty structure built by its own builder.
+    #[test]
+    fn an_empty_structure_gives_what_empty_says_for_every_ray() {
+        let mut g = 0x1234_5678u32;
+        let mut unit = || {
+            g = g.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (g >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let none = box32([NONE; 4], [UNIT, moved(UNIT, [3.0, 0.0, 0.0]), UNIT, UNIT]);
+        let none16 = box16([NONE; 4], [UNIT; 4]);
+        let zeros = [0u32; 28];
+        let flat = triangles(&[[0.0, 0.0, 5.0], [1.0, 1.0, 5.0], [2.0, 2.0, 5.0]], 9);
+        let mut rays: Vec<Ray> = (0..200)
+            .map(|_| {
+                let o = [unit() * 8.0, unit() * 8.0, unit() * 8.0];
+                Ray::new(o, [unit(), unit(), unit()], 100.0)
+            })
+            .collect();
+        // Rays from the origin and along an axis: a box of zeros is a point
+        // there.
+        rays.push(Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0));
+        rays.push(Ray::new([0.0; 3], [0.0; 3], 100.0));
+        for ray in &rays {
+            for sort in [true, false] {
+                assert_eq!(intersect(&none, 5, ray, sort), empty(5));
+                assert_eq!(intersect(&none16, 4, ray, sort), empty(4));
+                for k in 0..4 {
+                    assert_eq!(intersect(&zeros, k, ray, sort), empty(k), "{ray:?}");
+                }
+                assert_eq!(intersect(&flat, 0, &Ray::new([1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 9.0), sort), empty(0));
+                for k in [6, 7] {
+                    assert_eq!(intersect(&zeros, k, ray, sort), empty(k));
+                }
+            }
+        }
+        // A node pointer's kind is its low three bits.
+        assert_eq!(empty(8 | 5), [NONE; 4]);
+        assert_eq!(empty(8 | 2), MISS.map(f32::to_bits));
     }
 
     #[test]

@@ -58,6 +58,7 @@ hardware ray-intersection intrinsics directly in DXIL.
 | Variable | Effect |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | Enable translated BVH builder and ray-traversal passes |
+| `VICTORY_BVH_EMPTY=0` | Test nodes even while no structure was built (on by default: see below) |
 | `VICTORY_BVH_FENCES=0` | Disable fences around builder buffer atomics |
 | `VICTORY_BVH_SIZES_WAIT=1` | Synchronize size-query submissions |
 | `VICTORY_BVH_BOUNDS=0` | Disable builder memory bounds clamping |
@@ -76,6 +77,34 @@ hardware ray-intersection intrinsics directly in DXIL.
   are dropped safely instead of faulting the GPU.
 - **Unresolved indirect-descriptor trace variants:** A small subset of shaders
   indexing BVH addresses indirectly from descriptor tables are currently skipped.
+
+## With the builder off: every structure is empty
+
+A builder dispatch that is left out writes nothing. Nothing clears the
+memory it would have written, either. Static structures stay packed, as the
+title streamed them in, and dynamic ones are never written. So their memory
+holds the packed bytes, zeros, or whatever the title had there before. The
+traversal programs still run, and they read that memory as nodes:
+
+- **Zeros:** a triangle node of zeros has no area, so it is a miss. A box
+  node of zeros has child pointer 0 (not "none") and a point box at the
+  origin, so a ray through the origin enters all four children at distance 0.
+- **Packed bytes or other data:** the boxes and triangles are made of random
+  floats. A ray hits at random distances with valid barycentrics (the test
+  itself makes no NaN). Child pointers lead anywhere in memory, so the faults
+  bring in pages all over it. Then the program reads the hit's instance and
+  primitive IDs, and with them its material, out of that same memory.
+
+With `VICTORY_BVH_EMPTY` on (the default), once a builder dispatch has been
+left out and no builder dispatch has run, the host sets
+the user-data word `USER_BVH_EMPTY` for every program with a node test. The
+translated test then reads no node and returns what a node of an empty
+structure gives (`bvh::empty`): no child for a box node, a miss for a
+triangle. Each walk ends at its first node, every ray misses, and the title's
+own handling of a miss applies (sky, probes). The word is read at every bind,
+so it is not part of the translation, and `VICTORY_AB` can turn it on and off
+during one run in diagnostics builds. Before any builder dispatch, and once
+one has run, the nodes are tested as before.
 
 ## Without rays: screen-space ambient estimate (`crates/victory-gpu/src/ambient.rs`)
 

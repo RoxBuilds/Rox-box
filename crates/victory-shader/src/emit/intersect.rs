@@ -27,6 +27,8 @@
 
 use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
+use crate::emit::shader::USER_BVH_EMPTY;
+use crate::native::RootType;
 use crate::resource::BvhNodes;
 
 #[cfg(test)]
@@ -117,6 +119,9 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        // Not 0 while no structure has been built (`shader.rs`
+        // `USER_BVH_EMPTY`): no node is read, the result is an empty node's.
+        let empty = self.host_word(RootType::Other(USER_BVH_EMPTY), 0, 0);
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -135,6 +140,14 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // The lanes that test their node: those that run the instruction,
+        // while there are structures.
+        let zero = self.s.m.i32(0);
+        let built = self.s.m.cmp(c, pred::EQ, empty, zero);
+        let tested = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, built),
+            None => built,
+        };
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -164,7 +177,8 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                // (Pages only the lanes that test their node fault in.)
+                let (handle, byte, mapped) = self.bvh_memory(low, high, Some(tested));
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -174,14 +188,25 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
-        let head = self.cur;
+        let before = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
-        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
-        let pair = self.s.m.bin(head, Bin::And, pointer, k6);
-        let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
-        let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        let kind = self.s.m.bin(before, Bin::And, pointer, k7);
+        let pair = self.s.m.bin(before, Bin::And, pointer, k6);
+        let is_box = self.s.m.cmp(before, pred::EQ, pair, k4);
+        let is_triangle = self.s.m.cmp(before, pred::IULT, kind, k4);
+        // What a lane that does not test its node returns: an empty node's
+        // ([`bvh::empty`]). (A lane that does not run the instruction keeps
+        // its registers: `write` under the guard.)
+        let none = self.s.m.i32(bvh::NONE);
+        let untested: Vec<V> = bvh::MISS
+            .iter()
+            .map(|f| {
+                let miss = self.s.m.i32(f.to_bits());
+                self.s.m.select(before, is_box, none, miss)
+            })
+            .collect();
+        let gate = self.begin_guarded(Some(tested));
+        let head = self.cur;
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -214,7 +239,7 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            results.push((phi, untested[k]));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
