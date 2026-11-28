@@ -178,7 +178,7 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (6; 5 had no figures of compute pipelines in `[gpu_time]` and no `asked_to_leave_out`; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (7; 6 left the card's memory in use and the host lists' driver objects out of `[memory.map]`'s `accounted_total_mib`, so its `unaccounted_mib` held them, and had no `card_in_use_mib`, `host_lists_driver_estimate_mib`, `card_texture_blocks_free_mib`, `host_lists_idle`, `card_relief_looks` or `card_relief_freed_mib`; 5 had no figures of compute pipelines in `[gpu_time]` and no `asked_to_leave_out`; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
 | `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
@@ -377,8 +377,10 @@ counted and empty is `0`. Nothing here is a name, an address or a path.
 | Key | From | Exact? |
 |---|---|---|
 | `process_private_commit_mib` | The process's private commit now (`PagefileUsage`) | Exact |
-| `accounted_total_mib` | The sum of the private categories below that are known | Sum of the figures; each shown rounded to a MiB, so the shown parts may differ from it by a MiB or two |
-| `unaccounted_mib` | `process_private_commit_mib` less `accounted_total_mib` (0 if the categories add up to more): what the map does not explain, such as the driver's memory, the title's own heaps (its `HeapAlloc`s and stacks, apart from the pages it committed) and allocations we do not count | The difference |
+| `accounted_total_mib` | The sum of the private categories and the charged ones below that are known (format 7; a 6 added the private ones alone) | Sum of the figures; each shown rounded to a MiB, so the shown parts may differ from it by a MiB or two |
+| `unaccounted_mib` | `process_private_commit_mib` less `accounted_total_mib` (0 if the categories add up to more): what the map does not explain, such as the driver's other objects, the title's own heaps (its `HeapAlloc`s and stacks, apart from the pages it committed) and allocations we do not count | The difference |
+| `card_in_use_mib` | Charged: the card's own memory in use by the process, as the system counts it (`QueryVideoMemoryInfo`, local group, the budget governor's last look; left out while the card gives no budget). Every allocation in the card's memory is charged 1:1 to the process's private commit (measured on one PC and driver: a 512 MiB buffer there added 516 MiB of private usage, a 256 MiB texture 256 MiB), so it is in the total; the `card_*` keys beside are a breakdown of it, never added. Past the budget the system moves the overflow into the PC's memory, which is where free memory goes | Exact as the system counts it |
+| `host_lists_driver_estimate_mib` | Charged: `host_lists_alive` times 0.8 MiB, what one host list (its command allocators and lists) measured to cost of the private commit whatever it recorded | Estimate |
 | `title_committed_mib` | Host pages the title committed through its `VirtualAlloc`s, each counted once, less what it freed (the figure the title is told it uses). Left out with `VICTORY_TITLE_USED=counter` or `=process` | Exact |
 | `title_default_blocks_mib` | Blocks the title took from the default heap | Exact |
 | `title_buffer_copies_mib` | Host copies of title buffers: bytes of copies alive less the windows' lengths, and the bytes of the blocks copies of views' own bytes are cut from that no copy holds (`[memory.view_copies]`) | Estimate (a copy only a list still holds, whose window is gone from the table, counts here) |
@@ -396,14 +398,19 @@ counted and empty is `0`. Nothing here is a name, an address or a path.
 | `card_texture_tiles_mib`, `card_sparse_tiles_mib` | Tiles given to textures, and to sparse windows of title memory | Exact |
 | `card_buffer_copies_mib` | Card sides of host copies of title buffers | Exact |
 | `descriptor_heaps_mib` | Shader-visible descriptor heaps the host holds (driver memory; not in the total) | Exact heap sizes |
-| `host_lists_alive` | A count: host lists alive. Their allocators are not measured (no byte figure exists) and land in `unaccounted_mib` | Exact count |
+| `card_texture_blocks_free_mib` | What the blocks of textures (`VICTORY_TEXTURE_POOL`) hold that no texture uses: the card's memory they keep (in `card_in_use_mib`), which new textures take first. Much of it with the card past its budget is memory the blocks do not give back until a whole block is empty | Exact; left out while the pool's lock is held when the report is written |
+| `host_lists_alive` | A count: host lists alive (their driver objects: `host_lists_driver_estimate_mib`) | Exact count |
+| `host_lists_idle` | A count: of those, the ones kept idle for the next recordings and in the reserve kept back for want of memory (`VICTORY_IDLE_BY_FRAME`: as many as a frame asked for lately, on a PC of 24 GiB or less) | Exact count; left out while the pool's lock is held |
 
 The card's own use is also in `[memory]` (`vram_peak`, from the system's own
-counters); the `card_*` keys say what of it is ours, by kind. Not counted, so
-in `unaccounted_mib`: the driver's command memory and objects, command list
-allocators, the title's non-committed heaps, the pipeline and shader objects
-the host made (only the bytes above are counted) and the tables of descriptors
-on the CPU side.
+counters); the `card_*` keys say what of it is ours, by kind, and what is left
+of `card_in_use_mib` after them is the card's memory we do not name (blocks of
+textures free, objects let go that wait for the submissions that may still
+use them, the driver's own). Not counted, so in `unaccounted_mib`: the
+driver's other objects, the title's non-committed heaps, the pipeline and
+shader objects the host made (only the bytes above are counted) and the
+tables of descriptors on the CPU side. With `VICTORY_SEND_BAR=1`
+`send_spare_mib` lies in the card's memory and is counted twice.
 
 ### Reading the spared work
 
@@ -440,6 +447,7 @@ the frame line's own lines. Every key is 0 while its switch is off.
 | `lowest_free_ram_mib`, `lowest_commit_headroom_mib` | The budget governor's asks of the system (at most every 32 ms; absent with `VICTORY_BUDGET=0`) | Low is the warning here: under about 1,500 the PC pages and the governor and commit guard hold work back |
 | `governor_green_s`, `_yellow_s`, `_red_s` | The governor's looks (about once a second): the time from each look to the next is the level it found | Time at red is time memory ran out: uploads held back, idle memory let go, textures shown late |
 | `vram_over_budget`, `vram_over_budget_looks` | Looks that found the card's own memory in use past its budget | The driver moves memory out of the card: stutter, and textures and buffers read from the PC's memory |
+| `card_relief_looks`, `card_relief_freed_mib` | Looks of the governor that relieved the card (`VICTORY_CARD_RELIEF`): from 95 % of its budget in use until it is back under 90 %, empty blocks of textures go at once, idle cells of sparse windows at the next submission, idle host copies of textures in the sweeps (the largest first, by the system's own count of the card), and new copies are made of at most 256 texels a side. `_freed_mib` is what went at once (the blocks); the sweeps' share shows as `card_in_use_mib` falling | Many looks with `vram_over_budget_looks` close to them: the relief does not bring the card back under its line, and something it does not let go of grows (see the `card_*` keys of `[memory.map]`) |
 | `commit_critical_times` | The commit guard ("commit is critical, holding back uploads"): times commit headroom fell under 1,536 MiB | Commit ran short again and again |
 | `commit_uploads_held_back` | Stagings for uploads the guard held back ("a staging buffer was held back") | Textures were uploaded later than asked for |
 | `commit_allocations_refused` | Allocations refused with `E_OUTOFMEMORY` the guard saw | Memory ran out outright |
@@ -494,7 +502,7 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 6
+format = 7
 kind = "run"
 
 [rox_box]
@@ -838,6 +846,10 @@ governor_yellow_s = 18.50
 governor_red_s = 2.90
 vram_over_budget = true
 vram_over_budget_looks = 3
+# looks that found the card past the line of its relief (95 % of its budget, until it is back under 90 %),
+# and what they let go of at once (empty blocks of textures; the rest goes in the sweeps after them)
+card_relief_looks = 0
+card_relief_freed_mib = 0
 # the commit guard: times commit went critical, stagings it held back, refusals it saw
 commit_critical_times = 1
 commit_uploads_held_back = 14
@@ -866,8 +878,9 @@ ownerless_entries_dropped = 52000
 
 [memory.map]
 # MiB, sampled when the report is written; a category left out is one nothing counted (not known)
-# private: what the process holds in its own private memory; accounted_total is their sum,
-# unaccounted the process's private commit less it (the driver, the title's own heaps, what is not counted)
+# private: what the process holds in its own private memory; charged: what the driver charges to it
+# (the card's memory in use, the host lists' objects); accounted_total is the sum of both,
+# unaccounted the process's private commit less it (the title's own heaps, other driver objects, what is not counted)
 process_private_commit_mib = 9000
 accounted_total_mib = 6200
 unaccounted_mib = 2800
@@ -876,6 +889,7 @@ title_committed_mib = 4000
 windows_of_title_memory_mib = 1500
 list_scratch_mib = 700
 send_spare_mib = 0
+# charged to the private commit, in the total (the host lists' figure is an estimate: lists alive times a measured cost)
 # beside it (card memory, mapped sections, descriptor heaps): not in the total
 card_textures_filled_mib = 3000
 # counts

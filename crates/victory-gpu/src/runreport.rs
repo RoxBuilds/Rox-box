@@ -453,6 +453,9 @@ pub fn sample() {
     if limit > 0 {
         report::set(Stat::ViewHeapViews, u64::from(limit) + 1);
     }
+    let [looks, freed] = crate::host::budget::relief_counts();
+    report::set(Stat::CardReliefLooks, looks);
+    report::set(Stat::CardReliefFreed, freed);
     let [critical, held, refused] = crate::host::commit::counts();
     report::set(Stat::CommitCritical, critical);
     report::set(Stat::CommitHeldBack, held);
@@ -516,6 +519,12 @@ pub fn sample() {
 // written. Each is a relaxed load; the few that are behind a lock are taken
 // without waiting for it (the last figure stands if it is held).
 
+/// What one host list (its command allocators and lists) costs of the
+/// private commit in the driver, whatever it records: about 0.8 MiB, measured
+/// on one PC and driver by making lists and reading the process's private
+/// usage before and after. An estimate for `[memory.map]`, labelled so there.
+const HOST_LIST_DRIVER_BYTES: u64 = 800 << 10;
+
 /// Gives the report the bytes this crate holds, by category, and the
 /// process's private commit.
 fn memory_map() {
@@ -529,7 +538,27 @@ fn memory_map() {
     set(Part::CardSparseTiles, sparse);
     set(Part::ListScratch, crate::host::ALIVE[2].load(Relaxed));
     set(Part::ListUploads, crate::host::ALIVE[7].load(Relaxed));
-    set(Part::HostListsAlive, crate::host::ALIVE[0].load(Relaxed));
+    let lists = crate::host::ALIVE[0].load(Relaxed);
+    set(Part::HostListsAlive, lists);
+    if let Some(idle) = crate::list::report_idle() {
+        set(Part::HostListsIdle, idle);
+    }
+    // What the driver charges to the private commit for us. Every allocation
+    // in the card's own memory is charged to it 1:1 (measured), so the card's
+    // use as the governor last saw it belongs in the total; and each host
+    // list's allocators and lists cost about the same whatever they record,
+    // so the lists alive times that cost is an estimate of theirs. Without
+    // them, two thirds of a run's private commit stood as "unaccounted".
+    let card = crate::host::budget::sample().card;
+    if card[0] > 0 {
+        set(Part::CardInUse, card[1]);
+    }
+    set(Part::HostListsDriver, lists.saturating_mul(HOST_LIST_DRIVER_BYTES));
+    if crate::pool::on()
+        && let Some(free) = crate::pool::report_texture_room()
+    {
+        set(Part::CardTextureBlocksFree, free);
+    }
     // The pool's blocks hold the staging made from them (and what is free
     // in them); without the pool each staging buffer is its own.
     let staging = if crate::pool::on() {

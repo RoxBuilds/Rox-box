@@ -275,6 +275,16 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// The last pass found no room for a wanted tile.
 static STARVED: AtomicBool = AtomicBool::new(false);
 
+/// The card is being relieved (`crate::host::budget`, once a second): the
+/// next trim of idle cells takes those idle for half a second, as when a
+/// wanted tile found no room, and the tile heaps that leaves empty go back.
+static HURRY: AtomicBool = AtomicBool::new(false);
+
+/// [`HURRY`].
+pub(super) fn hurry() {
+    HURRY.store(true, Ordering::Release);
+}
+
 /// Until when ([`crate::host::now_ms`]) no cell is made: the last one found
 /// no room.
 static NO_ROOM_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -607,12 +617,12 @@ pub(super) fn make(map: &mut std::collections::BTreeMap<(u64, u64), Arc<Shadow>>
     let rig = rig()?;
     // Room: under the tiles' budget (less what is left to the cells there,
     // `cell_fits`), and the card itself under the line a card copy is made up
-    // to (`card_room_for`), with a heap more on it.
+    // to (`card_room_for`), with a heap more on it, as the budget governor
+    // places what may go either way (by the line alone: a window instead of
+    // the cell costs the PC no less, so a relief of the card is no reason).
     let given = POOL.lock().unwrap_or_else(|e| e.into_inner()).given_bytes();
     let full = !cell_fits(given, rig.budget, fallback());
-    let card_full = crate::host::host()
-        .and_then(|h| h.video_memory())
-        .is_some_and(|[budget, used, ..]| used + (16 << 20) > budget / 100 * 97);
+    let card_full = !crate::host::budget::card_has_room(crate::host::host().and_then(|h| h.video_memory()), 16 << 20, 97);
     if full || card_full {
         NO_ROOM_UNTIL.store(now + 1000, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -692,8 +702,10 @@ pub(super) fn before(queue: &ID3D12CommandQueue) {
     let starved = STARVED.swap(false, Ordering::AcqRel);
     if now >= turn[0] + 250 {
         turn[0] = now;
-        // With no room for a wanted tile: sooner.
-        evict(queue, rig, if starved { idle_ms().min(500) } else { idle_ms() });
+        // With no room for a wanted tile, or the card being relieved
+        // ([`hurry`]): sooner.
+        let hurried = HURRY.swap(false, Ordering::AcqRel);
+        evict(queue, rig, if starved || hurried { idle_ms().min(500) } else { idle_ms() });
     }
     if PENDING.swap(false, Ordering::AcqRel) || starved {
         give(queue, rig);

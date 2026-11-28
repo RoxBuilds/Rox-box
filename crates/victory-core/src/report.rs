@@ -52,8 +52,14 @@ use std::time::{Duration, Instant};
 /// categories. 5 added `[gpu_time]` and `[gpu_time.steady]`: the card's time
 /// by kind of work, its volumes, and the memory the budget governor saw. 6
 /// added to `[gpu_time]` the figures of the title's compute pipelines that
-/// name none of them, and `asked_to_leave_out` to `[gpu_work.left_out]`.
-pub const FORMAT: u32 = 6;
+/// name none of them, and `asked_to_leave_out` to `[gpu_work.left_out]`. 7
+/// counts in `[memory.map]`'s `accounted_total_mib` what the driver charges
+/// to the private commit (`card_in_use_mib`, `host_lists_driver_estimate_mib`),
+/// so `unaccounted_mib` is smaller than a 6's for the same run; it adds
+/// `card_texture_blocks_free_mib` beside, the count `host_lists_idle`, and
+/// `card_relief_looks` and
+/// `card_relief_freed_mib` to `[memory.pressure]`.
+pub const FORMAT: u32 = 7;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -390,9 +396,14 @@ pub enum Stat {
     /// freed for their cap since the start (`VICTORY_OWNERLESS_VIEWS`).
     OwnerlessViewsKept,
     OwnerlessViewsDropped,
+    /// Looks of the budget governor that found the card's own memory past
+    /// the line of its relief and let go of what it holds idle
+    /// (`VICTORY_CARD_RELIEF`), and the bytes those looks let go of at once.
+    CardReliefLooks,
+    CardReliefFreed,
 }
 
-const STATS: usize = Stat::OwnerlessViewsDropped as usize + 1;
+const STATS: usize = Stat::CardReliefFreed as usize + 1;
 static STAT: [AtomicU64; STATS] = [const { AtomicU64::new(0) }; STATS];
 
 /// One more of `stat`.
@@ -2202,17 +2213,28 @@ fn prune(dir: &Path, kind: Kind, keep: usize) {
 // their counters (`map_set`, before each report is written); nothing is fed
 // from a frame's path for it. A category nobody has given is not known, and
 // is left out of the section (a category known to be empty is 0). The ones
-// of kind `Private` are what the process holds in its own private memory:
-// their sum is `accounted_total`, and the process's private commit less that
-// sum is `unaccounted` (the driver, the title's own heaps, what we do not
-// count). The others are memory the card or a mapped section holds, and
-// counts: listed beside, never summed.
+// of kind `Private` are what the process holds in its own private memory,
+// and those of kind `Charged` what the driver charges to that private commit
+// for us (the card's memory in use, and the host lists' objects): their sum
+// is `accounted_total`, and the process's private commit less that sum is
+// `unaccounted` (the title's own heaps, the driver's other objects, what we
+// do not count). The others are memory the card or a mapped section holds,
+// and counts: listed beside, never summed.
 
 /// What a [`Part`] is, for the sum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartKind {
     /// Bytes held in the process's private memory: added to the total.
     Private,
+    /// Bytes the driver charges to the process's private commit although
+    /// they are not memory of ours the CPU sees: every allocation in the
+    /// card's own memory is charged 1:1 to the private commit (measured on
+    /// one PC: a 512 MiB buffer there added 516 MiB, a 256 MiB texture 256
+    /// MiB), and each host list's allocators and lists cost about the same
+    /// whatever they record. Added to the total, so that `unaccounted` is
+    /// what is genuinely not known. The `card_*` parts beside are a breakdown
+    /// of the card's part, never added.
+    Charged,
     /// Bytes held beside it (the card's memory, mapped sections, the
     /// driver's heaps): listed, not added.
     Beside,
@@ -2269,12 +2291,27 @@ pub enum Part {
     CardSparseTiles,
     /// Shader-visible descriptor heaps the host made.
     DescriptorHeaps,
-    /// Host lists alive (a count; their allocators are not measured).
+    /// Host lists alive (a count; their driver objects are estimated in
+    /// [`Part::HostListsDriver`]).
     HostListsAlive,
+    /// The card's own memory in use by the process, as the system counts it
+    /// (`QueryVideoMemoryInfo`'s local group, the budget governor's last
+    /// look): charged to the private commit, in the total.
+    CardInUse,
+    /// The host lists' command allocators and lists in the driver: an
+    /// estimate, the lists alive times what one measured to cost. In the
+    /// total.
+    HostListsDriver,
+    /// What the blocks of textures hold free (the card's memory they keep,
+    /// which no texture uses), on the card: part of [`Part::CardInUse`].
+    CardTextureBlocksFree,
+    /// Of the host lists alive, those kept idle for the next recordings (and
+    /// in the reserve kept back for want of memory): a count.
+    HostListsIdle,
 }
 
 impl Part {
-    pub const ALL: [Part; 21] = [
+    pub const ALL: [Part; 25] = [
         Part::TitleCommitted,
         Part::TitleDefaultBlocks,
         Part::TitleBufferCopies,
@@ -2296,6 +2333,10 @@ impl Part {
         Part::CardSparseTiles,
         Part::DescriptorHeaps,
         Part::HostListsAlive,
+        Part::CardInUse,
+        Part::HostListsDriver,
+        Part::CardTextureBlocksFree,
+        Part::HostListsIdle,
     ];
 
     /// The key the report writes it under (MiB for bytes, else a count).
@@ -2322,6 +2363,10 @@ impl Part {
             Part::CardSparseTiles => "card_sparse_tiles_mib",
             Part::DescriptorHeaps => "descriptor_heaps_mib",
             Part::HostListsAlive => "host_lists_alive",
+            Part::CardInUse => "card_in_use_mib",
+            Part::HostListsDriver => "host_lists_driver_estimate_mib",
+            Part::CardTextureBlocksFree => "card_texture_blocks_free_mib",
+            Part::HostListsIdle => "host_lists_idle",
         }
     }
 
@@ -2340,7 +2385,8 @@ impl Part {
             | Part::ShaderContainers
             | Part::ShaderTranslations
             | Part::PipelineLibrary => PartKind::Private,
-            Part::HostListsAlive => PartKind::Count,
+            Part::CardInUse | Part::HostListsDriver => PartKind::Charged,
+            Part::HostListsAlive | Part::HostListsIdle => PartKind::Count,
             _ => PartKind::Beside,
         }
     }
@@ -2398,11 +2444,12 @@ impl Default for MapSnapshot {
 }
 
 impl MapSnapshot {
-    /// The bytes of the parts that are private and known, added.
+    /// The bytes of the parts that are private or charged to the private
+    /// commit, and known, added.
     fn accounted(&self) -> u64 {
         Part::ALL
             .iter()
-            .filter(|p| p.kind() == PartKind::Private && self.now[**p as usize] != NOT_KNOWN)
+            .filter(|p| matches!(p.kind(), PartKind::Private | PartKind::Charged) && self.now[**p as usize] != NOT_KNOWN)
             .map(|p| self.now[*p as usize])
             .fold(0, u64::saturating_add)
     }
@@ -2441,8 +2488,9 @@ fn memory_map(d: &mut Doc, m: &MapSnapshot) {
     };
     d.table("memory.map");
     d.comment("MiB, sampled when the report is written; a category left out is one nothing counted (not known)");
-    d.comment("private: what the process holds in its own private memory; accounted_total is their sum,");
-    d.comment("unaccounted the process's private commit less it (the driver, the title's own heaps, what is not counted)");
+    d.comment("private: what the process holds in its own private memory; charged: what the driver charges to it");
+    d.comment("(the card's memory in use, the host lists' objects); accounted_total is the sum of both,");
+    d.comment("unaccounted the process's private commit less it (the title's own heaps, other driver objects, what is not counted)");
     if m.commit != NOT_KNOWN {
         d.int("process_private_commit_mib", mib(m.commit));
     }
@@ -2450,9 +2498,12 @@ fn memory_map(d: &mut Doc, m: &MapSnapshot) {
     if let Some(u) = m.unaccounted() {
         d.int("unaccounted_mib", mib(u));
     }
-    for kind in [PartKind::Private, PartKind::Beside, PartKind::Count] {
+    for kind in [PartKind::Private, PartKind::Charged, PartKind::Beside, PartKind::Count] {
         d.comment(match kind {
             PartKind::Private => "private memory, in the total",
+            PartKind::Charged => {
+                "charged to the private commit, in the total (the host lists' figure is an estimate: lists alive times a measured cost)"
+            }
             PartKind::Beside => "beside it (card memory, mapped sections, descriptor heaps): not in the total",
             PartKind::Count => "counts",
         });
@@ -3162,6 +3213,10 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     let over = s.stat(Stat::CardOverBudgetLooks);
     d.boolean("vram_over_budget", over > 0);
     d.int("vram_over_budget_looks", over);
+    d.comment("looks that found the card past the line of its relief (95 % of its budget, until it is back under 90 %),");
+    d.comment("and what they let go of at once (empty blocks of textures; the rest goes in the sweeps after them)");
+    d.int("card_relief_looks", s.stat(Stat::CardReliefLooks));
+    d.int("card_relief_freed_mib", mib(s.stat(Stat::CardReliefFreed)));
     d.comment("the commit guard: times commit went critical, stagings it held back, refusals it saw");
     d.int("commit_critical_times", s.stat(Stat::CommitCritical));
     d.int("commit_uploads_held_back", s.stat(Stat::CommitHeldBack));
@@ -3428,7 +3483,7 @@ mod tests {
         let now = table["map"].as_table().expect("a table");
         let parts: i64 = Part::ALL
             .iter()
-            .filter(|p| p.kind() == PartKind::Private)
+            .filter(|p| matches!(p.kind(), PartKind::Private | PartKind::Charged))
             .filter_map(|p| now.get(p.key()).and_then(toml::Value::as_integer))
             .sum();
         assert_eq!(now["accounted_total_mib"].as_integer(), Some(parts));
@@ -3447,6 +3502,30 @@ mod tests {
         let table = rendered_map(&none);
         assert!(!table["map"].as_table().expect("a table").contains_key("unaccounted_mib"));
         assert!(!table["map"].as_table().expect("a table").contains_key("process_private_commit_mib"));
+    }
+
+    /// What the driver charges to the private commit (the card's memory in
+    /// use, the host lists' objects) is in the total, so what is left
+    /// unaccounted shrinks by it; the card's breakdown beside it is not
+    /// added again.
+    #[test]
+    fn what_the_driver_charges_is_in_the_total() {
+        let mut m = synthetic_map();
+        m.now[Part::CardInUse as usize] = 1_500 * MIB;
+        m.now[Part::HostListsDriver as usize] = 512 * MIB;
+        m.now[Part::CardTextureBlocksFree as usize] = 300 * MIB;
+        assert_eq!(m.accounted(), (6_200 + 1_500 + 512) * MIB);
+        assert_eq!(m.unaccounted(), Some((2_800 - 1_500 - 512) * MIB));
+        let table = rendered_map(&m);
+        let now = table["map"].as_table().expect("a table");
+        assert_eq!(now["card_in_use_mib"].as_integer(), Some(1_500));
+        assert_eq!(now["host_lists_driver_estimate_mib"].as_integer(), Some(512));
+        assert_eq!(now["card_texture_blocks_free_mib"].as_integer(), Some(300));
+        assert_eq!(now["accounted_total_mib"].as_integer(), Some(8_212));
+        assert_eq!(now["unaccounted_mib"].as_integer(), Some(788));
+        assert_eq!(Part::CardInUse.kind(), PartKind::Charged);
+        assert_eq!(Part::HostListsDriver.kind(), PartKind::Charged);
+        assert_eq!(Part::CardTextureBlocksFree.kind(), PartKind::Beside);
     }
 
     #[test]

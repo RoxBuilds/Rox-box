@@ -18,7 +18,9 @@
 //! - [`level`]: green, yellow or red, from the sample ([`level_of`]).
 //! - [`place`]: where an allocation of some bytes should go: the card's own
 //!   memory while it has room, else the PC's while that has, else nowhere
-//!   ([`place_in`]). Nothing asks it yet; other code is to adopt it.
+//!   ([`place_in`]). The allocations that may lie in either memory ask it
+//!   through [`card_has_room`]: card copies of title buffers and cells of
+//!   sparse windows (their alternative is the PC's memory).
 //! - [`relieve`]: after a refusal, what is idle goes, in order, until the
 //!   bytes asked for are let go: the lists' spare scratch above its floor,
 //!   the spare memory of sends, empty blocks of texture staging, windows of
@@ -28,14 +30,17 @@
 //!   the first four are the PC's memory, the last the card's.
 //! - [`look`], once a second: with the PC's memory at red, its idle memory
 //!   goes without waiting for a refusal ([`tend_need`],
-//!   `VICTORY_RELIEF_AT_RED`).
+//!   `VICTORY_RELIEF_AT_RED`); with the card's past 95 % of its budget, the
+//!   card's, until it is back under 90 % ([`relief_next`],
+//!   `VICTORY_CARD_RELIEF`): the system never refuses the card's memory, it
+//!   moves what is past the budget into the PC's.
 //!
 //! `VICTORY_BUDGET=0`: none of it, as before: the commit guard asks the system
 //! itself, [`relieve`] is the emergency trim (`super::emergency_trim`), and
 //! [`place`] allows everything.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 const MIB: u64 = 1 << 20;
 /// The most often the system is asked (ms).
@@ -288,13 +293,123 @@ fn tend_need(s: &Sample, lines: &Lines) -> u64 {
     ram.max(commit).max(shared).max(64 * MIB)
 }
 
+/// Of the card's own budget, the use at which [`look`] begins to relieve the
+/// card, and the use under which it stops (percent; [`relief_next`]).
+const RELIEF_ON_PCT: u64 = 95;
+const RELIEF_OFF_PCT: u64 = 90;
+
+/// Whether the governor relieves the card's own memory at its looks while
+/// that memory is past 95 % of its budget, until it is back under 90 %
+/// (`VICTORY_CARD_RELIEF`, on unless `0`: only after a refusal, as before;
+/// [`card_relieving`] says where else it acts).
+///
+/// The system never refuses an allocation in the card's memory for want of
+/// room: past the budget it moves what does not fit into the PC's memory, so
+/// [`relieve`] never ran for the card. On an 8 GB card in a 16 GB PC the card
+/// stood past its budget at most looks of an open area (8.2 GB in use of a
+/// budget of 6.9), what was moved filled the PC's free memory to nothing, and
+/// making new memory resident waited 62 s of a 700 s run.
+fn card_relief_on() -> bool {
+    crate::toggled!("VICTORY_CARD_RELIEF")
+}
+
+/// Whether the card is being relieved now ([`relief_next`]): the texture
+/// sweep then goes by the system's own count of the card (not less what our
+/// blocks of textures have free), the largest idle copies first, and new
+/// copies are made of fewer levels (`crate::resource`). Never with the
+/// governor off.
+pub(crate) fn card_relieving() -> bool {
+    CARD_RELIEF.load(Ordering::Relaxed)
+}
+
+/// The card is being relieved ([`card_relieving`]).
+static CARD_RELIEF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the card is to be relieved after a look at its memory `card`
+/// (budget and use) when it `was` being relieved, and the bytes to let go of:
+/// from a use at or past [`RELIEF_ON_PCT`] of the budget on, until it is
+/// back under [`RELIEF_OFF_PCT`] (the gap keeps it from going on and off at
+/// each look), what brings it down to that line. Unknown (a budget of 0):
+/// never.
+fn relief_next(was: bool, card: [u64; 2]) -> (bool, u64) {
+    let [budget, used] = card;
+    let on = if was { past(card, RELIEF_OFF_PCT) } else { past(card, RELIEF_ON_PCT) };
+    let line = (u128::from(budget) * u128::from(RELIEF_OFF_PCT) / 100) as u64;
+    (on, if on { used.saturating_sub(line).max(1) } else { 0 })
+}
+
+/// Whether an allocation of `bytes` that may lie in either memory (one the
+/// caller makes in the PC's memory otherwise) goes to the card's own memory,
+/// by `memory` (the host's `video_memory`, asked now: a burst of them comes
+/// faster than the governor's sample) and the line `pct` of the card's budget
+/// the caller holds it under: [`place_in`] with that line. With nothing known,
+/// the card.
+///
+/// Not refused for a relief of the card ([`card_relieving`]), which begins
+/// past 95 %: the callers' lines (97 %) already keep these from taking the
+/// card past its budget, and their other memory costs as much: a card copy
+/// of a title buffer turned down stays in the PC's memory for as long as the
+/// title keeps the buffer, and the CPU then looks for shader writes in it
+/// (frames half as long again when a scene's copies were turned down); a
+/// cell of sparse windows turned down is a window of the PC's memory.
+pub(crate) fn card_has_room(memory: Option<[u64; 4]>, bytes: u64, pct: u64) -> bool {
+    let Some([budget, used, shared_budget, shared_used]) = memory else {
+        return true;
+    };
+    let s = Sample { card: [budget, used], shared: [shared_budget, shared_used], ram: u64::MAX, commit: u64::MAX };
+    // (Only whether it goes to the card is asked: the PC's lines play no part.)
+    takes_in(&s, bytes, &Lines { card_pct: pct, shared_pct: 100, free_ram: 0 })
+}
+
+/// [`card_has_room`] for sample `s` and `lines`.
+fn takes_in(s: &Sample, bytes: u64, lines: &Lines) -> bool {
+    place_in(s, bytes, Kind::Either, lines) == Place::Card
+}
+
+/// Looks that relieved the card, and the bytes they let go of at once.
+static RELIEVED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the run report: [`RELIEVED`].
+pub(crate) fn relief_counts() -> [u64; 2] {
+    RELIEVED.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
+/// The card is past its relief's line by `need` bytes: what it holds idle
+/// goes. Empty blocks of textures at once (past the spare ones too); cells
+/// of sparse windows idle for half a second at the next submission, with the
+/// heaps their tiles leave empty; idle host copies of textures in the sweeps
+/// that follow (`crate::resource::let_go_idle`, which goes by
+/// [`card_relieving`]). Those let go at once, in bytes.
+fn card_tend(need: u64) -> u64 {
+    let mut blocks = crate::pool::relieve_textures;
+    let mut cells = |_: u64| {
+        crate::shadow::hurry_sparse();
+        0
+    };
+    let done = relieve_with(
+        need,
+        &mut [("empty blocks of textures", &mut blocks), ("cells of sparse windows idle for half a second", &mut cells)],
+    );
+    tell(&done, &CARD_TENDED, || {
+        format!(
+            "the card's memory is past {RELIEF_ON_PCT} % of its budget ({} MB over {RELIEF_OFF_PCT} %; idle textures go in the \
+             sweeps, new ones are made of fewer levels; VICTORY_CARD_RELIEF=0: only after a refusal)",
+            need / MIB
+        )
+    })
+}
+
+/// Reliefs of the card that let go of something at once (for the log).
+static CARD_TENDED: AtomicU64 = AtomicU64::new(0);
+
 /// The level the last [`look`] found, and how many times it changed.
 static LOOKED: AtomicU8 = AtomicU8::new(0);
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 
 /// Once a second (the sweep): with the PC's memory at red, lets go of its
-/// idle memory ([`at_red`]); says when the level changed, the first 8 times
-/// and then at powers of two.
+/// idle memory ([`at_red`]); with the card's past its relief's line, of the
+/// card's ([`card_relief_on`]); says when the level changed, the first 8
+/// times and then at powers of two.
 pub(crate) fn look() {
     if !on() {
         return;
@@ -303,6 +418,24 @@ pub(crate) fn look() {
     let need = if at_red() { tend_need(&s, &lines()) } else { 0 };
     if need > 0 {
         tend(need);
+    }
+    if card_relief_on() {
+        let was = CARD_RELIEF.load(Ordering::Relaxed);
+        let (now, need) = relief_next(was, s.card);
+        CARD_RELIEF.store(now, Ordering::Relaxed);
+        if now != was {
+            tracing::info!(
+                card_mb = s.card[1] / MIB,
+                card_budget_mb = s.card[0] / MIB,
+                "the card's memory is {} (VICTORY_CARD_RELIEF)",
+                if now { "relieved from now on" } else { "back under its line: no longer relieved" }
+            );
+        }
+        if need > 0 {
+            let freed = card_tend(need);
+            RELIEVED[0].fetch_add(1, Ordering::Relaxed);
+            RELIEVED[1].fetch_add(freed, Ordering::Relaxed);
+        }
     }
     let now = level_of(&s, &lines());
     crate::runreport::governor_look(&s, now);
@@ -358,9 +491,8 @@ pub(crate) enum Place {
 /// budget (under all of it for [`Kind::Card`]); else to the PC's while the
 /// shared use with them stays under [`Lines::shared_pct`] of its budget and
 /// they leave [`Lines::free_ram`] free; else nowhere. What is not known (a
-/// budget of 0, free memory `u64::MAX`) holds nothing back. (Nothing asks
-/// it yet: other code is to adopt it.)
-#[allow(dead_code)]
+/// budget of 0, free memory `u64::MAX`) holds nothing back. ([`card_takes`]
+/// asks it for allocations that may go either way.)
 pub(crate) fn place_in(s: &Sample, bytes: u64, kind: Kind, lines: &Lines) -> Place {
     let fits = |[budget, used]: [u64; 2], pct: u64| {
         budget == 0 || (u128::from(used) + u128::from(bytes)) * 100 < u128::from(budget) * u128::from(pct)
@@ -704,6 +836,65 @@ mod tests {
             assert_eq!(tend_need(&at(card, shared, ram, commit), &l), bytes, "row {i}");
         }
         assert_eq!(tend_need(&Sample::UNKNOWN, &l), 0);
+    }
+
+    /// The card is relieved from 95 % of its budget on and until it is back
+    /// under 90 %, by what brings it to 90 %; on cards of 8, 12, 16 and 24 GB
+    /// alike (the lines are shares of the budget the system gives), and never
+    /// when the budget is not known.
+    #[test]
+    fn the_card_is_relieved_from_95_until_under_90_percent() {
+        for budget in [6935 * MIB, 7168 * MIB, 11 * GIB, 15 * GIB, 23 * GIB] {
+            let at = |pct: u64| budget / 100 * pct;
+            let line = budget * 90 / 100;
+            // (was relieved, use, relieved now)
+            let table = [
+                (false, at(50), false),
+                (false, at(94), false),
+                (false, at(95) + MIB, true),
+                (false, at(118), true),
+                (true, at(94), true),
+                (true, at(91), true),
+                (true, line - 1, false),
+                (true, at(50), false),
+            ];
+            for (i, &(was, used, now)) in table.iter().enumerate() {
+                let (on, need) = relief_next(was, [budget, used]);
+                assert_eq!(on, now, "budget {} MB row {i}", budget / MIB);
+                if on {
+                    assert_eq!(need, used - line, "budget {} MB row {i}", budget / MIB);
+                } else {
+                    assert_eq!(need, 0);
+                }
+            }
+        }
+        // The run that showed it: 8,183 MB in use of a budget of 6,935.
+        let (on, need) = relief_next(false, [6935 * MIB, 8183 * MIB]);
+        assert!(on);
+        assert_eq!(need / MIB, 8183 - 6935 * 90 / 100 - 1);
+        assert_eq!(relief_next(false, [0, 8 * GIB]), (false, 0));
+        assert_eq!(relief_next(true, [0, 8 * GIB]), (false, 0));
+    }
+
+    /// An allocation that may lie in either memory goes to the card under the
+    /// caller's line, whatever the PC's memory, and always when nothing is
+    /// known.
+    #[test]
+    fn either_way_allocations_go_to_the_card_while_it_has_room() {
+        let l = Lines { card_pct: 97, shared_pct: 100, free_ram: 0 };
+        let s = |used: u64| at(used, 7 * GIB, 100 * MIB, 8 * GIB);
+        let line = 7168 * MIB / 100 * 97;
+        assert!(takes_in(&s(GIB), 64 * MIB, &l));
+        assert!(takes_in(&s(line - 64 * MIB - 1), 64 * MIB, &l));
+        assert!(!takes_in(&s(line), 64 * MIB, &l));
+        assert!(!takes_in(&s(8 * GIB), 4 * MIB, &l));
+        // The line of 80 hundredths, with copies' room not kept.
+        let low = Lines { card_pct: 80, ..l };
+        assert!(!takes_in(&s(7168 * MIB / 100 * 80), 4 * MIB, &low));
+        assert!(takes_in(&Sample::UNKNOWN, 1 << 40, &l));
+        assert!(card_has_room(None, 1 << 40, 97));
+        assert!(card_has_room(Some([7168 * MIB, GIB, 7 * GIB, GIB]), 64 * MIB, 97));
+        assert!(!card_has_room(Some([7168 * MIB, 7 * GIB, 7 * GIB, GIB]), 64 * MIB, 97));
     }
 
     /// The words of a sample are the sample.

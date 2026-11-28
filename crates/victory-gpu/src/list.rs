@@ -540,7 +540,7 @@ fn reset_landed(
 /// less, as before. What the list's allocators keep is not counted there.
 #[cfg(windows)]
 fn give_back(host: crate::host::HostList, binds: u32) -> Option<crate::host::HostList> {
-    let keep = idle_keep();
+    let keep = keep_now();
     let bytes = host.scratch_kept();
     let back = IDLE.lock().unwrap_or_else(|e| e.into_inner()).give(Idle(host), binds, bytes, keep);
     if back.is_some() {
@@ -714,6 +714,98 @@ fn idle_keep() -> Keep {
         let (lists, bytes) = idle_most();
         Keep { lists, bytes, small: small_binds(), big: idle_big(), reserve: reserve_most() }
     })
+}
+
+/// What [`IDLE`] keeps now: [`idle_keep`], with as many lists as a frame
+/// asks for lately ([`by_frame`], [`lists_by_frame`]).
+#[cfg(windows)]
+fn keep_now() -> Keep {
+    let keep = idle_keep();
+    if !by_frame() {
+        return keep;
+    }
+    let most = DEMAND.lock().unwrap_or_else(|e| e.into_inner()).most();
+    Keep { lists: lists_by_frame(most, keep.lists), ..keep }
+}
+
+/// Whether the idle host lists are as many as a frame asks for lately
+/// instead of [`idle_most`]'s number, on a PC of 24 GiB or less
+/// (`VICTORY_IDLE_BY_FRAME`, on unless `0`: that number always, as before).
+///
+/// Every host list costs about 0.8 MiB of the process's private commit in the
+/// driver, whatever it records (measured: its allocators and lists), so the
+/// 384 small and 96 big idle lists such a PC keeps are some 380 MB. On a 16
+/// GB PC whose free memory was gone for most of a run, 955 host lists were
+/// alive. A frame's lists come back to the idle ones before the next frame's
+/// resets take them again, so what one frame asks for is what needs keeping.
+#[cfg(windows)]
+fn by_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let small = crate::host::total_physical_ram().is_some_and(|bytes| bytes <= 24 << 30);
+        small && crate::toggled!("VICTORY_IDLE_BY_FRAME")
+    })
+}
+
+/// The host lists asked for in the frames lately ([`by_frame`]).
+#[cfg(windows)]
+static DEMAND: std::sync::Mutex<Demand> = std::sync::Mutex::new(Demand::new());
+
+/// Frames a span of [`Demand`] lasts, and the spans it remembers: the most
+/// lists asked for in one frame over the last thousand frames or so (half a
+/// minute at 30 a second), so that a scene that asks for more now and then
+/// keeps lists for it.
+const SPAN_FRAMES: u64 = 256;
+const SPANS: usize = 4;
+
+/// Host lists asked for by frame: in the frame now, and the most in one frame
+/// of each of the last [`SPANS`] spans of [`SPAN_FRAMES`] frames.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Demand {
+    frame: u64,
+    now: u32,
+    spans: [u32; SPANS],
+    span_from: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Demand {
+    const fn new() -> Demand {
+        Demand { frame: 0, now: 0, spans: [0; SPANS], span_from: 0 }
+    }
+
+    /// A host list was asked for in `frame`.
+    fn ask(&mut self, frame: u64) {
+        if frame != self.frame {
+            self.spans[0] = self.spans[0].max(self.now);
+            self.now = 0;
+            self.frame = frame;
+            // (A frame number that went back starts a span too.)
+            if frame >= self.span_from.saturating_add(SPAN_FRAMES) || frame < self.span_from {
+                self.spans.rotate_right(1);
+                self.spans[0] = 0;
+                self.span_from = frame;
+            }
+        }
+        self.now = self.now.saturating_add(1);
+    }
+
+    /// The most asked for in one frame lately, this one included.
+    fn most(&self) -> u32 {
+        self.spans.iter().copied().fold(self.now, u32::max)
+    }
+}
+
+/// The idle lists kept for frames that asked for at most `most` lists, of at
+/// most `fixed` ([`idle_most`]): a quarter more than that and 32 (frames
+/// land several at a time), at least 64 (a frame of a loading screen asks
+/// for few).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lists_by_frame(most: u32, fixed: usize) -> usize {
+    const LEAST: usize = 64;
+    let most = most as usize;
+    (most + most / 4 + 32).clamp(LEAST.min(fixed), fixed)
 }
 
 /// How many host lists are kept back for want of memory
@@ -965,6 +1057,19 @@ fn idle_most_for(small: bool, set: Option<usize>) -> (usize, u64) {
     (set.unwrap_or(lists), bytes)
 }
 
+/// For the run report: host lists kept idle now ([`IDLE`]) and those kept
+/// back in the reserve; `None` while the pool's lock is held (nothing is
+/// waited for: the report may be written from any thread).
+#[cfg(windows)]
+pub(crate) fn report_idle() -> Option<u64> {
+    let idle = match IDLE.try_lock() {
+        Ok(idle) => idle,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some((idle.len() + idle.reserve.len()) as u64)
+}
+
 /// Host lists kept idle now ([`IDLE`]), for the memory line.
 #[cfg(windows)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -1012,6 +1117,9 @@ fn pools() -> bool {
 /// is for, if known ([`Classes::take`]).
 #[cfg(windows)]
 fn fresh_list(binds: Option<u32>, made_for: For) -> Option<crate::host::HostList> {
+    if by_frame() {
+        DEMAND.lock().unwrap_or_else(|e| e.into_inner()).ask(crate::frame::current());
+    }
     let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).take(binds, idle_keep());
     ahead::wake();
     match idle {
@@ -1037,7 +1145,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    let keep = idle_keep();
+    let keep = keep_now();
     for (i, Detached { host, _uploads, _state, .. }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         let binds = _state.binds();
@@ -3457,6 +3565,52 @@ mod tests {
 
     #[cfg(windows)]
     const KEEP: Keep = Keep { lists: 8, bytes: 1000, small: 256, big: 512, reserve: 0 };
+
+    /// The lists asked for are counted by frame; the most of one frame is
+    /// remembered for four spans of 256 frames, and forgotten after.
+    #[test]
+    fn the_lists_a_frame_asks_for_are_remembered_a_while() {
+        let mut d = Demand::new();
+        assert_eq!(d.most(), 0);
+        for frame in 1..=10u64 {
+            for _ in 0..(if frame == 3 { 300 } else { 120 }) {
+                d.ask(frame);
+            }
+        }
+        // Frame 3's 300, while frame 10's 120 are still being asked for.
+        assert_eq!(d.most(), 300);
+        // A frame that asks for more counts as it goes.
+        for _ in 0..350 {
+            d.ask(11);
+        }
+        assert_eq!(d.most(), 350);
+        // Frames of 100 for four spans more: the 350 is forgotten.
+        for frame in 12..12 + SPAN_FRAMES * SPANS as u64 + 1 {
+            for _ in 0..100 {
+                d.ask(frame);
+            }
+        }
+        assert_eq!(d.most(), 100);
+        // A frame number that went back (a new count) starts a span.
+        for _ in 0..40 {
+            d.ask(2);
+        }
+        assert_eq!(d.most(), 100);
+    }
+
+    /// The idle lists kept are a quarter more than a frame asked for and 32,
+    /// at least 64, at most the fixed number.
+    #[test]
+    fn idle_lists_are_kept_for_a_frame() {
+        assert_eq!(lists_by_frame(0, 384), 64);
+        assert_eq!(lists_by_frame(24, 384), 64);
+        assert_eq!(lists_by_frame(200, 384), 282);
+        assert_eq!(lists_by_frame(300, 384), 384);
+        assert_eq!(lists_by_frame(5000, 384), 384);
+        // A fixed number under the least (`VICTORY_IDLE_LISTS`) stands.
+        assert_eq!(lists_by_frame(0, 16), 16);
+        assert_eq!(lists_by_frame(u32::MAX, 512), 512);
+    }
 
     /// Small recordings' lists are kept up to the number of lists, bigger
     /// ones up to a quarter of it, and none past the big line or the bytes.

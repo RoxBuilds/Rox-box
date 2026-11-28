@@ -2011,15 +2011,39 @@ pub(crate) fn detail_side(memory: Option<[u64; 4]>) -> u64 {
     detail_side_why(memory).0
 }
 
-/// [`detail_side`] and why it is bounded ([`detail_side_as`]).
+/// [`detail_side`] and why it is bounded ([`detail_side_as`]), at most
+/// [`RELIEF_SIDE`] while the budget governor relieves the card
+/// ([`relief_side`]).
 #[cfg(windows)]
 pub(crate) fn detail_side_why(memory: Option<[u64; 4]>) -> (u64, Why) {
+    let relieving = crate::host::budget::card_relieving();
     let detail = detail();
     if detail == Detail::Off {
-        return (u64::MAX, Why::None);
+        return relief_side((u64::MAX, Why::None), relieving);
     }
     let pc_short = detail == Detail::CardAndPc && crate::host::commit::critical();
-    detail_side_as(detail, card_fill(memory), room_percent(), card_headroom(), pc_short, card_short_on())
+    relief_side(
+        detail_side_as(detail, card_fill(memory), room_percent(), card_headroom(), pc_short, card_short_on()),
+        relieving,
+    )
+}
+
+/// The most texels a side of a new host copy's first level while the budget
+/// governor relieves the card (`crate::host::budget::card_relieving`: the
+/// card's use past 95 % of its budget, until it is back under 90 %), on any
+/// card: a sixteenth of the bytes of a copy of 1024 texels a side. The band
+/// below the lines ([`detail_side_as`]) goes by the queue's own measures of
+/// the card, which counted it under its line with the system's count at 118
+/// % of the budget; while the card is relieved the system's count is the
+/// one that holds.
+#[cfg(any(windows, test))]
+const RELIEF_SIDE: u64 = 256;
+
+/// `side` (and why it is bounded) as the card's relief has it: at most
+/// [`RELIEF_SIDE`] while `relieving`, for the card's own count ([`Why::Whole`]).
+#[cfg(any(windows, test))]
+fn relief_side(side: (u64, Why), relieving: bool) -> (u64, Why) {
+    if relieving && side.0 > RELIEF_SIDE { (RELIEF_SIDE, Why::Whole) } else { side }
 }
 
 /// The share of the card's budget, in hundredths, kept free under what
@@ -3398,17 +3422,43 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    // While the budget governor relieves the card, the system's own count:
+    // what our blocks hold free is the card's memory too, and copies let go
+    // into a block free none of it until the whole block is empty. Measured
+    // less that room, the sweep found the card under its line after a look
+    // that let gigabytes of copies go into the blocks, and kept the rest for
+    // ten minutes, while the system counted the card past its budget (118 %
+    // of it at the worst in one run).
+    let relieving = crate::host::budget::card_relieving();
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
             let kept = if let_go_kept_room() { crate::shadow::card_room_kept() + targets_room_kept() } else { 0 };
-            crate::host::vram_keep(budget, let_go_use(used, crate::pool::texture_room(), kept))
+            let free_blocks = if relieving { 0 } else { crate::pool::texture_room() };
+            crate::host::vram_keep(budget, let_go_use(used, free_blocks, kept))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     match let_go_slice_ms() {
         0 => let_go_whole(idle_ms, most),
         // (Copies slots hold are cut down by this way only.)
-        ms => let_go_sliced(idle_ms, most, ms, if most == u64::MAX { u64::MAX } else { cut_side(memory) }),
+        ms => let_go_sliced(idle_ms, most, ms, if most == u64::MAX { u64::MAX } else { cut_side(memory) }, relieving),
+    }
+}
+
+/// The order [`let_go_sliced`] lets idle copies go in: `idle` holds, for
+/// each, when it was last used, its bytes and where it is. The longest idle
+/// first; while the card is relieved (`largest_first`), the largest first
+/// and the longest idle among the same size. A large copy is an allocation
+/// of its own, given back to the card the moment it goes; a small one lies in
+/// a block of textures, which frees nothing until all of it is let go. And a
+/// few large copies bring the card under its line with fewer uploads again
+/// than many small ones.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn idle_order(idle: &mut [(u64, u64, usize)], largest_first: bool) {
+    if largest_first {
+        idle.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)).then(a.2.cmp(&b.2)));
+    } else {
+        idle.sort_unstable();
     }
 }
 
@@ -3540,9 +3590,10 @@ fn walk_from(
 /// memory that the title fills their residency hints on the way
 /// (`crate::host::residency`). Short of `most` then, it cuts idle copies
 /// that slots hold down to `cut_side` texels a side ([`cut_idle`];
-/// `u64::MAX`: none), the longest idle first.
+/// `u64::MAX`: none), the longest idle first. While the card is relieved
+/// (`relieving`), the largest go first ([`idle_order`]).
 #[cfg(windows)]
-fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
+fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relieving: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3550,7 +3601,8 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
     let budget = std::time::Duration::from_millis(slice_ms);
     let hints = crate::host::Host::residency_hints();
     let now = crate::host::moment();
-    let mut idle: Vec<(u64, usize)> = Vec::new();
+    let largest_first = relieving && most != u64::MAX;
+    let mut idle: Vec<(u64, u64, usize)> = Vec::new();
     // Textures whose residency class is to change, and how long they were idle.
     let mut moving: Vec<(usize, u64)> = Vec::new();
     let mut hinted: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u8)> = Vec::new();
@@ -3577,17 +3629,20 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64) {
                     }
                 }
                 if crate::host::long_ago(used, idle_ms, IDLE_FRAMES) && !crate::texture::host_wrote(at) {
-                    idle.push((used & 0xffff_ffff, at));
+                    // (Its size in title memory stands for its copy's: only
+                    // the order goes by it, and only while relieved.)
+                    let bytes = if largest_first { footprint(&r.desc).map_or(0, |f| f.size) } else { 0 };
+                    idle.push((used & 0xffff_ffff, bytes, at));
                 }
             },
         );
         FROM.store(next, Relaxed);
-        // With a limit, the longest idle first.
+        // With a limit, the longest idle first (relieved: the largest).
         if most != u64::MAX {
-            idle.sort_unstable();
+            idle_order(&mut idle, largest_first);
         }
         let mut held = Vec::new();
-        for (_, at) in idle {
+        for (_, _, at) in idle {
             if bytes >= most {
                 break;
             }
@@ -5097,6 +5152,46 @@ mod tests {
     use crate::object::slot;
 
     const MIB: u64 = 1 << 20;
+
+    /// While the card is relieved, the sweep's measure is the system's own
+    /// count: a card at 118 % of its budget with a gigabyte free in our blocks
+    /// stood under 88 % less that room (copies kept for ten minutes), and is
+    /// past 95 % by the count (copies idle for 1.5 s go, down to 85 %).
+    #[cfg(windows)]
+    #[test]
+    fn a_relieved_card_is_swept_by_the_systems_count() {
+        let budget = 6935 * MIB;
+        let (used, free_blocks) = (8183 * MIB, 2300 * MIB);
+        assert_eq!(crate::host::vram_keep(budget, let_go_use(used, free_blocks, 0)), (600_000, u64::MAX));
+        let relieved = crate::host::vram_keep(budget, let_go_use(used, 0, 0));
+        assert_eq!(relieved, (1_500, used - budget / 100 * 85));
+    }
+
+    /// The idle copies go the longest idle first; while the card is relieved
+    /// the largest first, the longest idle among the same size.
+    #[test]
+    fn a_relieved_card_lets_its_largest_idle_copies_go_first() {
+        // (last used, bytes, where)
+        let found = [(30, 4 * MIB, 1), (10, 64 * MIB, 2), (20, 64 * MIB, 3), (5, MIB, 4), (40, 256 * MIB, 5)];
+        let mut by_age = found;
+        idle_order(&mut by_age, false);
+        assert_eq!(by_age.map(|i| i.2), [4, 2, 3, 1, 5]);
+        let mut by_size = found;
+        idle_order(&mut by_size, true);
+        assert_eq!(by_size.map(|i| i.2), [5, 2, 3, 1, 4]);
+    }
+
+    /// New copies have at most 256 texels a side while the card is relieved,
+    /// whatever the band says (also on a card the band is off for), and the
+    /// band's own bound when it is smaller or the card is not relieved.
+    #[test]
+    fn a_relieved_card_makes_new_copies_of_fewer_levels() {
+        assert_eq!(relief_side((u64::MAX, Why::None), true), (RELIEF_SIDE, Why::Whole));
+        assert_eq!(relief_side((1024, Why::Queue), true), (RELIEF_SIDE, Why::Whole));
+        assert_eq!(relief_side((128, Why::Queue), true), (128, Why::Queue));
+        assert_eq!(relief_side((u64::MAX, Why::None), false), (u64::MAX, Why::None));
+        assert_eq!(relief_side((1024, Why::Queue), false), (1024, Why::Queue));
+    }
 
     /// The sweep lets host copies of textures go for the card's own shortage:
     /// with two thirds of its budget in use the card kept nearly 2 GB for

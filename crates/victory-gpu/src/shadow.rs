@@ -666,9 +666,12 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
+    // As the budget governor places what may go either way, under that line
+    // (`host::budget::card_has_room`).
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+    let memory = host.video_memory();
+    if let Some([budget, used, ..]) = memory
+        && !crate::host::budget::card_has_room(memory, size, hundredths)
     {
         // Said, with the numbers it was decided by (no line named the
         // copies that were not made). The first 64, then every 32nd.
@@ -3498,6 +3501,12 @@ pub(crate) fn window_use() -> [u64; 8] {
     }
     out[7] = window();
     out
+}
+
+/// The card is being relieved (`crate::host::budget`): cells of sparse
+/// windows idle for half a second lose their tiles at the next submission.
+pub(crate) fn hurry_sparse() {
+    sparse::hurry();
 }
 
 /// For the run report, in bytes: host copies of title buffers (the bytes
@@ -6782,7 +6791,7 @@ fn loose_try(
             // before, of just the range (`sparse_fallback`).
             if !unsized_ask
                 && !shadow.sparse_fits(address, Some(end))
-                && let Some(window) = sparse_fallback(address, end)
+                && let Some(window) = sparse_fallback(address, end, any)
             {
                 note(&window);
                 return Some(window);
@@ -7067,25 +7076,65 @@ fn exact_cut(address: u64, end: u64) -> (u64, u64) {
     (start, (end - start).next_multiple_of(EXACT_PIECE))
 }
 
+/// Whether an ask that may take any window ([`find_any`]: a draw's vertex and
+/// index ranges, indirect arguments) takes a window of the PC's memory there
+/// already that holds its range when its sparse cell has no room
+/// ([`sparse_fallback`]), and makes one of just its range only if none does
+/// (`VICTORY_FALLBACK_SHARE`, on unless `0`: one of just its range, the one
+/// of the same range or a new one, as before).
+///
+/// Each such window was named by its own range, cut to 64 KiB: every
+/// distinct range a draw bound in a cell without room was a window of its
+/// own, copied whole, over the same title memory as its neighbours. In an
+/// open area of one run, with the card past its budget so that no cell
+/// found room, the windows went from 1,247 to 8,430 and held 2.4 to 3 GB of
+/// the PC's memory, a third of a megabyte each.
+fn fallback_share() -> bool {
+    crate::toggled!("VICTORY_FALLBACK_SHARE")
+}
+
+/// Of the windows `map` holds in the cell `cell` up to `address`, one that is
+/// not sparse and holds `[address, end)` ([`holder`]: the largest, the lowest
+/// of those).
+fn fallback_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, cell: u64, address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let entries = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, s)| (*key, s.sparse.is_some()));
+    shared_key(entries, address, end).and_then(|key| map.get(&key)).cloned()
+}
+
+/// Of `entries` (a window's key and whether it is sparse), the key of the
+/// window [`fallback_holder`] takes: not sparse, holding `[address, end)`.
+fn shared_key(entries: impl Iterator<Item = ((u64, u64), bool)>, address: u64, end: u64) -> Option<(u64, u64)> {
+    holder(entries.filter(|&(_, sparse)| !sparse).map(|(key, _)| key), address, end)
+}
+
 /// For a sized ask in a sparse cell whose pool has no room for the ask's
 /// tiles (`sparse::fallback`): the window as before of just the range, from
 /// the 64 KiB line below it to the 64 KiB line above it ([`exact_cut`]), the
-/// one there or a new one. `None` (the ask takes the cell after all) where
-/// that is the whole cell, whose key is the cell's, or a sparse window holds
-/// the key, or there is no host buffer for it.
-fn sparse_fallback(address: u64, end: u64) -> Option<Arc<Shadow>> {
+/// one there or a new one; for an ask that may take `any` window, one there
+/// that holds the range first ([`fallback_share`]). `None` (the ask takes the
+/// cell after all) where that is the whole cell, whose key is the cell's, or
+/// a sparse window holds the key, or there is no host buffer for it.
+fn sparse_fallback(address: u64, end: u64, any: bool) -> Option<Arc<Shadow>> {
     let (start, len) = exact_cut(address, end);
     if len >= WINDOW {
         return None;
     }
-    let there =
-        |map: &BTreeMap<(u64, u64), Arc<Shadow>>| map.get(&(start, len)).filter(|s| s.sparse.is_none()).cloned();
+    let share = any && fallback_share();
+    let (cell, _) = window_of(address, end, WINDOW);
+    let there = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
+        let shared = if share { fallback_holder(map, cell, address, end) } else { None };
+        shared.or_else(|| map.get(&(start, len)).filter(|s| s.sparse.is_none()).cloned())
+    };
     if let Some(shadow) = there(&LOOSE.read().unwrap_or_else(|e| e.into_inner())) {
         return Some(shadow);
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    // (Made meanwhile by another ask; or a sparse window holds the key.)
+    if let Some(shadow) = there(&map) {
+        return Some(shadow);
+    }
     if map.contains_key(&(start, len)) {
-        return there(&map);
+        return None;
     }
     let made = make_window(&mut map, start, len)?;
     drop(map);
@@ -7931,8 +7980,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        EXACT_PIECE, LOOSE, WINDOW, cover, default_card_limits_mb, default_window_kb, exact_cut, grid, grid_of, holder,
-        let_go_short, longest_tail, resolve_card_limits, tail_of, window_of,
+        EXACT_PIECE, LOOSE, WINDOW, cover, default_card_limits_mb, default_window_kb, exact_cut, fallback_share, grid,
+        grid_of, holder, let_go_short, longest_tail, resolve_card_limits, shared_key, tail_of, window_of,
     };
 
     #[test]
@@ -8014,6 +8063,32 @@ mod window_tests {
         let windows = [(0u64, 4 << 20), (0x40_0000, 1 << 20), (0x40_0000, 4 << 20)];
         assert_eq!(holder(windows.into_iter(), 0x40_1000, 0x40_2000), Some((0x40_0000, 4 << 20)));
         assert_eq!(holder(windows.into_iter(), 0x3f_f000, 0x40_1000), None);
+    }
+
+    /// In a sparse cell without room, an ask that may take any window takes
+    /// a window there that holds its range, never the sparse cell itself;
+    /// ranges of draws over the same memory share one instead of each being
+    /// a window of its own; and one that none holds makes its own.
+    #[test]
+    fn fallback_windows_are_shared_by_the_ranges_they_hold() {
+        let cell = 0x4000_0000u64;
+        // The cell itself (sparse), and the windows of earlier asks.
+        let entries = [
+            ((cell, WINDOW), true),
+            ((cell + 0x1_0000, 0x3_0000), false),
+            ((cell + 0x1_0000, 0x1_0000), false),
+            ((cell + 0x8_0000, 0x1_0000), false),
+        ];
+        // Inside the larger of the first two: it, not a new window.
+        assert_eq!(shared_key(entries.into_iter(), cell + 0x1_8000, cell + 0x2_0000), Some((cell + 0x1_0000, 0x3_0000)));
+        assert_eq!(shared_key(entries.into_iter(), cell + 0x1_0000, cell + 0x1_0100), Some((cell + 0x1_0000, 0x3_0000)));
+        // Reaching past every window: none (the sparse cell holds it, but is
+        // what has no room).
+        assert_eq!(shared_key(entries.into_iter(), cell + 0x3_f000, cell + 0x4_1000), None);
+        assert_eq!(shared_key(entries.into_iter(), cell + 0x8_8000, cell + 0x9_8000), None);
+        assert_eq!(shared_key(entries.into_iter(), cell + 0x8_8000, cell + 0x8_9000), Some((cell + 0x8_0000, 0x1_0000)));
+        // (On by default.)
+        assert!(fallback_share());
     }
 
     /// An emergency let-go with the table held by the caller does nothing

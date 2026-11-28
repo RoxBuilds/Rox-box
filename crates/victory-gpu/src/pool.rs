@@ -556,6 +556,12 @@ pub(crate) fn report_staging_bytes() -> Option<u64> {
     try_lock(&STAGING).map(|pool| pool.blocks() as u64 * pool.block)
 }
 
+/// For the run report: [`texture_room`], `None` while the pool's lock is
+/// held (nothing is waited for: the report may be written from any thread).
+pub(crate) fn report_texture_room() -> Option<u64> {
+    try_lock(&TEXTURES).map(|pool| (pool.blocks() as u64 * pool.block).saturating_sub(HELD.load(Ordering::Relaxed)))
+}
+
 /// A mapped upload buffer's memory.
 #[derive(Clone)]
 struct Upload(ID3D12Resource, *mut u8);
