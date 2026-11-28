@@ -113,7 +113,12 @@ it may be attached to an issue as it is
    workers (`pipeline/make.rs`), the container is translated by
    `shader_cache::host_shader` and `victory_shader::emit::translate`, and the
    stores must land in title memory (`land.rs`), checked word by word, twice
-   (other constants the second time). Last, a list copies a title buffer into
+   (other constants the second time). The card's time of those dispatches must
+   have been measured by the split of the card's time by kind
+   (`host/gpu_split.rs`, the run report's `[gpu_time]`): more than none, in
+   runs counted; where the driver refuses timestamp queries on the queue, or
+   with `VICTORY_GPU_SPLIT=0`, the stage says so and checks nothing of it.
+   Last, a list copies a title buffer into
    that shader's buffer, which now has a host copy, so the copy is made on the
    card (`host/place.rs`) and must land too. Skipped where the adapter has no
    shader model 6.6.

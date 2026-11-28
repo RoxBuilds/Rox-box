@@ -923,6 +923,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        // The card's time of these steps ([`gpu_split`]).
+        own.list.gpu_kind(gpu_split::Kind::Fills);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
@@ -965,6 +967,11 @@ impl Host {
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        gpu_split::count(gpu_split::Volume::Fills, (ops.len() - copies) as u64);
+        gpu_split::count(
+            gpu_split::Volume::FillBytes,
+            ops.iter().filter(|op| !matches!(op.to, To::Copy(..))).map(|op| op.len as u64).sum(),
+        );
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();

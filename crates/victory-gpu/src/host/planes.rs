@@ -480,6 +480,7 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            copy.gpu_kind(super::gpu_split::Kind::Passes);
             let list = &copy.list;
             list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             let target = |f: u32| self.rtv(Some(&back), Some(&target_view(f)));

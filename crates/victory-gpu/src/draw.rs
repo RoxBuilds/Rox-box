@@ -610,6 +610,13 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// The kind of the card's time a dispatch of `p` is (`host::gpu_split`): of
+/// a compute program written for 64-lane waves, or another.
+fn dispatch_kind(p: &crate::pipeline::host::HostPipeline) -> crate::host::gpu_split::Kind {
+    use crate::host::gpu_split::Kind;
+    if p.stages.first().is_some_and(|s| s.translated().wave64) { Kind::Wave64 } else { Kind::Dispatches }
+}
+
 #[cfg(test)]
 mod heap_range_tests {
     use super::{HEAP_ROUND, HeapRanges};
@@ -2474,20 +2481,28 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room(memory);
+        let no_room = crate::resource::no_room_why(memory);
+        let mut room = no_room.is_none();
         // With room: the most texels a side of a new copy's first level, the
         // fewer the closer the card is to its line (`resource::detail`;
-        // `u64::MAX`: every level).
-        let mut side = if room { crate::resource::detail_side(memory) } else { u64::MAX };
+        // `u64::MAX`: every level), and why.
+        let no_side = (u64::MAX, crate::resource::Why::None);
+        let (mut side, mut side_why) = if room { crate::resource::detail_side_why(memory) } else { no_side };
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run hundreds
         // of MB past its line while a scene loaded).
         let mut since_asked = 0u64;
-        if !room {
+        if let Some(why) = no_room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+            crate::resource::NO_ROOM_WHY[why as usize].fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
+        // What our blocks of textures have free: a texture whose whole copy
+        // fits there takes none of the card's memory more, and is neither
+        // cut nor refused for the card (`resource::card_short_on`).
+        let card_short = crate::resource::card_short_on();
+        let (mut pool_free, mut pool_hole) = if card_short { crate::pool::texture_free() } else { (0, 0) };
         let mut refused = 0;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`); in the band, once copies may have more
@@ -2535,6 +2550,7 @@ impl State {
             count.store(now, Ordering::Relaxed);
         }
         crate::resource::detail_line(side, room, census[5]);
+        crate::resource::unwritten_line();
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2613,17 +2629,50 @@ impl State {
                 served = false;
                 break;
             }
+            // A placed texture without a host copy whose whole copy fits the
+            // room our blocks of textures have free
+            // ([`crate::resource::fits_pool`]): as with room and no bound, for
+            // it takes no more of the card.
+            let fits = card_short
+                && (!room || side != u64::MAX)
+                && pool_hole > 0
+                && heap
+                    .handle(index)
+                    .and_then(crate::descriptor::view)
+                    .and_then(|view| match view {
+                        View::Placed(false, resource, desc) if resource[0] != 1 => {
+                            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                            let made = crate::resource::placed_known(address, &resource)
+                                .is_some_and(|texture| crate::resource::made_copy(texture).is_some());
+                            let first = crate::resource::first_mip(&desc);
+                            if made { None } else { crate::resource::placed_bytes_from(&resource, first) }
+                        }
+                        _ => None,
+                    })
+                    // (With the host's alignment of a piece.)
+                    .map(|need| need.saturating_add(64 << 10))
+                    .is_some_and(|need| {
+                        let fits = crate::resource::fits_pool(need, pool_hole, pool_free);
+                        if fits {
+                            pool_free -= need;
+                        }
+                        fits
+                    });
+            if fits {
+                crate::resource::POOL_WHOLE.fetch_add(1, Ordering::Relaxed);
+            }
+            let slot_room = room || fits;
             // While the card has no room: a placed texture's host copy made
             // for this slot holds only its smallest levels, and one that does
             // stays so (`crate::resource::tail_only`); the slot is held then,
             // for the rest of them when the card has room.
-            let tail = !room && crate::resource::tail_only();
+            let tail = !slot_room && crate::resource::tail_only();
             let _tail = crate::resource::TailOnly::new(tail);
             // With room in the band below the line: a new host copy holds the
             // levels of at most `side` texels a side, and the slot is held as
             // one of the smallest levels is, for the rest of them.
-            let fewer = room && side != u64::MAX;
-            let _fewer = crate::resource::DetailCap::new(if fewer { side } else { u64::MAX });
+            let fewer = slot_room && !fits && side != u64::MAX;
+            let _fewer = crate::resource::DetailCap::new_why(if fewer { side } else { u64::MAX }, side_why);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2745,7 +2794,7 @@ impl State {
             // findings), and such a texture had its colour only when the
             // scene was entered under the line.
             // `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as before.
-            if !room {
+            if !slot_room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 // A placed texture whose host copy would be new gets one of
@@ -2824,6 +2873,15 @@ impl State {
             let view = heap.handle(index).and_then(|handle| {
                 if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
             });
+            // Made from its view before its upload, which the commit guard may
+            // hold back: then not shown before its bytes
+            // (`crate::resource::show_written`).
+            let at_once_made = !shows_other && !late;
+            let held_back = || {
+                if at_once_made {
+                    host.texture_slot_held_back(index);
+                }
+            };
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -2832,6 +2890,7 @@ impl State {
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             if crate::host::commit::upload_refused() {
                 served = false;
+                held_back();
                 break;
             }
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -2845,6 +2904,7 @@ impl State {
             let texture = crate::resource::host_resource(resource);
             if crate::host::commit::upload_refused() {
                 served = false;
+                held_back();
                 break;
             }
             // No host copy for want of memory, asked for again soon
@@ -2927,6 +2987,7 @@ impl State {
             }
             if ahead.is_none() && crate::host::commit::upload_refused() {
                 served = false;
+                held_back();
                 break;
             }
             let late = late && ahead.is_none();
@@ -2946,6 +3007,7 @@ impl State {
                 && (crate::host::commit::take_staging_deferred() || crate::host::commit::upload_refused())
             {
                 served = false;
+                held_back();
                 break;
             }
             if shows_other && let Some(handle) = heap.handle(index) {
@@ -3024,7 +3086,10 @@ impl State {
                 since_asked = 0;
                 let memory = crate::host::host().and_then(|h| h.video_memory());
                 room = crate::resource::room(memory);
-                side = if room { crate::resource::detail_side(memory) } else { u64::MAX };
+                (side, side_why) = if room { crate::resource::detail_side_why(memory) } else { no_side };
+                if card_short {
+                    (pool_free, pool_hole) = crate::pool::texture_free();
+                }
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -3162,6 +3227,7 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        list.gpu_kind(dispatch_kind(p));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -3578,6 +3644,7 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    list.gpu_kind(crate::host::gpu_split::Kind::Draws);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
@@ -3882,6 +3949,9 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // (What a slot's making tells of a copy no upload went into
+                // is this slot's: `crate::resource::take_made_unwritten`.)
+                let _ = crate::resource::take_made_unwritten();
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
@@ -3910,6 +3980,15 @@ impl State {
                                 listed.ready = (list.epoch(), tested.0, depth);
                             }
                         }
+                    }
+                    // Made just now of a copy whose upload was held back: the
+                    // neutral texture, and made again by the next draw
+                    // (`crate::resource::show_written`).
+                    if crate::resource::made_unwritten_pending()
+                        && let Some(view) = crate::descriptor::host::listed_view(recording, words)
+                        && host.draw_slot_held_back(index, &view)
+                    {
+                        crate::descriptor::host::forget_listed(recording, words);
                     }
                     // (Told once per record and recording; with
                     // `VICTORY_TABLED_REREAD=1` also of a slot the queue
@@ -3951,6 +4030,7 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        let _ = crate::resource::take_made_unwritten();
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -3958,6 +4038,9 @@ impl State {
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
                         }
+                        // Its upload held back: not shown before its bytes
+                        // (`crate::resource::show_written`).
+                        host.draw_slot_held_back(index, &view);
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
                         // (its texture is up to date now), and made in
@@ -4096,6 +4179,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.gpu_kind(crate::host::gpu_split::Kind::Draws);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4207,6 +4291,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.gpu_kind(crate::host::gpu_split::Kind::Draws);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4455,6 +4540,8 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                // (The clamp is a pass of ours on the card.)
+                list.gpu_kind(crate::host::gpu_split::Kind::Passes);
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
@@ -4499,6 +4586,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        list.gpu_kind(if kind == DISPATCH { dispatch_kind(p) } else { crate::host::gpu_split::Kind::Draws });
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {

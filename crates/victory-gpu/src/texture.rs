@@ -1021,7 +1021,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    let texture = &copy.texture;
     ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
         return;
@@ -1091,7 +1090,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         *staging.holds.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
-        record_upload(list, resource, texture, &staging, &source, 0, uploaded);
+        record_upload(list, resource, &copy, &staging, &source, 0, uploaded);
         // Noted when the list is submitted, as the other uploads are: a list recorded before it was submitted
         // carries the aliasing barrier too, which twice does no harm.
         list.defer_host(move || staging.uploaded.store(true, Relaxed));
@@ -1109,6 +1108,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             staging.expected.store(there, Relaxed);
         }
         let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+        // (Recorded on the list's prelude at its submission, ahead of what
+        // the list reads: as good as recorded here for what shows it.)
+        crate::resource::note_recorded(&copy, staging.first);
         list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand });
         return;
     }
@@ -1137,7 +1139,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
-    record_upload(list, resource, texture, &staging, &staging.buffer, staging.base, uploaded);
+    record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base, uploaded);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then. This is meant to run before the check of the same
     // submission, which sets `dirty` again if it detiles (the next list then
@@ -1308,7 +1310,9 @@ impl PreludeUpload {
     /// Records the copy of the staging buffer into the host texture on
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        crate::host::gpu_split::count(crate::host::gpu_split::Volume::TextureBytes, self.staging.bytes);
         let texture = &self.copy.texture;
+        crate::resource::note_recorded(&self.copy, self.staging.first);
         // The staging buffer lives as long as `self.staging`, which the
         // list's steps hold until it is reset.
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
@@ -1348,13 +1352,22 @@ impl PreludeUpload {
 fn record_upload(
     list: &HostList,
     resource: This,
-    texture: &ID3D12Resource,
+    copy: &crate::resource::HostTexture,
     staging: &Staging,
     source: &ID3D12Resource,
     base: u64,
     uploaded: bool,
 ) {
     const COPY_DEST: u32 = 0x400;
+    let texture = &copy.texture;
+    // The first upload into a copy cut from a block, from a later level than
+    // its first: what the block held below that level is not shown, the
+    // levels get zeros (`crate::resource::show_written`).
+    let below = staging.first.saturating_sub(staging.level0);
+    let cover = below > 0
+        && copy.pooled
+        && copy.recorded.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX
+        && crate::resource::show_written();
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
     // Not one made as a committed resource of its own (a piece too large for
@@ -1382,6 +1395,13 @@ fn record_upload(
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
+    // The card's time of texture uploads, and their bytes (`host::gpu_split`).
+    list.gpu_kind(crate::host::gpu_split::Kind::Textures);
+    crate::host::gpu_split::count(crate::host::gpu_split::Volume::TextureBytes, staging.bytes);
+    if cover && let Some(host) = host() {
+        zeros_below(list, host, texture, below);
+    }
+    crate::resource::note_recorded(copy, staging.first);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh the caller records holds until the list is reset; a movie plane's
     // buffer, until the list is reset ([`HostList::plane_upload`]).
@@ -1504,11 +1524,14 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
+    let Some((buffer, at, data)) = list.upload_at(host, bytes) else {
         return;
     };
-    // SAFETY: a mapped buffer of `bytes` bytes, just made.
+    // SAFETY: a mapped range of `bytes` bytes, the list's own.
     unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+    for footprint in &mut footprints {
+        footprint.Offset += at;
+    }
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -1521,6 +1544,58 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
+/// The subresources of a texture of `mips` levels and `layers` array slices
+/// (1 for a 3D texture) that are its first `below` levels: those an upload
+/// from level `below` on leaves out ([`zeros_below`]).
+pub(crate) fn levels_below(below: u32, mips: u32, layers: u32) -> Vec<u32> {
+    let below = below.min(mips);
+    (0..layers).flat_map(|layer| (0..below).map(move |level| layer * mips + level)).collect()
+}
+
+/// Records copies of zeros into the first `below` levels of `texture` (every
+/// array slice), which is in the copy destination state.
+fn zeros_below(list: &HostList, host: &crate::host::Host, texture: &ID3D12Resource, below: u32) {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
+    let subresources = levels_below(below, u32::from(d.MipLevels), layers);
+    if subresources.is_empty() {
+        return;
+    }
+    crate::resource::UNWRITTEN[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for index in subresources {
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0u64;
+        // SAFETY: outputs for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(&d, index, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
+        }
+        if bytes == 0 || bytes == u64::MAX {
+            continue;
+        }
+        let Some((buffer, at, data)) = list.upload_at(host, bytes) else {
+            return;
+        };
+        // SAFETY: a mapped range of `bytes` bytes, the list's own.
+        unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        footprint.Offset += at;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the list holds the buffer until it is reset.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
@@ -1570,13 +1645,14 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let Some((buffer, at, data)) = list.upload_at(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
                 continue;
             };
-            // SAFETY: a mapped buffer of `bytes` bytes, just made.
+            footprint.Offset += at;
+            // SAFETY: a mapped range of `bytes` bytes, the list's own.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -2605,6 +2681,24 @@ mod title_memory_tests {
 /// [`claim_upload`] (`VICTORY_PRELUDE_UPLOADS=1`; ported from
 /// trustno1-coder/VIctory-NVIDIA 91df493, from Belobug/VIctory-Belobug-AMD
 /// 5d6bd84). Off, the uploads are decided as before and none of this runs.
+#[cfg(test)]
+mod levels_below_tests {
+    use super::levels_below;
+
+    /// The first upload into a copy cut from a block, from a later level
+    /// than its first, writes zeros into the levels before that one in every
+    /// array slice (`crate::resource::show_written`): those subresources.
+    #[test]
+    fn the_levels_an_upload_leaves_out_are_named_in_every_slice() {
+        assert!(levels_below(0, 10, 1).is_empty());
+        assert_eq!(levels_below(2, 10, 1), [0, 1]);
+        assert_eq!(levels_below(2, 10, 3), [0, 1, 10, 11, 20, 21]);
+        // Never past the copy's own levels.
+        assert_eq!(levels_below(12, 4, 1), [0, 1, 2, 3]);
+        assert!(levels_below(3, 10, 0).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod prelude_upload_tests {
     use super::{claim_upload, unclaim_upload};

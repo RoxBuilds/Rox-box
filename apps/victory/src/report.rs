@@ -96,6 +96,8 @@ const SECTIONS: &[&str] = &[
     "frame_time.waits.steady",
     "frame_time.spared",
     "frame_time.spared.steady",
+    "gpu_time",
+    "gpu_time.steady",
     "pipelines",
     "shaders",
     "shaders.failures",

@@ -1258,6 +1258,178 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// Cut from a block of textures (`crate::pool`): memory another texture
+    /// may have held, whose bytes it shows where nothing was uploaded.
+    pub(crate) pooled: bool,
+    /// The title's first level of the lowest upload into it a list recorded
+    /// ([`note_recorded`]; `u32::MAX`: none yet): it holds nothing written
+    /// below that level, and nothing at all without one.
+    pub(crate) recorded: std::sync::atomic::AtomicU32,
+}
+
+/// An upload into `copy` of the title's levels from `first` on was recorded.
+#[cfg(windows)]
+pub(crate) fn note_recorded(copy: &HostTexture, first: u32) {
+    copy.recorded.fetch_min(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a slot made from host copy `copy` of title texture `this` could
+/// show bytes nothing wrote ([`show_written`]): the copy is cut from a block,
+/// the title fills it, no upload into it was recorded, and the host did not
+/// copy into it either. (A copy of memory of its own reads zeros unwritten.)
+#[cfg(windows)]
+pub(crate) fn unwritten(this: This, copy: &HostTexture) -> bool {
+    copy.pooled
+        && copy.filled
+        && copy.tiled.is_none()
+        && copy.recorded.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX
+        && !crate::texture::host_wrote(this as usize)
+}
+
+/// Whether nothing is shown that was never written (`VICTORY_SHOW_WRITTEN`,
+/// on unless `0`: as before). A host copy cut from a block of textures holds
+/// what the block held before (another texture's bytes) until its upload
+/// has run, and below the first level an upload wrote. With it:
+/// - a slot made where no upload follows in the same list (a slot flipped
+///   after an upload ran, `descriptor/host.rs` `texture_slots_flip`; a slot
+///   made again for a copy of more levels, `texture_views_remade`) does not
+///   replace its texture's copy by a new one ([`want_level`]), shows the
+///   neutral texture for a copy no upload went into, and the levels an upload
+///   went into for one whose view starts below them ([`NoUploadFollows`]);
+///   the slot is made again by the next texture pass;
+/// - a slot of the texture pass made before its upload, and a draw's table
+///   slot, whose upload was held back (the commit guard), shows the neutral
+///   texture;
+/// - the first upload into a copy cut from a block writes zeros into the
+///   levels below the first one it uploads (`crate::texture` `upload_from`).
+///
+/// Of a run on a card of 8 GB, textures showed dense coloured noise in rows: a
+/// copy made with fewer levels for the band ([`detail`]) and uploaded was
+/// shown by its slot once that upload had run, and showing it asked for a
+/// copy of every level (the band's bound is the pass's alone): the uploaded
+/// copy was let go and its slot showed a new one, from a block another
+/// texture had held, that no upload went into until the title wrote the
+/// texture again.
+#[cfg(windows)]
+pub(crate) fn show_written() -> bool {
+    crate::toggled!("VICTORY_SHOW_WRITTEN")
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// The thread makes slots that no upload follows in the same list
+    /// ([`NoUploadFollows`]).
+    static NO_UPLOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A slot made while [`NO_UPLOAD`] was set was given a stand-in
+    /// ([`stood_in`]).
+    static STOOD_IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The title texture whose host copy a view was last made of on this
+    /// thread while no upload had gone into it ([`made_unwritten`]; 0: none).
+    static MADE_UNWRITTEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A view of title texture `this` was made of a host copy no upload went
+/// into yet ([`unwritten`]): its caller's upload may be held back.
+#[cfg(windows)]
+pub(crate) fn made_unwritten(this: This) {
+    MADE_UNWRITTEN.set(this as usize);
+}
+
+/// Whether [`made_unwritten`] named a texture on this thread since it was
+/// last taken ([`take_made_unwritten`]).
+#[cfg(windows)]
+pub(crate) fn made_unwritten_pending() -> bool {
+    MADE_UNWRITTEN.get() != 0
+}
+
+/// The texture [`made_unwritten`] last named on this thread, if its copy is
+/// still one no upload went into; taken.
+#[cfg(windows)]
+pub(crate) fn take_made_unwritten() -> Option<This> {
+    let this = MADE_UNWRITTEN.replace(0) as This;
+    (!this.is_null() && made_copy(this).is_some_and(|copy| unwritten(this, &copy))).then_some(this)
+}
+
+/// Sets [`NO_UPLOAD`] on this thread while it lives ([`show_written`] on),
+/// and gives it back what it was then.
+#[cfg(windows)]
+pub(crate) struct NoUploadFollows(bool);
+
+#[cfg(windows)]
+impl NoUploadFollows {
+    pub(crate) fn new() -> NoUploadFollows {
+        STOOD_IN.set(false);
+        NoUploadFollows(NO_UPLOAD.replace(show_written()))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NoUploadFollows {
+    fn drop(&mut self) {
+        NO_UPLOAD.set(self.0);
+    }
+}
+
+/// Whether slots made now have no upload after them ([`NoUploadFollows`]).
+#[cfg(windows)]
+pub(crate) fn no_upload_follows() -> bool {
+    NO_UPLOAD.get()
+}
+
+/// A slot made under [`NoUploadFollows`] was given the neutral texture or
+/// fewer levels than its view: it is made again later.
+#[cfg(windows)]
+pub(crate) fn stand_in() {
+    STOOD_IN.set(true);
+}
+
+/// Whether the slot made last under [`NoUploadFollows`] was given a stand-in
+/// ([`stand_in`]); taken.
+#[cfg(windows)]
+pub(crate) fn stood_in() -> bool {
+    STOOD_IN.replace(false)
+}
+
+/// Since the start ([`show_written`]): slots made where no upload follows
+/// that showed the neutral texture for a copy no upload went into; such
+/// slots shown from the first level an upload wrote; copies kept that
+/// showing a slot would have replaced by a new one ([`want_level`]); slots
+/// of the texture pass, and draws' table slots, whose upload was held back
+/// and that showed the neutral texture; first uploads that wrote zeros
+/// below their first level.
+#[cfg(windows)]
+pub(crate) static UNWRITTEN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Says, at most once a second and when they changed, the counts of
+/// [`UNWRITTEN`].
+#[cfg(windows)]
+pub(crate) fn unwritten_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SAID: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = crate::host::coarse_ms();
+    let last = SAID[0].load(Relaxed);
+    let n = UNWRITTEN.each_ref().map(|n| n.load(Relaxed));
+    let sum: u64 = n.iter().sum();
+    if sum == SAID[1].load(Relaxed)
+        || now < last.saturating_add(1000)
+        || SAID[0].compare_exchange(last, now.max(1), Relaxed, Relaxed).is_err()
+    {
+        return;
+    }
+    SAID[1].store(sum, Relaxed);
+    tracing::info!(
+        "host copies not shown before their bytes (VICTORY_SHOW_WRITTEN), since the start: slots made after an upload \
+         ran that showed the neutral texture for a copy no upload went into {}, shown from the first level uploaded {}; \
+         copies kept that a slot's view would have replaced by an empty one {}; slots of the texture pass {} and draws' \
+         table slots {} that showed the neutral texture as their upload was held back; first uploads that wrote zeros \
+         below their first level {}",
+        n[0],
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5]
+    );
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1450,7 +1622,7 @@ pub(crate) enum Detail {
     /// their smallest levels only ([`tail_only`]), as before.
     Off,
     /// Of fewer levels the closer the card comes to the line of [`room`]
-    /// ([`detail_side_in`]).
+    /// ([`detail_side_as`]).
     Card,
     /// The same, and while the PC's commit is critical
     /// (`crate::host::commit::critical`) at most [`PC_SHORT_SIDE`] texels a
@@ -1459,9 +1631,11 @@ pub(crate) enum Detail {
 }
 
 /// [`Detail`] from `VICTORY_TEXTURE_DETAIL` as set and the card's budget:
-/// `0` off (as before), `card` the card's band only, any other value the
-/// band and the PC's commit; unset, the latter on a card whose budget is 8
-/// GiB or less, off on larger ones.
+/// `0` off (as before); `card`, or any other value but `pc`, the card's band
+/// only ([`Detail::Card`]); `pc` the band and the PC's commit
+/// ([`Detail::CardAndPc`], what unset and any other value but `0` and `card`
+/// were before); unset, the card's band on a card whose budget is 8 GiB or
+/// less, off on larger ones (as before).
 ///
 /// On a card of 8 GB the copies the title's textures want came to more than
 /// the card: every host copy was made whole until the card reached its line,
@@ -1470,21 +1644,89 @@ pub(crate) enum Detail {
 /// blurred to nothing or missing. Leaving out a texture's largest level takes
 /// three quarters of its bytes; two, fifteen sixteenths. Made with fewer of
 /// them as the card fills, many more textures have a copy before it is full,
-/// and what reaches the line later has more than its tail. The PC's side: on
-/// a PC of 16 GB the commit guard holds a pass to 16 MiB while commit is
-/// critical, the same textures then take a sixteenth of the bytes to stage.
+/// and what reaches the line later has more than its tail.
+///
+/// The PC's side is no longer the default: a host copy is the card's memory,
+/// and cutting it frees none of the PC's. On a PC of 16 GB whose free memory
+/// stood near nothing for most of a run, with the card under its budget and a
+/// gigabyte of our blocks of textures free, new copies were cut for the PC's
+/// commit as well as for the card. The PC's memory has its own guard for what
+/// stages a texture (`crate::host::commit`: a pass held to 16 MiB while
+/// commit is critical), which stays.
 #[cfg(any(windows, test))]
 fn detail_for(set: Option<&str>, budget: Option<u64>) -> Detail {
     match set.map(str::trim) {
         Some("0") => Detail::Off,
-        Some("card") => Detail::Card,
-        Some(_) => Detail::CardAndPc,
-        None if budget.is_some_and(|b| b > 0 && b <= 8 << 30) => Detail::CardAndPc,
+        Some("pc") => Detail::CardAndPc,
+        Some(_) => Detail::Card,
+        None if budget.is_some_and(|b| b > 0 && b <= 8 << 30) => Detail::Card,
         None => Detail::Off,
     }
 }
 
-/// [`detail_for`] for this card, read once.
+/// [`card_short_on`] for the switch's value `set` and a card of `budget`
+/// bytes.
+#[cfg(any(windows, test))]
+fn card_short_for(set: Option<&str>, budget: Option<u64>) -> bool {
+    match set.map(str::trim) {
+        Some("0") => false,
+        Some(_) => true,
+        None => budget.is_some_and(|b| b > 0 && b <= 8 << 30),
+    }
+}
+
+/// Whether the detail cut ([`detail`]) and the texture queue's "no room"
+/// ([`room`]) go by the card being short alone (`VICTORY_CARD_SHORT`; unset:
+/// on a card whose budget is 8 GiB or less, off on larger ones; `0`: off, as
+/// before; any other value: on). With it:
+/// - neither happens while the system's own count of our use of the card,
+///   without the room kept for what is not made yet, is under the bottom of
+///   the band below its line ([`CardFill::short`]): the card's use well under
+///   its budget is no shortage, whatever is kept;
+/// - a texture whose whole copy fits the room our blocks of textures have
+///   free takes none of the card's memory more, and is made whole however
+///   full the card counts (`draw.rs` `heap_textures`, [`fits_pool`]).
+///
+/// On a card of 8 GB with the card's use under its budget and a gigabyte of
+/// the blocks' room free, new copies were cut to 128 texels a side and the
+/// card said to have no room hundreds of times: the line by the system's count
+/// counts the blocks' free room as used, and the room kept for render targets
+/// and buffer copies not made yet as used too.
+#[cfg(windows)]
+pub(crate) fn card_short_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let set = std::env::var("VICTORY_CARD_SHORT").ok();
+        card_short_for(set.as_deref(), crate::host::host().and_then(|h| h.video_memory()).map(|m| m[0]))
+    })
+}
+
+/// Why new host copies are cut or refused ([`CardFill::room_as`],
+/// [`detail_side_as`]): for the queue's own measure past its line or in its
+/// band, for the system's count past the line of the headroom or in its
+/// band, for the PC's commit ([`Detail::CardAndPc`] only). Kept as an index
+/// of [`DETAIL_WHY`] and [`NO_ROOM_WHY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Why {
+    None = 0,
+    Queue = 1,
+    Whole = 2,
+    Pc = 3,
+}
+
+/// Whether a texture whose whole host copy takes `need` bytes fits the room
+/// our blocks of textures have free: it fits the largest free range of one
+/// (`hole`), and the bytes free in all (`free`) that the copies let through
+/// so far this pass left.
+#[cfg(any(windows, test))]
+pub(crate) fn fits_pool(need: u64, hole: u64, free: u64) -> bool {
+    need > 0 && need <= hole && need <= free
+}
+
+/// [`detail_for`] for this card, read once: `VICTORY_TEXTURE_DETAIL` `0`
+/// off; `card`, or any other value but `pc`, the card's band alone (unset: so
+/// on a card of 8 GiB or less, off on larger ones); `pc` the card's band and
+/// the PC's commit, as unset was before on a card of 8 GiB or less.
 #[cfg(windows)]
 pub(crate) fn detail() -> Detail {
     static DETAIL: std::sync::OnceLock<Detail> = std::sync::OnceLock::new();
@@ -1498,15 +1740,17 @@ pub(crate) fn detail() -> Detail {
             headroom_pct = card_headroom(),
             cut = cut_on(),
             small_when_full_kb = small_when_full() >> 10,
-            "textures picked by index on a full card (VICTORY_TEXTURE_DETAIL, VICTORY_CARD_HEADROOM_PCT, VICTORY_TEXTURE_CUT, \
-             VICTORY_SMALL_WHEN_FULL_KB; each 0: as before)"
+            card_short = card_short_on(),
+            "textures picked by index on a full card (VICTORY_TEXTURE_DETAIL, pc: for the PC's commit too; \
+             VICTORY_CARD_HEADROOM_PCT, VICTORY_TEXTURE_CUT, VICTORY_SMALL_WHEN_FULL_KB, VICTORY_CARD_SHORT; each 0: \
+             as before)"
         );
         detail
     })
 }
 
 /// The band below the lines of [`room`] in which new copies are made with
-/// fewer levels ([`detail_side_in`]), in hundredths of the budget.
+/// fewer levels ([`detail_side_as`]), in hundredths of the budget.
 #[cfg(any(windows, test))]
 const DETAIL_BAND_PCT: u64 = 10;
 
@@ -1549,19 +1793,51 @@ impl CardFill {
     }
 
     /// Whether the queue may make more host copies: under its line, and
-    /// with a headroom under that line too.
-    #[cfg(any(windows, test))]
+    /// with a headroom under that line too (as before [`card_short_for`]).
+    #[cfg(test)]
     pub(crate) fn room(&self, percent: u64, headroom: u64) -> bool {
+        self.room_as(percent, headroom, false).is_ok()
+    }
+
+    /// Whether the queue may make more host copies (under its line, and with a
+    /// headroom under that line too), and with `card_short`
+    /// ([`card_short_for`]) while the card is not short ([`CardFill::short`]);
+    /// else why not.
+    #[cfg(any(windows, test))]
+    pub(crate) fn room_as(&self, percent: u64, headroom: u64, card_short: bool) -> Result<(), Why> {
+        if card_short && !self.short(percent, headroom) {
+            return Ok(());
+        }
         let (queue, line) = self.queue(percent);
-        queue < line && self.whole(headroom).is_none_or(|(whole, line)| whole < line)
+        if queue >= line {
+            return Err(Why::Queue);
+        }
+        match self.whole(headroom) {
+            Some((whole, line)) if whole >= line => Err(Why::Whole),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the card is short ([`card_short_for`]): the system's own count
+    /// of our use, without what is kept for later, has reached the bottom of
+    /// the band of [`DETAIL_BAND_PCT`] below the line it is held under (the
+    /// budget less the headroom, or the queue's line without one).
+    #[cfg(any(windows, test))]
+    pub(crate) fn short(&self, percent: u64, headroom: u64) -> bool {
+        let line = if headroom > 0 { 100 - headroom.min(100) } else { percent.min(100) };
+        let bottom = line.saturating_sub(DETAIL_BAND_PCT);
+        self.budget > 0 && u128::from(self.used) * 100 >= u128::from(self.budget) * u128::from(bottom)
     }
 
     /// How far into the band of `band` bytes below the lines its use is: 0
-    /// under the band, `band` at or past a line.
+    /// under the band, `band` at or past a line; and which line's band that
+    /// is ([`Why::Queue`] when both are as deep).
     #[cfg(any(windows, test))]
-    fn depth(&self, percent: u64, headroom: u64, band: u64) -> u64 {
+    fn depth(&self, percent: u64, headroom: u64, band: u64) -> (u64, Why) {
         let into = |(used, line): (u64, u64)| used.saturating_add(band).saturating_sub(line).min(band);
-        into(self.queue(percent)).max(self.whole(headroom).map_or(0, into))
+        let queue = into(self.queue(percent));
+        let whole = self.whole(headroom).map_or(0, into);
+        if whole > queue { (whole, Why::Whole) } else { (queue, Why::Queue) }
     }
 }
 
@@ -1571,23 +1847,43 @@ impl CardFill {
 /// step by step to the line, and [`PC_SHORT_SIDE`] at most while `pc_short`
 /// ([`Detail::CardAndPc`]). Past the line no copy is made but the smallest
 /// levels' ([`tail_only`]); what is there then is the pass's.
+///
+/// And why the side is bounded ([`Why::None`]: it is not); with
+/// `card_short` ([`card_short_for`]) not bounded while the card is not short
+/// ([`CardFill::short`]).
 #[cfg(any(windows, test))]
-fn detail_side_in(detail: Detail, fill: Option<CardFill>, percent: u64, headroom: u64, pc_short: bool) -> u64 {
+fn detail_side_as(
+    detail: Detail,
+    fill: Option<CardFill>,
+    percent: u64,
+    headroom: u64,
+    pc_short: bool,
+    card_short: bool,
+) -> (u64, Why) {
     if detail == Detail::Off {
-        return u64::MAX;
+        return (u64::MAX, Why::None);
     }
-    let pc = if detail == Detail::CardAndPc && pc_short { PC_SHORT_SIDE } else { u64::MAX };
+    let pc = if detail == Detail::CardAndPc && pc_short { (PC_SHORT_SIDE, Why::Pc) } else { (u64::MAX, Why::None) };
     let Some(fill) = fill.filter(|f| f.budget > 0) else {
         return pc;
     };
+    if card_short && !fill.short(percent, headroom) {
+        return pc;
+    }
     let band = fill.budget / 100 * DETAIL_BAND_PCT;
-    let depth = fill.depth(percent, headroom, band);
+    let (depth, why) = fill.depth(percent, headroom, band);
     if depth == 0 || band == 0 {
         return pc;
     }
     let steps = DETAIL_SIDES.len() as u64;
     let step = (u128::from(depth) * u128::from(steps) / u128::from(band)).min(u128::from(steps - 1)) as usize;
-    DETAIL_SIDES[step].min(pc)
+    if pc.0 < DETAIL_SIDES[step] { pc } else { (DETAIL_SIDES[step], why) }
+}
+
+/// [`detail_side_as`]'s side without the rule of [`card_short_for`], as before.
+#[cfg(test)]
+fn detail_side_in(detail: Detail, fill: Option<CardFill>, percent: u64, headroom: u64, pc_short: bool) -> u64 {
+    detail_side_as(detail, fill, percent, headroom, pc_short, false).0
 }
 
 /// Where the card stands now ([`CardFill`]), from `memory`.
@@ -1602,15 +1898,21 @@ fn card_fill(memory: Option<[u64; 4]>) -> Option<CardFill> {
     })
 }
 
-/// [`detail_side_in`] for the card and the PC now.
+/// [`detail_side_as`] for the card and the PC now.
 #[cfg(windows)]
 pub(crate) fn detail_side(memory: Option<[u64; 4]>) -> u64 {
+    detail_side_why(memory).0
+}
+
+/// [`detail_side`] and why it is bounded ([`detail_side_as`]).
+#[cfg(windows)]
+pub(crate) fn detail_side_why(memory: Option<[u64; 4]>) -> (u64, Why) {
     let detail = detail();
     if detail == Detail::Off {
-        return u64::MAX;
+        return (u64::MAX, Why::None);
     }
     let pc_short = detail == Detail::CardAndPc && crate::host::commit::critical();
-    detail_side_in(detail, card_fill(memory), room_percent(), card_headroom(), pc_short)
+    detail_side_as(detail, card_fill(memory), room_percent(), card_headroom(), pc_short, card_short_on())
 }
 
 /// The share of the card's budget, in hundredths, kept free under what
@@ -1739,17 +2041,25 @@ thread_local! {
     /// the most texels a side the first level of a host copy of a placed
     /// texture made on this thread has (`u64::MAX`: no bound).
     static CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    /// Why [`CAP`] bounds the side ([`Why`] as a number).
+    static CAP_WHY: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 /// Sets [`CAP`] on this thread while it lives, and gives it back what it was
 /// then.
 #[cfg(windows)]
-pub(crate) struct DetailCap(u64);
+pub(crate) struct DetailCap(u64, u8);
 
 #[cfg(windows)]
 impl DetailCap {
+    #[cfg(test)]
     pub(crate) fn new(side: u64) -> DetailCap {
-        DetailCap(CAP.replace(side))
+        DetailCap::new_why(side, if side == u64::MAX { Why::None } else { Why::Queue })
+    }
+
+    /// [`DetailCap::new`], with why the side is bounded.
+    pub(crate) fn new_why(side: u64, why: Why) -> DetailCap {
+        DetailCap(CAP.replace(side), CAP_WHY.replace(why as u8))
     }
 }
 
@@ -1757,8 +2067,21 @@ impl DetailCap {
 impl Drop for DetailCap {
     fn drop(&mut self) {
         CAP.set(self.0);
+        CAP_WHY.set(self.1);
     }
 }
+
+/// Since the start, by [`Why`]: host copies made with fewer levels for the
+/// band ([`CAP`]); passes over textures picked by index that began with the
+/// card without room ([`room`]). And new host copies made whole in the room
+/// our blocks of textures had free while the card counted short
+/// ([`card_short_on`], [`fits_pool`]).
+#[cfg(windows)]
+pub(crate) static DETAIL_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+#[cfg(windows)]
+pub(crate) static NO_ROOM_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+#[cfg(windows)]
+pub(crate) static POOL_WHOLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The least [`CAP`] slots were held at since they were last let out
 /// ([`held_at`], [`release_held`]): 0 for slots held without a copy.
@@ -1813,6 +2136,8 @@ pub(crate) fn detail_line(side: u64, room: bool, rechecks: u64) {
         return;
     }
     let [made, bytes, cut, cut_bytes, small] = [0, 1, 2, 3, 4].map(|i| DETAILED[i].load(Relaxed));
+    let why = DETAIL_WHY.each_ref().map(|n| n.load(Relaxed));
+    let no_room = NO_ROOM_WHY.each_ref().map(|n| n.load(Relaxed));
     let now_side = match (room, side) {
         (false, _) => format!("their smallest levels only ({TAIL_SIDE} texels a side)"),
         (true, u64::MAX) => "every level".to_owned(),
@@ -1820,11 +2145,20 @@ pub(crate) fn detail_line(side: u64, room: bool, rechecks: u64) {
     };
     tracing::info!(
         "textures picked by index on a filling card (VICTORY_TEXTURE_DETAIL): new host copies now of {now_side}; since \
-         the start {made} made with fewer levels ({} MB), {cut} cut down while idle ({} MB before; VICTORY_TEXTURE_CUT), \
-         {small} small ones made while the card had no room (VICTORY_SMALL_WHEN_FULL_KB); {rechecks} slots of the queue \
-         uploaded and waiting for a look at their memory",
+         the start {made} made with fewer levels ({} MB; {} for the queue's own count of the card, {} for the system's \
+         count of it, {} for the PC's commit), {cut} cut down while idle ({} MB before; VICTORY_TEXTURE_CUT), \
+         {small} small ones made while the card had no room (VICTORY_SMALL_WHEN_FULL_KB); passes that found the card \
+         without room: {} by the queue's count, {} by the system's; {} made whole in the room our blocks of textures \
+         had free (VICTORY_CARD_SHORT {}); {rechecks} slots of the queue uploaded and waiting for a look at their memory",
         bytes >> 20,
-        cut_bytes >> 20
+        why[Why::Queue as usize],
+        why[Why::Whole as usize],
+        why[Why::Pc as usize],
+        cut_bytes >> 20,
+        no_room[Why::Queue as usize],
+        no_room[Why::Whole as usize],
+        POOL_WHOLE.load(Relaxed),
+        if card_short_on() { "on" } else { "off" }
     );
 }
 
@@ -1954,6 +2288,13 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     };
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
+        return;
+    }
+    // A slot made where no upload follows ([`NoUploadFollows`]) would show
+    // the new copy before anything is in it: the copy stays, and the slot
+    // shows its levels; the texture pass replaces it when it asks for more.
+    if no_upload_follows() {
+        UNWRITTEN[2].fetch_add(1, Relaxed);
         return;
     }
     // Of only the smallest levels, for a card without room ([`tail_only`]):
@@ -2439,6 +2780,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         };
         host.base = base;
         host.tail = tail;
+        host.pooled = !own && host.tiled.is_none();
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2448,6 +2790,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if detailed {
             DETAILED[0].fetch_add(1, Relaxed);
             DETAILED[1].fetch_add(host.bytes, Relaxed);
+            DETAIL_WHY[usize::from(CAP_WHY.get()).min(3)].fetch_add(1, Relaxed);
         }
         if smallest {
             let n = TAILS[0].fetch_add(1, Relaxed) + 1;
@@ -2511,16 +2854,29 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 }
 
 /// Whether more host copies of textures the title fills may be made for
+/// shaders that pick textures by index ([`no_room_why`] says why not).
+#[cfg(windows)]
+pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    no_room_why(memory).is_none()
+}
+
+/// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the
 /// PC's, and the run ends.
+///
+/// `None` with room, else why there is none ([`Why::Queue`] for a limit of
+/// `VICTORY_TEXTURE_BUDGET_MB` or a card that says no budget). With
+/// [`card_short_on`], there is room while the card is not short
+/// ([`CardFill::room_as`]).
 #[cfg(windows)]
-pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+pub(crate) fn no_room_why(memory: Option<[u64; 4]>) -> Option<Why> {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
+    let no = |room: bool| (!room).then_some(Why::Queue);
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -2530,11 +2886,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return no(filled < limit);
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
-        return true;
+        return None;
     }
     // What is kept for card copies of title buffers not made yet
     // (`crate::shadow::card_room_kept`) and for the render targets a scene
@@ -2542,8 +2898,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // a headroom ([`card_headroom`]) the system's own count of our use is
     // held under its line too.
     match card_fill(memory) {
-        Some(fill) => fill.room(room_percent(), card_headroom()),
-        None => filled < WITHOUT_BUDGET,
+        Some(fill) => fill.room_as(room_percent(), card_headroom(), card_short_on()).err(),
+        None => no(filled < WITHOUT_BUDGET),
     }
 }
 
@@ -3485,6 +3841,8 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            pooled: false,
+            recorded: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
@@ -3511,6 +3869,8 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            pooled: false,
+            recorded: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }
@@ -4771,13 +5131,23 @@ mod tests {
         const GIB: u64 = 1 << 30;
         let small = Some(7 * GIB);
         let large = Some(16 * GIB);
-        assert_eq!(detail_for(None, small), Detail::CardAndPc);
-        assert_eq!(detail_for(None, Some(8 * GIB)), Detail::CardAndPc);
+        // The card's band alone by default; the PC's commit too only as asked.
+        assert_eq!(detail_for(None, small), Detail::Card);
+        assert_eq!(detail_for(None, Some(8 * GIB)), Detail::Card);
         assert_eq!(detail_for(None, large), Detail::Off);
         assert_eq!(detail_for(None, None), Detail::Off);
         assert_eq!(detail_for(Some("0"), small), Detail::Off);
         assert_eq!(detail_for(Some("card"), large), Detail::Card);
-        assert_eq!(detail_for(Some("1"), large), Detail::CardAndPc);
+        assert_eq!(detail_for(Some("1"), large), Detail::Card);
+        assert_eq!(detail_for(Some("pc"), small), Detail::CardAndPc);
+        assert_eq!(detail_for(Some(" pc "), large), Detail::CardAndPc);
+        // The card's shortage alone decides on small cards only by default.
+        assert!(card_short_for(None, small));
+        assert!(card_short_for(None, Some(8 * GIB)));
+        assert!(!card_short_for(None, large));
+        assert!(!card_short_for(None, None));
+        assert!(!card_short_for(Some("0"), small));
+        assert!(card_short_for(Some("1"), large));
         assert_eq!(card_headroom_for(None, small), 4);
         assert_eq!(card_headroom_for(None, large), 0);
         assert_eq!(card_headroom_for(Some("0"), small), 0);
@@ -4837,6 +5207,116 @@ mod tests {
         assert_eq!(side_level(4096, 1024, 13, 2048), 1);
         assert_eq!(side_level(256, 256, 9, 2048), 0);
         assert_eq!(side_level(4096, 4096, 13, TAIL_SIDE), tail_level(4096, 4096, 13));
+    }
+
+    /// The detail cut and the "no room" verdict as the card stands, its
+    /// blocks' free room and the PC's memory (`VICTORY_CARD_SHORT`): with the
+    /// rule, only the card being short cuts or refuses, never its use well
+    /// under the budget whatever is kept for later, never the PC's commit
+    /// unless `VICTORY_TEXTURE_DETAIL=pc`, and a texture that fits the free
+    /// room of the blocks is let through; without it, as before.
+    #[test]
+    fn only_the_card_being_short_cuts_detail_or_finds_no_room() {
+        const MIB: u64 = 1 << 20;
+        let budget = 7000 * MIB;
+        let fill = |used: u64, free_blocks: u64, kept: u64| CardFill {
+            budget,
+            used: used * MIB,
+            free_blocks: free_blocks * MIB,
+            kept: kept * MIB,
+        };
+        let decide = |f: CardFill, detail: Detail, pc_short: bool, rule: bool| {
+            let room = f.room_as(90, 4, rule);
+            let side =
+                if room.is_ok() { detail_side_as(detail, Some(f), 90, 4, pc_short, rule) } else { (u64::MAX, Why::None) };
+            (room, side)
+        };
+        // Use at 6,000 of 7,000 MB with 1,000 MB of the blocks free and 700
+        // kept for targets not made yet: by the system's count with what is
+        // kept, 6,700 against the headroom's line of 6,720.
+        let filling = fill(6000, 1000, 700);
+        assert_eq!(decide(filling, Detail::Card, false, false), (Ok(()), (128, Why::Whole)));
+        // The card's own count (6,000) is under the band below its line
+        // (86 %, 6,020): no cut, room.
+        assert!(!filling.short(90, 4));
+        assert_eq!(decide(filling, Detail::Card, false, true), (Ok(()), (u64::MAX, Why::None)));
+        // With what is kept the queue's line is past: no room before, room
+        // with the rule while the card's use is well under its budget.
+        let kept_much = fill(5000, 0, 2000);
+        assert_eq!(kept_much.room_as(90, 4, false), Err(Why::Queue));
+        assert_eq!(kept_much.room_as(90, 4, true), Ok(()));
+        // The PC's commit: no bound unless asked for.
+        assert_eq!(decide(filling, Detail::Card, true, true), (Ok(()), (u64::MAX, Why::None)));
+        assert_eq!(decide(filling, Detail::CardAndPc, true, true), (Ok(()), (PC_SHORT_SIDE, Why::Pc)));
+        assert_eq!(decide(filling, Detail::CardAndPc, true, false), (Ok(()), (128, Why::Whole)));
+        assert_eq!(decide(fill(1000, 0, 0), Detail::CardAndPc, true, false).1, (PC_SHORT_SIDE, Why::Pc));
+        // The card short by its own count: cut and refused as before, and
+        // said why.
+        let short = fill(6350, 500, 0);
+        assert!(short.short(90, 4));
+        assert_eq!(decide(short, Detail::Card, false, true), (Ok(()), (512, Why::Whole)));
+        assert_eq!(decide(short, Detail::Card, false, false), (Ok(()), (512, Why::Whole)));
+        let full = fill(6900, 0, 0);
+        assert_eq!(full.room_as(90, 4, true), Err(Why::Queue));
+        assert_eq!(fill(6800, 600, 0).room_as(90, 4, true), Err(Why::Whole));
+        // The queue's own band comes first where it is as deep.
+        assert_eq!(detail_side_as(Detail::Card, Some(fill(5950, 0, 0)), 90, 0, false, true), (512, Why::Queue));
+        // Without a headroom the band is below the queue's line (80 %).
+        assert!(!fill(5500, 0, 0).short(90, 0) && fill(5600, 0, 0).short(90, 0));
+        // A texture that fits the blocks' free room is let through: it
+        // fits the largest free range and what is left of the free bytes.
+        assert!(fits_pool(4 * MIB, 16 * MIB, 1000 * MIB));
+        assert!(fits_pool(16 * MIB, 16 * MIB, 16 * MIB));
+        assert!(!fits_pool(20 * MIB, 16 * MIB, 1000 * MIB));
+        assert!(!fits_pool(4 * MIB, 16 * MIB, 2 * MIB));
+        assert!(!fits_pool(0, 16 * MIB, 1000 * MIB));
+        assert!(!fits_pool(4 * MIB, 0, 0));
+    }
+
+    /// A host copy made with fewer levels for the band is not replaced by an
+    /// empty one with every level where no upload follows (a slot flipped
+    /// after its upload ran: `NoUploadFollows`), and the slot shows the levels
+    /// it has; the texture pass, where its upload follows, replaces it as
+    /// before. With `VICTORY_SHOW_WRITTEN=0` the guard is never set.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_of_fewer_levels_is_not_replaced_where_no_upload_follows() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() || !show_written() {
+            return;
+        }
+        let _views = crate::test_views_lock();
+        // 1024x1024 BC7, eleven levels, 4 KiB blocks.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        let fewer = {
+            let _band = DetailCap::new(256);
+            want_level(texture, 0);
+            host_copy(texture).unwrap()
+        };
+        assert_eq!((fewer.tail, fewer.base), (true, 2));
+        let kept = UNWRITTEN[2].load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let _alone = NoUploadFollows::new();
+            assert!(no_upload_follows());
+            want_level(texture, 0);
+            assert_eq!(host_copy(texture).unwrap().serial, fewer.serial, "kept where no upload follows");
+            assert!(UNWRITTEN[2].load(std::sync::atomic::Ordering::Relaxed) > kept);
+        }
+        assert!(!no_upload_follows());
+        // No upload went into it: what a slot made of it would show is not
+        // its memory.
+        assert_eq!(fewer.recorded.load(std::sync::atomic::Ordering::Relaxed), u32::MAX);
+        assert_eq!(unwritten(texture, &fewer), fewer.pooled && fewer.filled);
+        note_recorded(&fewer, 2);
+        assert!(!unwritten(texture, &fewer));
+        // Where its upload follows: replaced by one of every level.
+        want_level(texture, 0);
+        let more = host_copy(texture).unwrap();
+        assert!(more.serial != fewer.serial && more.base == 0);
     }
 
     /// More textures than fit a made-up budget, as the pass over textures

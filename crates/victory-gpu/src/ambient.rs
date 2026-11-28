@@ -804,6 +804,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[10] = air().to_bits();
     // (No floor for reflections: their `place_only` reads no light.)
     words[11] = if role == Role::Miss { 0 } else { floor().to_bits() };
+    // A pass of ours on the card (`host::gpu_split`).
+    list.gpu_kind(crate::host::gpu_split::Kind::Passes);
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states

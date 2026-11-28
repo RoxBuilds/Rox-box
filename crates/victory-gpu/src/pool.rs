@@ -490,6 +490,13 @@ impl<B: Clone> Pool<B> {
         self.blocks.iter().flatten().count()
     }
 
+    /// The bytes free in the blocks now (not those resting) and the largest
+    /// free range of one ([`texture_free`]).
+    fn free(&self) -> (u64, u64) {
+        let ranges = self.blocks.iter().flatten().flat_map(|b| b.free.0.values().copied());
+        ranges.fold((0, 0), |(all, most), len| (all + len, most.max(len)))
+    }
+
     /// Memory ran out: the pieces that rested long enough are free, and empty
     /// blocks go, spare ones too, the last made first, until `need` bytes have
     /// gone: with `trims` those empty for [`TRIM_MS`] (a slot that still shows
@@ -572,6 +579,14 @@ pub(crate) fn texture_room() -> u64 {
     (pool.blocks() as u64 * pool.block).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
+/// What new textures can take of the blocks of textures without a block
+/// more: the bytes free in them now and the largest free range of one
+/// (`crate::resource::fits_pool`). Pieces given back that still rest are
+/// not counted.
+pub(crate) fn texture_free() -> (u64, u64) {
+    lock(&TEXTURES).free()
+}
+
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
@@ -619,6 +634,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::host::commit::allow_staging_growth(false) {
             return None;
         }
+        let _as = crate::host::UploadAs::new(crate::host::NewMemory::UploadStaging);
         let (buffer, data) = host.upload_buffer(block)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         #[cfg(feature = "diagnostics")]
@@ -956,6 +972,29 @@ mod tests {
         // Still inside the window just before it ends, open right at its end.
         assert!(pool.take(24080, 512, 12 + backoff_ms() - 1, || Some(1)).is_none());
         assert!(pool.take(24080, 512, 12 + backoff_ms(), || Some(1)).is_some());
+    }
+
+    /// A piece taken where another lay before is told so (what lies there is
+    /// that one's: `crate::resource::show_written`), and the room free in the
+    /// blocks ([`texture_free`]) is what new textures can take without a
+    /// block more: free ranges alone, not the pieces that still rest.
+    #[test]
+    fn a_piece_taken_again_is_told_and_the_free_room_is_counted() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        assert_eq!(pool.free(), (0, 0));
+        let (a, _, again) = pool.take(BLOCK / 4, 512, 0, || Some(1)).unwrap();
+        assert!(!again, "a new block holds zeros");
+        assert_eq!(pool.free(), (BLOCK * 3 / 4, BLOCK * 3 / 4));
+        let (_b, _, again) = pool.take(BLOCK / 4, 512, 0, || None).unwrap();
+        assert!(!again);
+        pool.give(a, 0);
+        // Resting: not free yet.
+        assert_eq!(pool.free(), (BLOCK / 2, BLOCK / 2));
+        pool.rested(REST);
+        assert_eq!(pool.free(), (BLOCK * 3 / 4, BLOCK / 2));
+        let (c, _, again) = pool.take(BLOCK / 4, 512, REST, || None).unwrap();
+        assert!(again && c.start == a.start, "taken again where the first lay");
+        assert_eq!(pool.free(), (BLOCK / 2, BLOCK / 2));
     }
 
     #[test]

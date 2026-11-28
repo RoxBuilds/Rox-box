@@ -49,8 +49,9 @@ use std::time::{Duration, Instant};
 /// of the last part of a second too; a short run's `[frame_time.steady]` is
 /// by whole seconds, or left without figures when there is none. 4 added
 /// `[memory.map]` and `[memory.map.peak]`: the process's memory by our own
-/// categories.
-pub const FORMAT: u32 = 4;
+/// categories. 5 added `[gpu_time]` and `[gpu_time.steady]`: the card's time
+/// by kind of work, its volumes, and the memory the budget governor saw.
+pub const FORMAT: u32 = 5;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -361,6 +362,14 @@ pub enum Stat {
     PickedReuploadedFull,
     TailCopies,
     TailBytes,
+    /// Host copies made with fewer levels for the card and for the PC's
+    /// commit; copies made whole in the room the blocks of textures had
+    /// free; slots that showed the neutral texture, or fewer levels, instead
+    /// of a copy's memory no upload went into.
+    DetailCutCard,
+    DetailCutPc,
+    PoolRoomWhole,
+    UnwrittenKept,
     // `[memory.views]`: the runtime's views of title pages and the
     // descriptor table's entries of views without a resource.
     /// Views of the host's mapped at title addresses since the start, the
@@ -999,6 +1008,337 @@ fn steady_state(
         figures,
         by_seconds: true,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The card's time by kind of work (`[gpu_time]`, `[gpu_time.steady]`).
+
+/// What the GPU side measures of the card's own time on the host queue, by
+/// kind of work (GPU timestamps, `VICTORY_GPU_SPLIT`), what that work moved,
+/// and what the budget governor saw of memory meanwhile: totals over the
+/// frames of a frame-line second (nanoseconds, bytes, counts), and per look
+/// of the governor. Kept per [`WINDOW_S`] window and per second as the
+/// frame line's figures are, so its steady state is theirs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GpuFigure {
+    /// Frames of the frame meter, and of them those partly measured.
+    Frames,
+    PartlyFrames,
+    /// Nanoseconds by kind, in the order of [`GPU_KINDS`].
+    DrawsNs,
+    DispatchesWave64Ns,
+    DispatchesOtherNs,
+    TitleOtherNs,
+    FillsNs,
+    HashesNs,
+    ComparesNs,
+    CopyBacksNs,
+    UploadsNs,
+    TextureUploadsNs,
+    OtherPassesNs,
+    UnattributedNs,
+    /// The volumes: fills done on the card and their bytes, hash passes and
+    /// the bytes they read, compare passes and theirs, bytes fetched back,
+    /// ranges sent up and their bytes, bytes of textures uploaded.
+    Fills,
+    FillBytes,
+    HashPasses,
+    HashedBytes,
+    ComparePasses,
+    ComparedBytes,
+    CopiedBackBytes,
+    UploadRanges,
+    UploadedBytes,
+    TextureBytes,
+    /// The governor's looks that knew the card's memory: their sums of use
+    /// and budget of the card's own and of the shared memory, the most used.
+    Looks,
+    CardUsedSum,
+    CardBudgetSum,
+    CardUsedPeak,
+    SharedUsedSum,
+    SharedBudgetSum,
+    SharedUsedPeak,
+    /// The looks that knew free memory, its sum, and the lowest (kept as
+    /// its bitwise complement, so that the most kept is the lowest seen; 0:
+    /// none).
+    RamLooks,
+    FreeRamSum,
+    FreeRamLowestNot,
+    /// Looks with the card's memory past its budget, and with free memory
+    /// under [`LOW_RAM`].
+    CardOverLooks,
+    RamLowLooks,
+}
+
+const GPU_FIGS: usize = GpuFigure::RamLowLooks as usize + 1;
+
+/// The kinds of the card's time, in order, under their keys.
+pub const GPU_KINDS: [GpuFigure; 12] = [
+    GpuFigure::DrawsNs,
+    GpuFigure::DispatchesWave64Ns,
+    GpuFigure::DispatchesOtherNs,
+    GpuFigure::TitleOtherNs,
+    GpuFigure::FillsNs,
+    GpuFigure::HashesNs,
+    GpuFigure::ComparesNs,
+    GpuFigure::CopyBacksNs,
+    GpuFigure::UploadsNs,
+    GpuFigure::TextureUploadsNs,
+    GpuFigure::OtherPassesNs,
+    GpuFigure::UnattributedNs,
+];
+
+const GPU_KIND_KEYS: [&str; 12] = [
+    "draws_ms",
+    "dispatches_wave64_ms",
+    "dispatches_other_ms",
+    "title_other_ms",
+    "fills_ms",
+    "hashes_ms",
+    "compares_ms",
+    "copy_backs_ms",
+    "uploads_ms",
+    "texture_uploads_ms",
+    "other_passes_ms",
+    "unattributed_ms",
+];
+
+/// How many of [`GPU_KINDS`] are the title's (the rest are ours, then the
+/// unattributed).
+const GPU_TITLE_KINDS: usize = 4;
+
+/// Free memory under which a look counts as low: 512 MiB.
+pub const LOW_RAM: u64 = 512 << 20;
+
+/// Whether a figure is the most of its windows (else their sum).
+fn gpu_most(f: usize) -> bool {
+    [GpuFigure::CardUsedPeak, GpuFigure::SharedUsedPeak, GpuFigure::FreeRamLowestNot]
+        .iter()
+        .any(|&m| m as usize == f)
+}
+
+static GPU_WINDOWS: [[AtomicU64; GPU_FIGS]; WINDOWS] = [const { [const { AtomicU64::new(0) }; GPU_FIGS] }; WINDOWS];
+static GPU_SECONDS: [[AtomicU64; GPU_FIGS]; SECONDS_KEPT] =
+    [const { [const { AtomicU64::new(0) }; GPU_FIGS] }; SECONDS_KEPT];
+
+/// Whether the split is measured: 0 no word yet, else [`GpuSplit`] + 1.
+static GPU_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// What the GPU side says of its split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GpuSplit {
+    /// Measured.
+    On,
+    /// `VICTORY_GPU_SPLIT=0`.
+    Off,
+    /// The driver refused timestamp queries on the host queue.
+    Refused,
+    /// On, and no list has marked a run yet.
+    NotStarted,
+}
+
+impl GpuSplit {
+    const fn key(self) -> &'static str {
+        match self {
+            GpuSplit::On => "on",
+            GpuSplit::Off => "off",
+            GpuSplit::Refused => "refused_by_driver",
+            GpuSplit::NotStarted => "not_started",
+        }
+    }
+}
+
+/// Adds `values` to the window and second of now (`*Peak` and
+/// `FreeRamLowestNot` keep the most).
+fn gpu_add(values: &[(GpuFigure, u64)]) {
+    let now = now_us();
+    let window = &GPU_WINDOWS[window_of(now)];
+    let second = second_of(now).map(|s| &GPU_SECONDS[s]);
+    for &(figure, value) in values {
+        let f = figure as usize;
+        for at in std::iter::once(window).chain(second) {
+            if gpu_most(f) {
+                at[f].fetch_max(value, Relaxed);
+            } else {
+                at[f].fetch_add(value, Relaxed);
+            }
+        }
+    }
+}
+
+/// The card's time by kind and the volumes of a frame-line second (and of
+/// the run's last part of one), as totals over its frames; and the split's
+/// state.
+pub fn gpu_time(state: GpuSplit, values: &[(GpuFigure, u64)]) {
+    if !ACTIVE.load(Relaxed) {
+        return;
+    }
+    GPU_STATE.store(state as u64 + 1, Relaxed);
+    gpu_add(values);
+}
+
+/// One look of the budget governor (about once a second): the card's own
+/// memory and the shared memory as `[budget, used]` bytes (zeros while not
+/// known), free physical memory (`u64::MAX` while not known).
+pub fn gpu_time_look(card: [u64; 2], shared: [u64; 2], free_ram: u64) {
+    if !ACTIVE.load(Relaxed) {
+        return;
+    }
+    if card[0] > 0 {
+        gpu_add(&[
+            (GpuFigure::Looks, 1),
+            (GpuFigure::CardBudgetSum, card[0]),
+            (GpuFigure::CardUsedSum, card[1]),
+            (GpuFigure::CardUsedPeak, card[1]),
+            (GpuFigure::SharedBudgetSum, shared[0]),
+            (GpuFigure::SharedUsedSum, shared[1]),
+            (GpuFigure::SharedUsedPeak, shared[1]),
+            (GpuFigure::CardOverLooks, u64::from(card[1] > card[0])),
+        ]);
+    }
+    if free_ram != u64::MAX {
+        gpu_add(&[
+            (GpuFigure::RamLooks, 1),
+            (GpuFigure::FreeRamSum, free_ram),
+            (GpuFigure::FreeRamLowestNot, !free_ram),
+            (GpuFigure::RamLowLooks, u64::from(free_ram < LOW_RAM)),
+        ]);
+    }
+}
+
+/// `windows` folded into one: summed, the most where a figure keeps it.
+fn gpu_fold<'a>(windows: impl Iterator<Item = &'a [u64; GPU_FIGS]>) -> [u64; GPU_FIGS] {
+    let mut out = [0u64; GPU_FIGS];
+    for w in windows {
+        for (f, &v) in w.iter().enumerate() {
+            out[f] = if gpu_most(f) { out[f].max(v) } else { out[f].saturating_add(v) };
+        }
+    }
+    out
+}
+
+/// The card's time over the run and at the steady state the frame line's
+/// figures have (`steady`, from the first present at `first_us`): the same
+/// windows, or for a short run the same seconds.
+fn gpu_steady(
+    steady: &Steady,
+    first_us: u64,
+    windows: &[[u64; GPU_FIGS]],
+    seconds: &[[u64; GPU_FIGS]],
+) -> [u64; GPU_FIGS] {
+    if steady.by_seconds {
+        let skip = (steady.from_us.saturating_sub(first_us) / 1_000_000) as usize + 1;
+        gpu_fold(seconds.iter().skip(skip))
+    } else {
+        gpu_fold(windows.iter().skip((steady.from_us / WINDOW_US) as usize))
+    }
+}
+
+/// What the report says of the card's time.
+#[derive(Clone, Debug, PartialEq)]
+struct GpuTime {
+    state: Option<GpuSplit>,
+    whole: [u64; GPU_FIGS],
+    /// At the steady state (`None` where `[frame_time.steady]` has none).
+    steady: Option<[u64; GPU_FIGS]>,
+}
+
+impl GpuTime {
+    fn take(windows_used: usize, first_us: Option<u64>, steady: Option<&Steady>) -> GpuTime {
+        let take = |w: &[AtomicU64; GPU_FIGS]| -> [u64; GPU_FIGS] { std::array::from_fn(|f| w[f].load(Relaxed)) };
+        let windows: Vec<[u64; GPU_FIGS]> = GPU_WINDOWS[..windows_used].iter().map(take).collect();
+        let seconds: Vec<[u64; GPU_FIGS]> = GPU_SECONDS.iter().map(take).collect();
+        let state = match GPU_STATE.load(Relaxed) {
+            1 => Some(GpuSplit::On),
+            2 => Some(GpuSplit::Off),
+            3 => Some(GpuSplit::Refused),
+            4 => Some(GpuSplit::NotStarted),
+            _ => None,
+        };
+        GpuTime {
+            state,
+            whole: gpu_fold(windows.iter()),
+            steady: steady.zip(first_us).map(|(s, first)| gpu_steady(s, first, &windows, &seconds)),
+        }
+    }
+}
+
+/// `[gpu_time]` and `[gpu_time.steady]`.
+fn gpu_time_sections(d: &mut Doc, g: &GpuTime, steady: Option<&Steady>, presented: bool) {
+    d.table("gpu_time");
+    d.comment("the card's own time on the host queue per frame by kind of work, ms (GPU timestamps around");
+    d.comment("runs of commands of one kind; VICTORY_GPU_SPLIT), what our work moved, MB (10^6 bytes), and");
+    d.comment("the memory the budget governor saw meanwhile, MiB; whole run here, [gpu_time.steady] as");
+    d.comment("[frame_time.steady]");
+    d.word("split", Ours(g.state.map_or("not_known", GpuSplit::key)));
+    gpu_time_figures(d, &g.whole);
+    d.table("gpu_time.steady");
+    match (&g.steady, steady) {
+        (Some(f), Some(s)) => {
+            d.float("from_s", s.from_us as f64 / 1e6);
+            gpu_time_figures(d, f);
+        }
+        _ if presented => d.comment("none (see [frame_time.steady])"),
+        _ => d.comment("no present yet"),
+    }
+}
+
+/// The card's time of `f` per frame, its volumes, the memory meanwhile.
+fn gpu_time_figures(d: &mut Doc, f: &[u64; GPU_FIGS]) {
+    let get = |figure: GpuFigure| f[figure as usize];
+    let frames = get(GpuFigure::Frames);
+    let per = |v: u64, scale: f64| v as f64 / scale / frames.max(1) as f64;
+    d.int("frames", frames);
+    d.float("partly_measured_pct", 100.0 * get(GpuFigure::PartlyFrames) as f64 / frames.max(1) as f64);
+    d.comment("the title's work");
+    let ns: Vec<u64> = GPU_KINDS.iter().map(|&k| get(k)).collect();
+    for (i, (&key, &n)) in GPU_KIND_KEYS.iter().zip(&ns).enumerate() {
+        match i {
+            GPU_TITLE_KINDS => d.comment("ours"),
+            11 => d.comment("runs no one kind could be given (past the frame's budget of boundaries)"),
+            _ => {}
+        }
+        d.float(key, per(n, 1e6));
+    }
+    let title: u64 = ns[..GPU_TITLE_KINDS].iter().sum();
+    let ours: u64 = ns[GPU_TITLE_KINDS..11].iter().sum();
+    d.comment("sums: the title's, ours, and all measured (the unattributed with them)");
+    d.float("title_ms", per(title, 1e6));
+    d.float("ours_ms", per(ours, 1e6));
+    d.float("measured_ms", per(ns.iter().sum(), 1e6));
+    d.comment("what our work moved, per frame");
+    d.float("fills", per(get(GpuFigure::Fills), 1.0));
+    d.float("fills_mb", per(get(GpuFigure::FillBytes), 1e6));
+    d.float("hash_passes", per(get(GpuFigure::HashPasses), 1.0));
+    d.float("hashed_mb", per(get(GpuFigure::HashedBytes), 1e6));
+    d.float("compare_passes", per(get(GpuFigure::ComparePasses), 1.0));
+    d.float("compared_mb", per(get(GpuFigure::ComparedBytes), 1e6));
+    d.float("copied_back_mb", per(get(GpuFigure::CopiedBackBytes), 1e6));
+    d.float("upload_ranges", per(get(GpuFigure::UploadRanges), 1.0));
+    d.float("uploaded_mb", per(get(GpuFigure::UploadedBytes), 1e6));
+    d.float("texture_uploads_mb", per(get(GpuFigure::TextureBytes), 1e6));
+    d.comment("memory while those frames ran: the budget governor's looks (about one a second), MiB");
+    let looks = get(GpuFigure::Looks);
+    let mib = |v: u64| v as f64 / (1u64 << 20) as f64;
+    let avg = |sum: GpuFigure, n: u64| mib(get(sum)) / n.max(1) as f64;
+    d.int("governor_looks", looks);
+    d.float("card_used_mib_avg", avg(GpuFigure::CardUsedSum, looks));
+    d.float("card_used_mib_peak", mib(get(GpuFigure::CardUsedPeak)));
+    d.float("card_budget_mib_avg", avg(GpuFigure::CardBudgetSum, looks));
+    d.float("shared_used_mib_avg", avg(GpuFigure::SharedUsedSum, looks));
+    d.float("shared_used_mib_peak", mib(get(GpuFigure::SharedUsedPeak)));
+    d.float("shared_budget_mib_avg", avg(GpuFigure::SharedBudgetSum, looks));
+    let ram_looks = get(GpuFigure::RamLooks);
+    d.float("free_ram_mib_avg", avg(GpuFigure::FreeRamSum, ram_looks));
+    match get(GpuFigure::FreeRamLowestNot) {
+        0 => d.comment("free_ram_mib_lowest: not seen"),
+        not => d.float("free_ram_mib_lowest", mib(!not)),
+    }
+    d.int("looks_card_over_budget", get(GpuFigure::CardOverLooks));
+    d.int("looks_free_ram_under_512_mib", get(GpuFigure::RamLowLooks));
 }
 
 // ---------------------------------------------------------------------------
@@ -2174,6 +2514,8 @@ struct Snapshot {
     other_imports: (u64, u64),
     /// The memory map ([`Part`]).
     map: MapSnapshot,
+    /// The card's time by kind (`[gpu_time]`).
+    gpu_time: GpuTime,
 }
 
 impl Snapshot {
@@ -2237,6 +2579,7 @@ impl Snapshot {
             imports,
             other_imports,
             map: map_take(),
+            gpu_time: GpuTime::take(windows_used, first_present_us, steady.as_ref()),
         }
     }
 
@@ -2696,6 +3039,7 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
         Some(steady) => spared(d, &steady.figures),
         None => d.comment("none (see [frame_time.steady])"),
     }
+    gpu_time_sections(d, &s.gpu_time, s.steady.as_ref(), s.first_present_us.is_some());
 
     d.table("pipelines");
     d.int("created_by_title", s.stat(Stat::PipelinesCreated));
@@ -2795,6 +3139,10 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     d.int("uploaded_again_while_full", s.stat(Stat::PickedReuploadedFull));
     d.int("smallest_levels_only", s.stat(Stat::TailCopies));
     d.int("smallest_levels_only_mib", s.stat(Stat::TailBytes) >> 20);
+    d.int("detail_cut_for_card", s.stat(Stat::DetailCutCard));
+    d.int("detail_cut_for_pc", s.stat(Stat::DetailCutPc));
+    d.int("made_whole_in_pool_room", s.stat(Stat::PoolRoomWhole));
+    d.int("not_shown_unwritten", s.stat(Stat::UnwrittenKept));
     d.comment("texture refreshes on all threads, ms per frame (whole run, steady state)");
     let refresh = |f: &[u64; FIGS]| {
         f[Figure::RefreshAllUs as usize] as f64 / 1e3 / f[Figure::Frames as usize].max(1) as f64
@@ -3253,7 +3601,153 @@ mod tests {
             imports: vec![("kernel32.dll!SomeFunction".into(), 1)],
             other_imports: (2, 5),
             map: synthetic_map(),
+            gpu_time: synthetic_gpu_time(),
         }
+    }
+
+    /// `[gpu_time]` of 1,000 frames, its steady state of 370, from per-frame
+    /// figures (ms by kind, then the volumes) and the governor's looks.
+    fn synthetic_gpu_time() -> GpuTime {
+        use GpuFigure as G;
+        let of = |frames: u64, partly: u64, ms: [f64; 12], volumes: [f64; 10], looks: u64| {
+            let mut f = [0u64; GPU_FIGS];
+            f[G::Frames as usize] = frames;
+            f[G::PartlyFrames as usize] = partly;
+            for (k, ms) in GPU_KINDS.iter().zip(ms) {
+                f[*k as usize] = (ms * 1e6 * frames as f64).round() as u64;
+            }
+            let volume = [
+                G::Fills,
+                G::FillBytes,
+                G::HashPasses,
+                G::HashedBytes,
+                G::ComparePasses,
+                G::ComparedBytes,
+                G::CopiedBackBytes,
+                G::UploadRanges,
+                G::UploadedBytes,
+                G::TextureBytes,
+            ];
+            for (v, per) in volume.iter().zip(volumes) {
+                f[*v as usize] = (per * frames as f64).round() as u64;
+            }
+            let mib = |n: u64| n << 20;
+            f[G::Looks as usize] = looks;
+            f[G::CardUsedSum as usize] = looks * mib(7_100);
+            f[G::CardBudgetSum as usize] = looks * mib(7_600);
+            f[G::CardUsedPeak as usize] = mib(7_300);
+            f[G::SharedUsedSum as usize] = looks * mib(4_800);
+            f[G::SharedBudgetSum as usize] = looks * mib(7_900);
+            f[G::SharedUsedPeak as usize] = mib(5_100);
+            f[G::RamLooks as usize] = looks;
+            f[G::FreeRamSum as usize] = looks * mib(900);
+            f[G::FreeRamLowestNot as usize] = !mib(612);
+            f[G::CardOverLooks as usize] = 3;
+            f
+        };
+        let volumes = [2_800.0, 0.9e6, 80.0, 10.5e6, 7.0, 488e6, 3.2e6, 580.0, 52e6, 1.5e6];
+        GpuTime {
+            state: Some(GpuSplit::On),
+            whole: of(1_000, 20, [6.0, 3.5, 1.2, 0.4, 0.8, 2.1, 1.3, 0.3, 0.6, 0.2, 0.5, 0.1], volumes, 60),
+            steady: Some(of(370, 0, [5.5, 3.6, 1.1, 0.3, 0.8, 2.0, 1.3, 0.3, 0.5, 0.1, 0.4, 0.0], volumes, 20)),
+        }
+    }
+
+    /// `[gpu_time]` and its steady state say every kind, the sums, the
+    /// volumes and the memory; the title's and ours add up to what was
+    /// measured, less what could not be given a kind.
+    #[test]
+    fn the_gpu_time_says_its_kinds_their_sums_and_the_memory() {
+        let text = render(&synthetic());
+        let parsed: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        let gpu = &parsed["gpu_time"];
+        assert_eq!(gpu["split"].as_str(), Some("on"));
+        for section in [gpu, &gpu["steady"]] {
+            for key in GPU_KIND_KEYS.iter().chain(&[
+                "frames",
+                "partly_measured_pct",
+                "title_ms",
+                "ours_ms",
+                "measured_ms",
+                "fills",
+                "fills_mb",
+                "hashed_mb",
+                "compared_mb",
+                "copied_back_mb",
+                "uploaded_mb",
+                "texture_uploads_mb",
+                "governor_looks",
+                "card_used_mib_avg",
+                "card_used_mib_peak",
+                "card_budget_mib_avg",
+                "shared_used_mib_avg",
+                "shared_used_mib_peak",
+                "shared_budget_mib_avg",
+                "free_ram_mib_avg",
+                "free_ram_mib_lowest",
+                "looks_card_over_budget",
+                "looks_free_ram_under_512_mib",
+            ]) {
+                assert!(section.get(*key).is_some(), "no {key} in\n{text}");
+            }
+            let f = |k: &str| section[k].as_float().unwrap();
+            let kinds: f64 = GPU_KIND_KEYS.iter().map(|k| f(k)).sum();
+            assert!((f("measured_ms") - kinds).abs() < 0.05, "{text}");
+            assert!((f("title_ms") + f("ours_ms") + f("unattributed_ms") - f("measured_ms")).abs() < 0.05);
+        }
+        assert_eq!(gpu["frames"].as_integer(), Some(1_000));
+        assert_eq!(gpu["draws_ms"].as_float(), Some(6.0));
+        assert_eq!(gpu["measured_ms"].as_float(), Some(17.0));
+        assert_eq!(gpu["partly_measured_pct"].as_float(), Some(2.0));
+        assert_eq!(gpu["hashed_mb"].as_float(), Some(10.5));
+        assert_eq!(gpu["compared_mb"].as_float(), Some(488.0));
+        assert_eq!(gpu["free_ram_mib_lowest"].as_float(), Some(612.0));
+        assert_eq!(gpu["card_used_mib_avg"].as_float(), Some(7_100.0));
+        assert_eq!(gpu["looks_card_over_budget"].as_integer(), Some(3));
+        assert_eq!(gpu["steady"]["from_s"].as_float(), Some(40.0));
+        assert_eq!(gpu["steady"]["frames"].as_integer(), Some(370));
+    }
+
+    /// With the split off nothing is measured and the report says so; a run
+    /// with no steady state has none here either; no look of the governor
+    /// leaves the lowest free memory unsaid.
+    #[test]
+    fn the_gpu_time_says_when_it_is_off_or_has_no_steady_state() {
+        let off = GpuTime { state: Some(GpuSplit::Off), whole: [0; GPU_FIGS], steady: None };
+        let text = render(&Snapshot { steady: None, gpu_time: off, ..synthetic() });
+        let parsed: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        assert_eq!(parsed["gpu_time"]["split"].as_str(), Some("off"));
+        assert_eq!(parsed["gpu_time"]["measured_ms"].as_float(), Some(0.0));
+        assert!(parsed["gpu_time"].get("free_ram_mib_lowest").is_none(), "{text}");
+        assert!(parsed["gpu_time"]["steady"].as_table().unwrap().is_empty(), "{text}");
+        assert!(text.contains("[gpu_time.steady]\n# none (see [frame_time.steady])"), "{text}");
+    }
+
+    /// The most-kept figures fold as the most, the others as sums; the steady
+    /// state takes the windows (or a short run's seconds) the frame line's
+    /// figures take.
+    #[test]
+    fn the_gpu_figures_fold_by_their_rule_over_the_steady_windows() {
+        let mut a = [0u64; GPU_FIGS];
+        let mut b = [0u64; GPU_FIGS];
+        a[GpuFigure::DrawsNs as usize] = 5;
+        b[GpuFigure::DrawsNs as usize] = 7;
+        a[GpuFigure::CardUsedPeak as usize] = 9;
+        b[GpuFigure::CardUsedPeak as usize] = 4;
+        a[GpuFigure::FreeRamLowestNot as usize] = !100;
+        b[GpuFigure::FreeRamLowestNot as usize] = !80;
+        let folded = gpu_fold([a, b].iter());
+        assert_eq!(folded[GpuFigure::DrawsNs as usize], 12);
+        assert_eq!(folded[GpuFigure::CardUsedPeak as usize], 9);
+        assert_eq!(!folded[GpuFigure::FreeRamLowestNot as usize], 80);
+        // Windows from 40 s on: the fifth and sixth.
+        let windows = [a, a, a, a, b, b];
+        let steady = Steady { from_us: 40_000_000, figures: [0; FIGS], by_seconds: false };
+        assert_eq!(gpu_steady(&steady, 21_300_000, &windows, &[])[GpuFigure::DrawsNs as usize], 14);
+        // A short run: the seconds after the one `from_s` begins.
+        let seconds = [a, a, a, b];
+        let short = Steady { from_us: 4_000_000, figures: [0; FIGS], by_seconds: true };
+        assert_eq!(gpu_steady(&short, 2_000_000, &[], &seconds)[GpuFigure::DrawsNs as usize], 7);
     }
 
     #[test]
@@ -3810,6 +4304,28 @@ mod tests {
         assert!(total(&after) - total(&before) >= 5_000);
         assert!(after.stat(Stat::CardOverBudgetLooks) > before.stat(Stat::CardOverBudgetLooks));
         assert!(after.lowest[0] <= 1 << 20 && after.lowest[1] <= 3 << 20);
+    }
+
+    /// The GPU side's split and the governor's looks reach `[gpu_time]`: the
+    /// sums grow, the peak and the lowest free memory are the most and the
+    /// least seen.
+    #[test]
+    fn the_gpu_split_and_the_governor_feed_the_gpu_time() {
+        ACTIVE.store(true, Relaxed);
+        let before = Snapshot::take().gpu_time.whole;
+        gpu_time(GpuSplit::On, &[(GpuFigure::Frames, 30), (GpuFigure::HashesNs, 4_000_000), (GpuFigure::HashedBytes, 9)]);
+        gpu_time_look([8 << 30, 9 << 30], [8 << 30, 1 << 30], 300 << 20);
+        gpu_time_look([0, 0], [0, 0], u64::MAX);
+        let after = Snapshot::take().gpu_time;
+        let grew = |f: GpuFigure| after.whole[f as usize] - before[f as usize];
+        assert!(grew(GpuFigure::Frames) >= 30);
+        assert!(grew(GpuFigure::HashesNs) >= 4_000_000);
+        assert!(grew(GpuFigure::Looks) >= 1);
+        assert!(grew(GpuFigure::CardOverLooks) >= 1);
+        assert!(grew(GpuFigure::RamLowLooks) >= 1);
+        assert!(after.whole[GpuFigure::CardUsedPeak as usize] >= 9 << 30);
+        assert!(!after.whole[GpuFigure::FreeRamLowestNot as usize] <= 300 << 20);
+        assert_eq!(after.state, Some(GpuSplit::On));
     }
 
     #[test]

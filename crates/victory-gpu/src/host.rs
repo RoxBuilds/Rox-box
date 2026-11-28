@@ -249,11 +249,23 @@ pub(crate) enum NewMemory {
     Texture,
     /// A depth texture's colour twin (`crate::resource`).
     Twin,
-    /// An upload buffer ([`Host::upload_buffer`]).
+    /// An upload buffer ([`Host::upload_buffer`]) none of those below is.
     Upload,
-    /// A buffer of the PC's memory the card shares ([`Host::shared_buffer`]):
-    /// host copies of title buffers, windows.
+    /// Upload buffers by what they were made for ([`UploadAs`]): a chunk of
+    /// the lists' scratch (the reserve's too), one for a list's copy
+    /// (`HostList::upload`), one for a list's scratch ask longer than a
+    /// chunk, a block of texture staging (`crate::pool`).
+    UploadScratch,
+    UploadListCopy,
+    UploadLongScratch,
+    UploadStaging,
+    /// A buffer of the PC's memory the card shares ([`Host::shared_buffer`])
+    /// none of those below is.
     Shared,
+    /// The same for a window of title memory outside buffers, and for a copy
+    /// of a title buffer (`crate::shadow`, [`SharedAs`]).
+    SharedWindow,
+    SharedTitleCopy,
     /// The same for a copy of a buffer view's own bytes
     /// (`crate::shadow::exact`, [`SharedAs`]).
     ViewBytes,
@@ -266,12 +278,18 @@ pub(crate) enum NewMemory {
 }
 
 impl NewMemory {
-    const ALL: [NewMemory; 9] = [
+    const ALL: [NewMemory; 15] = [
         NewMemory::TextureBlock,
         NewMemory::Texture,
         NewMemory::Twin,
         NewMemory::Upload,
+        NewMemory::UploadScratch,
+        NewMemory::UploadListCopy,
+        NewMemory::UploadLongScratch,
+        NewMemory::UploadStaging,
         NewMemory::Shared,
+        NewMemory::SharedWindow,
+        NewMemory::SharedTitleCopy,
         NewMemory::ViewBytes,
         NewMemory::ViewBlock,
         NewMemory::CardMapped,
@@ -283,8 +301,14 @@ impl NewMemory {
             NewMemory::TextureBlock => "blocks of textures",
             NewMemory::Texture => "textures of their own",
             NewMemory::Twin => "depth twins",
-            NewMemory::Upload => "upload buffers",
+            NewMemory::Upload => "other upload buffers",
+            NewMemory::UploadScratch => "upload buffers: lists' scratch chunks",
+            NewMemory::UploadListCopy => "upload buffers: one per list copy",
+            NewMemory::UploadLongScratch => "upload buffers: list scratch asks longer than a chunk",
+            NewMemory::UploadStaging => "upload buffers: blocks of texture staging",
             NewMemory::Shared => "other buffers of shared memory",
+            NewMemory::SharedWindow => "shared memory: windows of title memory",
+            NewMemory::SharedTitleCopy => "shared memory: copies of title buffers",
             NewMemory::ViewBytes => "copies of views' own bytes",
             NewMemory::ViewBlock => "blocks of copies of views' own bytes",
             NewMemory::CardMapped => "card buffers the CPU maps",
@@ -312,6 +336,30 @@ impl SharedAs {
 impl Drop for SharedAs {
     fn drop(&mut self) {
         SHARED_AS.set(self.0);
+    }
+}
+
+thread_local! {
+    /// What an upload buffer made on this thread is, for the line of
+    /// [`resident`] ([`UploadAs`]).
+    static UPLOAD_AS: std::cell::Cell<NewMemory> = const { std::cell::Cell::new(NewMemory::Upload) };
+}
+
+/// Sets what upload buffers made on this thread are while it lives
+/// ([`UPLOAD_AS`]), and gives back what it was then: the line of the waits
+/// said "upload buffers" of all of them, and on a PC short of memory they
+/// were a tenth of a run.
+pub(crate) struct UploadAs(NewMemory);
+
+impl UploadAs {
+    pub(crate) fn new(kind: NewMemory) -> UploadAs {
+        UploadAs(UPLOAD_AS.replace(kind))
+    }
+}
+
+impl Drop for UploadAs {
+    fn drop(&mut self) {
+        UPLOAD_AS.set(self.0);
     }
 }
 
@@ -2005,6 +2053,10 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Where runs of each kind of work begin in the list, and in its
+    /// prelude ([`gpu_split`]).
+    gpu_marks: gpu_split::Marks,
+    prelude_marks: gpu_split::Marks,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2970,6 +3022,11 @@ impl<T> Spare<T> {
         self.take_out(floor, need, |_| true)
     }
 
+    /// [`Spare::above`] of those given `idle_ms` or more before `now` only.
+    fn above_idle(&mut self, floor: u64, need: u64, now: u64, idle_ms: u64) -> Vec<(T, u64)> {
+        self.take_out(floor, need, |given| now.saturating_sub(given) >= idle_ms)
+    }
+
     fn take_out(&mut self, floor: u64, need: u64, idle: impl Fn(u64) -> bool) -> Vec<(T, u64)> {
         let (mut out, mut freed) = (Vec::new(), 0u64);
         let mut stay = Vec::with_capacity(self.kept.len());
@@ -3123,6 +3180,7 @@ fn fill_reserve(host: &Host) {
     static FILLED: std::sync::Once = std::sync::Once::new();
     FILLED.call_once(|| {
         let mut made = Vec::new();
+        let _as = UploadAs::new(NewMemory::UploadScratch);
         for size in reserve_plan(reserve_bytes()) {
             let Some((buffer, data)) = host.upload_buffer(size) else {
                 break;
@@ -3222,6 +3280,7 @@ fn take_chunk(host: &Host, size: u64, least: u64) -> Option<(Chunk, u64)> {
         fill_reserve(host);
     }
     let make = |size: u64| {
+        let _as = UploadAs::new(NewMemory::UploadScratch);
         // (Refused ones are asked for again, `upload_retry`.)
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || "list scratch".into());
@@ -3243,6 +3302,9 @@ fn take_chunk(host: &Host, size: u64, least: u64) -> Option<(Chunk, u64)> {
         Came::Made => {
             ALIVE[1].fetch_add(1, Ordering::Relaxed);
             ALIVE[2].fetch_add(got, Ordering::Relaxed);
+            if made_again(LAST_RELIEF_MS.load(Ordering::Relaxed), coarse_ms()) {
+                SCRATCH_RELIEF[0].fetch_add(1, Ordering::Relaxed);
+            }
         }
         // (Counted alive since it was made.)
         Came::Reserve => {}
@@ -3356,6 +3418,22 @@ fn scratch_decay(now: u64) {
 /// bytes have gone; their bytes. The pool's lock is only tried: the caller
 /// may hold it.
 fn scratch_relieve(need: u64) -> u64 {
+    scratch_relieve_by(need, None)
+}
+
+/// The PC's memory is at red (`budget::tend`): [`scratch_relieve`], but with
+/// [`ScratchRelief::Idle`] only of chunks no list has had for [`decay_ms`].
+fn scratch_relieve_at_red(need: u64) -> u64 {
+    let idle = (scratch_relief() == ScratchRelief::Idle).then(decay_ms);
+    let bytes = scratch_relieve_by(need, idle);
+    SCRATCH_RELIEF[1].fetch_add(bytes, Ordering::Relaxed);
+    bytes
+}
+
+/// [`scratch_relieve`] of the chunks given back `idle` ms or more ago, with
+/// it; else of any.
+fn scratch_relieve_by(need: u64, idle: Option<u64>) -> u64 {
+    let now = coarse_ms();
     let gone = {
         let mut pools = match POOLS.try_lock() {
             Ok(pools) => pools,
@@ -3363,11 +3441,98 @@ fn scratch_relieve(need: u64) -> u64 {
             Err(std::sync::TryLockError::WouldBlock) => return 0,
         };
         let floor = spare_floor(&mut pools);
-        pools.spare.above(floor, need)
+        match idle {
+            Some(idle_ms) => pools.spare.above_idle(floor, need, now, idle_ms),
+            None => pools.spare.above(floor, need),
+        }
     };
     let bytes = let_go_spare(gone);
     SCRATCH_STATS[4].fetch_add(bytes, Ordering::Relaxed);
+    if bytes > 0 {
+        LAST_RELIEF_MS.store(now.max(1), Ordering::Relaxed);
+    }
     bytes
+}
+
+/// [`scratch_relief`]: the rule at red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchRelief {
+    Idle,
+    Floor,
+}
+
+fn scratch_relief_of(value: Option<&str>) -> ScratchRelief {
+    match value.map(str::trim) {
+        Some("floor") => ScratchRelief::Floor,
+        _ => ScratchRelief::Idle,
+    }
+}
+
+/// Which spare chunks of the lists' scratch the budget governor lets go of
+/// while the PC's memory is at red (`VICTORY_SCRATCH_RELIEF`, read once:
+/// `idle`, the default, or `floor`, the rule before it).
+///
+/// The rule before let go of spare chunks above the floor (half of what the
+/// lists held at most in the last five seconds), the longest idle first,
+/// however short a time ago a list had them: once a second while the PC sat
+/// at red, and the next frame made them again, each a new upload buffer made
+/// resident while memory was short. Letting go of what the next frame takes
+/// again frees nothing for long and costs the making. With `idle` the look
+/// at red lets go only of chunks no list has had for [`decay_ms`] (as the
+/// sweep does, but at red, and down to the same floor). A relief after an
+/// allocation was refused lets go of any above the floor, as before.
+fn scratch_relief() -> ScratchRelief {
+    static RELIEF: OnceLock<ScratchRelief> = OnceLock::new();
+    *RELIEF.get_or_init(|| scratch_relief_of(std::env::var("VICTORY_SCRATCH_RELIEF").ok().as_deref()))
+}
+
+/// Whether the upload memory a list's copy into a texture reads from, or the
+/// zeros it copies, lies in the list's scratch where it fits a chunk
+/// (`VICTORY_LIST_UPLOAD_SCRATCH`, on unless `0`: an upload buffer of its own
+/// for each copy, made and let go of with the list, as before). Each was a
+/// new allocation made resident (on a PC short of memory, tens of
+/// milliseconds for the big ones); a scratch chunk is made once and kept for
+/// the next list. The card reads the same bytes either way.
+fn list_upload_scratch() -> bool {
+    crate::toggled!("VICTORY_LIST_UPLOAD_SCRATCH")
+}
+
+/// When a relief last let go of spare scratch ([`coarse_ms`]; 0: never).
+static LAST_RELIEF_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the start: scratch chunks made within [`REMADE_MS`] of a relief that
+/// let go of spare scratch; and the bytes the looks at red let go of.
+static SCRATCH_RELIEF: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How soon after a relief a chunk made counts as made again.
+const REMADE_MS: u64 = 2000;
+
+/// Whether a chunk made at `now` comes within [`REMADE_MS`] of the relief at
+/// `last` (0: none yet).
+fn made_again(last: u64, now: u64) -> bool {
+    last != 0 && now >= last && now - last <= REMADE_MS
+}
+
+/// What the reliefs did to the lists' scratch since the start, said with the
+/// frame line when there was a relief since the last time: the bytes let go
+/// of, those at red, and the chunks made again within 2 s of one.
+fn scratch_relief_line() {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let last = LAST_RELIEF_MS.load(Ordering::Relaxed);
+    if last == 0 || SAID.swap(last, Ordering::Relaxed) == last {
+        return;
+    }
+    tracing::info!(
+        "the lists' spare scratch let go of by reliefs since the start: {:.1} MB, {:.1} MB of it at red; chunks made \
+         again within 2 s of a relief: {} (VICTORY_SCRATCH_RELIEF={})",
+        SCRATCH_STATS[4].load(Ordering::Relaxed) as f64 / 1e6,
+        SCRATCH_RELIEF[1].load(Ordering::Relaxed) as f64 / 1e6,
+        SCRATCH_RELIEF[0].load(Ordering::Relaxed),
+        match scratch_relief() {
+            ScratchRelief::Idle => "idle",
+            ScratchRelief::Floor => "floor",
+        }
+    );
 }
 
 /// For the memory line: what the lists' scratch is now and has done.
@@ -3675,6 +3840,10 @@ struct CardPlan {
     skipped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// What compares it called off wait for ([`card_join`]).
     join: card_join::Plan,
+    /// Where the runs of the lists it sent ahead of the submission's begin,
+    /// in the order they ran, and of its compare ([`gpu_split`]).
+    split_before: Vec<gpu_split::Marks>,
+    split_check: Option<gpu_split::Marks>,
 }
 
 /// Since the start: lists of ours for copies in the card's memory that could
@@ -5343,6 +5512,7 @@ mod card_join;
 mod card_steps;
 #[cfg(feature = "diagnostics")]
 mod frameline;
+pub(crate) mod gpu_split;
 #[cfg(any(test, feature = "diagnostics"))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -5896,6 +6066,8 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
+                gpu_marks: gpu_split::Marks::new(),
+                prelude_marks: gpu_split::Marks::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
@@ -6096,7 +6268,10 @@ impl Host {
         // nothing had), and the ranges put back if not.
         let mut synced = true;
         let mut skipped: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        // Where the list's runs begin, once it went to the queue ([`gpu_split`]).
+        let mut split_sync: Option<gpu_split::Marks> = None;
         if !dirty.is_empty() {
+            let sync_marks = gpu_split::Marks::new();
             // Out of memory for the list, or for recording it: what is idle
             // is let go of, and it is asked for again ([`oom_retry`]).
             let what = "a host list to bring copies in the card's memory up to date";
@@ -6112,6 +6287,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    sync_marks.clear();
+                    sync_marks.mark(list, gpu_split::Kind::Uploads);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -6144,6 +6321,8 @@ impl Host {
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        gpu_split::count(gpu_split::Volume::UploadedBytes, bytes);
+                        gpu_split::count(gpu_split::Volume::UploadRanges, ranges.len() as u64);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         // After upstream GPL-3.0 fork, commit e05d463 "Merge upstream GPL-3.0 fork
@@ -6168,6 +6347,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    sync_marks.mark(list, gpu_split::Kind::Hashes);
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -6199,10 +6379,18 @@ impl Host {
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        gpu_split::count(gpu_split::Volume::HashPasses, runs.len() as u64);
+                        gpu_split::count(
+                            gpu_split::Volume::HashedBytes,
+                            runs.iter().map(|r| gpu_split::pass_bytes(r.first, r.pieces, r.skew, size)).sum(),
+                        );
                         for run in runs {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    // (In a call of its own: what follows it on the queue
+                    // until the submission's lists is not counted.)
+                    sync_marks.end(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -6214,6 +6402,7 @@ impl Host {
                 Ok(sync) => match oom_retry_as(doing, oom_inject(), || record(&sync)) {
                     Ok(()) => {
                         used.push((false, sync));
+                        split_sync = Some(sync_marks);
                         Ok(())
                     }
                     Err(e) => {
@@ -6280,6 +6469,8 @@ impl Host {
             sends: own.map(send::Own::memory),
             skipped,
             join: Default::default(),
+            split_before: split_sync.into_iter().collect(),
+            split_check: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -6337,6 +6528,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
+            let check_marks = gpu_split::Marks::new();
             let what = "a host list for the compare of copies in the card's memory";
             let made = oom_retry_as(what, oom_inject(), || match work.check.pop() {
                 Some(check) => Ok(check),
@@ -6349,6 +6541,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    check_marks.clear();
+                    check_marks.mark(list, gpu_split::Kind::Compares);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6373,6 +6567,11 @@ impl Host {
                         let mode = if r.called.is_some() { 3 } else if flown && !r.picked { 2 } else { 1 };
                         card_pass(list, &r.span, size as u32, r.at, mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        gpu_split::count(gpu_split::Volume::ComparePasses, 1);
+                        gpu_split::count(
+                            gpu_split::Volume::ComparedBytes,
+                            gpu_split::pass_bytes(r.span.first, r.span.pieces, r.span.skew, size),
+                        );
                     }
                     list.Close()?;
                     list.cast()
@@ -6393,6 +6592,7 @@ impl Host {
             match recorded {
                 Ok((check, compare)) => {
                     plan.check = Some(compare);
+                    plan.split_check = Some(check_marks);
                     plan.lists.push((true, check));
                     card_join::after_compare(calls, &plan, all_declared);
                 }
@@ -6658,6 +6858,7 @@ impl Host {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+            gpu_split::count(gpu_split::Volume::CopiedBackBytes, total);
         }
         let mut meanwhile = Some(meanwhile);
         let mut written = 0;
@@ -6684,12 +6885,17 @@ impl Host {
             // them and in what `room` holds. Recorded again if it ran out of
             // memory.
             let what = "recording the relay's fetch of what shaders wrote to the card's memory";
+            // Its time on the card, read after the wait: on the drawing queue
+            // alone (the host queue's timestamps; [`gpu_split`]).
+            let mut split = None;
             let recorded = oom_retry(what, || unsafe {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                let marks = copy_queue.is_none().then(|| gpu_split::alone_begin(&list, gpu_split::Kind::CopyBacks)).flatten();
                 for (shadow, lo, hi, at) in copies {
                     list.CopyBufferRegion(&buffer, *at - base, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                split = gpu_split::alone_end(&list, marks);
                 list.Close()
             });
             if let Err(e) = recorded {
@@ -6749,6 +6955,9 @@ impl Host {
                     "what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)"
                 )),
             };
+            if let Some(split) = split {
+                split.fold();
+            }
             let us = waiting.elapsed().as_micros() as u64;
             RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
             crate::shadow::CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -6939,6 +7148,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
+            gpu_split::landed(last);
             bury(last);
         }
         stage.next("landing: the rest");
@@ -7082,21 +7292,26 @@ impl Host {
                 fetch_turns(pieces.iter().map(|p| (p.2 - p.1) as u64), room).into();
             crate::shadow::CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             crate::shadow::CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+            gpu_split::count(gpu_split::Volume::CopiedBackBytes, total);
             while let Some(turn) = turns.pop_front() {
                 let these = &pieces[turn.clone()];
                 let base = these[0].3;
                 let waiting = std::time::Instant::now();
                 let (allocator, list) = &work.fetch;
+                // Its time on the card, read after the wait ([`gpu_split`]).
+                let mut split = None;
                 // SAFETY: the list's last run was waited for; live buffers,
                 // the pieces lie in them and in what `room` holds. Recorded
                 // again if it ran out of memory.
                 let recorded = oom_retry("recording the fetch of what shaders wrote to the card's memory", || unsafe {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let marks = gpu_split::alone_begin(list, gpu_split::Kind::CopyBacks);
                     for &(i, lo, hi, at) in these {
                         let from = &plan.ranges[i].shadow.buffer;
                         list.CopyBufferRegion(&fetched, at - base, from, lo as u64, (hi - lo) as u64);
                     }
+                    split = gpu_split::alone_end(list, marks);
                     list.Close()
                 });
                 if let Err(e) = recorded {
@@ -7128,6 +7343,9 @@ impl Host {
                 };
                 if let Err(e) = ran {
                     fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
+                }
+                if let Some(split) = split {
+                    split.fold();
                 }
                 crate::shadow::CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 crate::shadow::CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7487,6 +7705,7 @@ impl Host {
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
+                gpu_split::landed(last);
                 bury(last);
             }
             line().landed.extend(landed);
@@ -7737,17 +7956,26 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        // Where the runs of each kind of work begin, in the order the lists
+        // go to the queue ([`gpu_split`]).
+        let mut split_body = gpu_split::Sequence::new();
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(&mut batch) {
                 lists.push(Some(prelude));
+                if let Some(seq) = &mut split_body {
+                    seq.list(&list.prelude_marks);
+                }
             }
             // A list that could not close for want of memory is left out
             // (`HostList::drop_for_memory`); the run's other lists, the fence
             // signal after them and the settling that follows are as ever.
             if !list.dropped_for_memory() {
                 lists.push(list.list.cast().ok());
+                if let Some(seq) = &mut split_body {
+                    seq.list(&list.gpu_marks);
+                }
             }
         }
         batch.fill();
@@ -7786,7 +8014,19 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut card = self.card_before(&declared, &picked, flown);
+        // What the plan sent ahead of the lists (in a call of its own, ahead
+        // of theirs) runs first.
+        let mut gpu_seq = split_body.map(|body| {
+            let mut seq = gpu_split::Sequence::default();
+            if let Some(card) = card.as_mut() {
+                for marks in std::mem::take(&mut card.split_before) {
+                    seq.own(marks);
+                }
+            }
+            seq.append(body);
+            seq
+        });
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -7794,6 +8034,9 @@ impl Host {
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+            if let (Some(seq), Some(marks)) = (&mut gpu_seq, card.as_mut().and_then(|c| c.split_check.take())) {
+                seq.own(marks);
+            }
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
@@ -7819,6 +8062,12 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // The list that ends the submission's timestamps and resolves them
+        // goes last, in its last call ([`gpu_split`]).
+        let split_pending = gpu_seq.and_then(|seq| seq.finish(this_submission)).map(|(list, pending)| {
+            lists.push(Some(list));
+            pending
+        });
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
@@ -7839,6 +8088,9 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if let Some(pending) = split_pending {
+                gpu_split::sent(pending);
+            }
             // What compares this plan called off wait for ([`card_join`]).
             if let Some(card) = &card {
                 card.join.sent(*submitted);
@@ -7941,6 +8193,10 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
+        gpu_split::landed(this_submission);
+        if let Some(pending) = split_pending {
+            pending.fold();
+        }
         bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -8471,6 +8727,9 @@ impl HostList {
         }
         self.dropped.store(false, Ordering::Relaxed);
         self.changed_something();
+        // Every submission of the list has landed: its timestamps were read.
+        self.gpu_marks.clear();
+        self.prelude_marks.clear();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
@@ -8741,6 +9000,7 @@ impl HostList {
         const DEPTH_WRITE: u32 = 0x10;
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let Some(plane) = &twin.plane else { return };
+        self.gpu_kind(gpu_split::Kind::Passes);
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
@@ -8764,6 +9024,7 @@ impl HostList {
         } else {
             (&twin.colour, depth)
         };
+        self.gpu_kind(gpu_split::Kind::Passes);
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
@@ -8823,6 +9084,9 @@ impl HostList {
     fn textures_back(&self) {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        if !wanted.is_empty() {
+            self.gpu_kind(gpu_split::Kind::CopyBacks);
+        }
         for target in wanted {
             self.settle(&target.copy, COPY_SOURCE);
             if let Some(back) = crate::texback::record(&self.list, target) {
@@ -9013,6 +9277,9 @@ impl HostList {
         let recorded = oom_retry_as("recording a state prelude", oom_inject(), || unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                // Ours: the states and twins, then the uploads ([`gpu_split`]).
+                self.prelude_marks.clear();
+                self.prelude_marks.mark(list, gpu_split::Kind::Passes);
                 if !aliasing.is_empty() {
                     list.ResourceBarrier(&aliasing);
                 }
@@ -9027,10 +9294,14 @@ impl HostList {
                         twins::plane_back_from_source(list, &depth.texture, &plane.texture);
                     }
                 }
+                if !uploads.is_empty() {
+                    self.prelude_marks.mark(list, gpu_split::Kind::Textures);
+                }
                 for (upload, _) in &uploads {
                     upload.record(list);
                 }
                 if !barriers.is_empty() {
+                    self.prelude_marks.mark(list, gpu_split::Kind::Passes);
                     list.ResourceBarrier(&barriers);
                 }
                 list.Close()
@@ -9301,10 +9572,24 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        let _as = UploadAs::new(NewMemory::UploadListCopy);
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
+    }
+
+    /// [`HostList::upload`], or `size` bytes of the list's scratch where it
+    /// fits a chunk ([`list_upload_scratch`]): the buffer, where in it the
+    /// bytes begin (a multiple of 512, where texture copies' footprints
+    /// begin; 0 for a buffer of its own) and their mapping. Alive until the
+    /// list is reset either way; the bytes are the caller's to write whole.
+    pub(crate) fn upload_at(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        if list_upload_scratch() && card_steps::stage() <= 1 && size.max(1).next_multiple_of(512) <= SCRATCH_CHUNK {
+            return self.scratch_aligned(size, 512);
+        }
+        let (buffer, data) = self.upload(host, size)?;
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -9327,10 +9612,16 @@ impl HostList {
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_aligned(len, 256)
+    }
+
+    /// [`HostList::scratch_at`] at a multiple of `align` (a multiple of 256).
+    fn scratch_aligned(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
+            let _as = UploadAs::new(NewMemory::UploadLongScratch);
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
@@ -9338,7 +9629,7 @@ impl HostList {
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunks may be smaller ones).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -9348,8 +9639,8 @@ impl HostList {
             s.used = 0;
         }
         let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
-        let at = s.used;
-        s.used += len;
+        let at = s.used.next_multiple_of(align);
+        s.used = at + len;
         Some((buffer, at, (data + at as usize) as *mut u8))
     }
 
@@ -11157,7 +11448,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b, NewMemory::Upload)?;
+                    resident(&self.device, b, UPLOAD_AS.get())?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11272,6 +11563,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        gpu_split::presented();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -11309,11 +11601,13 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::shadow::exact_line(frames);
+        scratch_relief_line();
         crate::descriptor::sync_line(frames);
         late_line(frames);
         sweep_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
+        gpu_split::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
@@ -11766,6 +12060,7 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            copy.gpu_kind(gpu_split::Kind::Passes);
             let list = &copy.list;
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -12598,6 +12893,50 @@ mod scratch_policy_tests {
     /// idle first, as long as what stays is the floor or more; what was given
     /// lately stays however much there is; a relief takes what is above the
     /// floor, idle or not, until it has what it asked for.
+    /// At red, the rule before (`VICTORY_SCRATCH_RELIEF=floor`) lets go of
+    /// what is above the floor however lately a list had it; the default
+    /// (`idle`) only of what no list has had for the decay's time, above the
+    /// same floor. A chunk made within 2 s of a relief counts as made again.
+    #[test]
+    fn relief_at_red_keeps_what_the_lists_had_lately() {
+        assert_eq!(scratch_relief_of(None), ScratchRelief::Idle);
+        assert_eq!(scratch_relief_of(Some("idle")), ScratchRelief::Idle);
+        assert_eq!(scratch_relief_of(Some(" floor ")), ScratchRelief::Floor);
+        assert_eq!(scratch_relief_of(Some("0")), ScratchRelief::Idle);
+        // Six chunks of 4 MiB: four given back at 1 s (idle), two at 9.5 s
+        // (a list had them the frame before).
+        let filled = || {
+            let mut spare: Spare<u32> = Spare::new();
+            for i in 0..6u32 {
+                spare.give_at(i, 4 * MIB, u64::MAX, if i < 4 { 1000 } else { 9500 });
+            }
+            spare
+        };
+        let now = 10_000;
+        // The rule before: down to the floor (8 MiB), the lately had too.
+        let mut spare = filled();
+        let gone: Vec<u32> = spare.above(8 * MIB, u64::MAX).into_iter().map(|g| g.0).collect();
+        assert_eq!(gone, [0, 1, 2, 3]);
+        let mut spare = filled();
+        let gone: Vec<u32> = spare.above(0, u64::MAX).into_iter().map(|g| g.0).collect();
+        assert_eq!(gone, [0, 1, 2, 3, 4, 5], "however lately a list had them");
+        // The default: only the idle ones, above the floor, until enough.
+        let mut spare = filled();
+        let gone: Vec<u32> = spare.above_idle(0, u64::MAX, now, 3000).into_iter().map(|g| g.0).collect();
+        assert_eq!(gone, [0, 1, 2, 3]);
+        assert_eq!(spare.kept.iter().map(|k| k.0).collect::<Vec<_>>(), [4, 5]);
+        let mut spare = filled();
+        assert_eq!(spare.above_idle(12 * MIB, u64::MAX, now, 3000).len(), 3, "the floor holds");
+        let mut spare = filled();
+        assert_eq!(spare.above_idle(0, 6 * MIB, now, 3000).len(), 2, "until enough");
+        // Made again: within 2 s after a relief, not before one or later.
+        assert!(!made_again(0, 5000));
+        assert!(made_again(5000, 5000));
+        assert!(made_again(5000, 7000));
+        assert!(!made_again(5000, 7001));
+        assert!(!made_again(5000, 4000));
+    }
+
     #[test]
     fn decay_respects_the_floor() {
         let mut spare: Spare<u32> = Spare::new();
@@ -13822,7 +14161,7 @@ mod movie_plane_tests {
 
 #[cfg(test)]
 mod new_memory_tests {
-    use super::{NewMemory, SharedAs, note_wait, waits_by, SHARED_AS};
+    use super::{NewMemory, SharedAs, UploadAs, note_wait, waits_by, SHARED_AS, UPLOAD_AS};
 
     /// The waits for new memory are told by what it was; a buffer of shared
     /// memory is what the thread making it says while it says so.
@@ -13830,8 +14169,16 @@ mod new_memory_tests {
     fn waits_for_new_memory_are_told_by_kind() {
         note_wait(NewMemory::ViewBytes, 1, 2500);
         note_wait(NewMemory::TextureBlock, 0, 1000);
+        note_wait(NewMemory::UploadScratch, 0, 1000);
         assert!(waits_by(1).contains("copies of views' own bytes"));
         assert!(waits_by(0).contains("blocks of textures"));
+        assert!(waits_by(0).contains("upload buffers: lists' scratch chunks"));
+        assert_eq!(UPLOAD_AS.get(), NewMemory::Upload);
+        {
+            let _as = UploadAs::new(NewMemory::UploadStaging);
+            assert_eq!(UPLOAD_AS.get(), NewMemory::UploadStaging);
+        }
+        assert_eq!(UPLOAD_AS.get(), NewMemory::Upload);
         assert_eq!(SHARED_AS.get(), NewMemory::Shared);
         {
             let _as = SharedAs::new(NewMemory::ViewBytes);

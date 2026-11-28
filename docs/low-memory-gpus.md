@@ -125,6 +125,24 @@ behaviour before it.
   copy goes (slots hold such copies themselves, as they held a buffer), and is
   handed out again after the same wait as a buffer above; a block empty for
   2 s goes, past the first empty one. Longer copies are buffers of their own.
+  The look for copies to let go of walks every copy kept; it runs once in 64
+  new copies (`VICTORY_VIEW_BYTES_SWEEP`; `1`: at every one, as before).
+- **Relief at red keeps the scratch the lists had lately**
+  (`VICTORY_SCRATCH_RELIEF=idle`, the default; `floor`: as before). While the
+  PC's memory is at red, the governor's look once a second let go of spare
+  list scratch above its floor however lately a list had it, and the next
+  frame made it again. Now it lets go only of chunks no list has had for 3 s;
+  a relief after a refused allocation is as before. The line "the lists' spare
+  scratch let go of by reliefs" says the MB let go of and the chunks made
+  again within 2 s of a relief.
+- **A list's texture copies read from its scratch**
+  (`VICTORY_LIST_UPLOAD_SCRATCH`, on everywhere): the upload memory a copy
+  into a texture reads (and the zeros of new levels) lies in the list's
+  scratch chunks where it fits one, not in an upload buffer made for each.
+- The `new memory waited for` lines split upload buffers (the lists' scratch
+  chunks, one per list copy, scratch asks longer than a chunk, blocks of
+  texture staging, other) and shared memory (windows of title memory, copies
+  of title buffers, other).
 - The lines `new memory waited for` and `new card memory waited for until it
   is mapped` now say what the memory was (blocks of textures, textures of their
   own, depth twins, upload buffers, copies of views' own bytes, other buffers

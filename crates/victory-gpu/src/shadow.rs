@@ -623,7 +623,10 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    let (buffer, _) = host.shared_buffer(size)?;
+    let (buffer, _) = {
+        let _as = crate::host::SharedAs::new(crate::host::NewMemory::SharedTitleCopy);
+        host.shared_buffer(size)?
+    };
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }
@@ -745,7 +748,10 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    let (buffer, _) = host.shared_buffer(size)?;
+    let (buffer, _) = {
+        let _as = crate::host::SharedAs::new(crate::host::NewMemory::SharedWindow);
+        host.shared_buffer(size)?
+    };
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }
@@ -5975,7 +5981,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             return entry.shadow.clone();
         }
         // (`Host::shared_buffer` trimmed and asked again if memory ran out.)
-        let Some((buffer, data)) = host()?.shared_buffer(size) else {
+        let made = {
+            let _as = crate::host::SharedAs::new(crate::host::NewMemory::SharedTitleCopy);
+            host()?.shared_buffer(size)
+        };
+        let Some((buffer, data)) = made else {
             count_no_copy();
             return None;
         };
@@ -6862,7 +6872,10 @@ fn window_buffers(start: u64, len: u64) -> Option<Arc<Shadow>> {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = {
+        let _as = crate::host::SharedAs::new(crate::host::NewMemory::SharedWindow);
+        host()?.shared_buffer(len)?
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     #[cfg(feature = "diagnostics")]
     crate::book::tag(&buffer, "windows of title memory");
@@ -7021,6 +7034,35 @@ fn view_bytes_fit(held: u64, len: u64, most: u64) -> bool {
     held.saturating_add(len) <= most
 }
 
+/// New copies asked for ([`exact`]) since its sweep last looked for copies to
+/// let go of. Changed under [`EXACT`]'s lock.
+static EXACT_SINCE_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// How many new copies of views' own bytes ([`exact`]) are asked for between
+/// two looks for those to let go of, while many are kept
+/// (`VICTORY_VIEW_BYTES_SWEEP`, 64 unless set; `1`: at every one, as before).
+/// The look walks every copy kept and asks the count of references of each
+/// one's buffer: thousands of copies were kept and hundreds made a frame, so
+/// it was millions of such calls a frame, under the lock every thread that
+/// makes a view waits for. A copy that may go goes at most that many new
+/// copies later, so over a frame the same go.
+fn view_bytes_sweep() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| sweep_every_of(std::env::var("VICTORY_VIEW_BYTES_SWEEP").ok().as_deref()))
+}
+
+/// [`view_bytes_sweep`] for `VICTORY_VIEW_BYTES_SWEEP` as set.
+fn sweep_every_of(set: Option<&str>) -> u64 {
+    set.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1)
+}
+
+/// Whether [`exact`] looks for copies to let go of: `kept` are kept, `many`
+/// are many, and this is the `since`th new copy since the last look, of
+/// `every` between looks.
+fn sweep_due(kept: usize, many: usize, since: u64, every: u64) -> bool {
+    kept >= many && since >= every
+}
+
 /// The bytes the copies in `map` ([`EXACT`]) hold.
 fn exact_bytes(map: &BTreeMap<(u64, u64), (Arc<Shadow>, u64)>) -> u64 {
     map.values().map(|(shadow, _)| shadow.len).sum()
@@ -7032,6 +7074,19 @@ mod view_bytes_tests {
 
     /// Copies of views' own bytes hold 256 MB at most unless set, none
     /// with 0, and a copy that would pass the limit is not made.
+    #[test]
+    fn the_sweep_looks_once_in_so_many_new_copies() {
+        use super::{sweep_due, sweep_every_of};
+        assert_eq!(sweep_every_of(None), 64);
+        assert_eq!(sweep_every_of(Some(" 1 ")), 1, "every new copy, as before");
+        assert_eq!(sweep_every_of(Some("0")), 1);
+        assert_eq!(sweep_every_of(Some("many")), 64);
+        assert!(!sweep_due(255, 256, 1000, 64), "few kept: no look");
+        assert!(!sweep_due(5000, 256, 63, 64));
+        assert!(sweep_due(5000, 256, 64, 64));
+        assert!(sweep_due(256, 256, 1, 1), "as before: at every new copy");
+    }
+
     #[test]
     fn copies_of_views_own_bytes_are_bounded() {
         assert_eq!(view_bytes_of(None), 256 << 20);
@@ -7085,7 +7140,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let most = view_bytes_most();
     let reuse = view_bytes_reuse();
     let clock = crate::host::now_ms();
-    if map.len() >= MANY || !view_bytes_fit(exact_bytes(map), len, most) {
+    // The copies not held and not asked for lately are looked for once in
+    // [`view_bytes_sweep`] new copies while there are many, and whenever the
+    // limit would be passed.
+    let since = EXACT_SINCE_SWEEP.fetch_add(1, Ordering::Relaxed) + 1;
+    let fits = view_bytes_fit(exact_bytes(map), len, most);
+    if sweep_due(map.len(), MANY, since, view_bytes_sweep()) || !fits {
+        EXACT_SINCE_SWEEP.store(0, Ordering::Relaxed);
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately. (A copy cut from a block
         // is held by the slots that show it itself, `descriptor::host::Held`:
@@ -7501,6 +7562,14 @@ pub(crate) fn range_free(block: usize, start: u64) -> bool {
     blocks.is_free(|m| m.buffer.as_raw() as usize == block, start)
 }
 
+/// Tests: how many copies of views' own bytes are kept for title memory in
+/// `[from, to)`.
+#[cfg(test)]
+fn copies_in(from: u64, to: u64) -> usize {
+    let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.range((from, 0)..(to, 0)).count()
+}
+
 #[cfg(test)]
 impl Drop for TestViewCopies {
     fn drop(&mut self) {
@@ -7596,6 +7665,31 @@ mod spare_view_buffers {
         assert!(super::EXACT_REUSED.load(Relaxed) > before + 200, "buffers let go of are used again");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// With the sweep once in so many new copies, the copies nothing holds
+    /// and nothing asked for lately still go: of a thousand made one after
+    /// the other, no more stay than those asked for lately and the copies
+    /// one sweep is late by.
+    #[test]
+    fn copies_nothing_holds_still_go_with_the_sweep_less_often() {
+        let _one = super::view_copies_lock();
+        if crate::host::host().is_none() {
+            return;
+        }
+        let _setting = super::TestViewCopies::set(true);
+        // Addresses no title memory is at: nothing reads them here.
+        let base = 0x7b00_0000_0000u64;
+        let end = base + 1000 * 0x100;
+        super::forget_copies_in(base, end);
+        for i in 0..1000u64 {
+            drop(super::exact(base + i * 0x100, 0x80).expect("a copy"));
+        }
+        let kept = super::copies_in(base, end);
+        // (512 asks a copy stays for, `exact`'s `LATELY`.)
+        assert!(kept <= 512 + super::view_bytes_sweep() as usize, "{kept} kept");
+        assert!(kept >= 256, "those asked for lately stay: {kept}");
+        super::forget_copies_in(base, end);
     }
 
     /// A copy a list still holds (recorded, or in the air) is never let go,

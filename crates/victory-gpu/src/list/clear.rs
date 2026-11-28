@@ -323,6 +323,7 @@ pub(crate) fn run(
     list.texture_written(named);
     super::ensure_state(list, named, UNORDERED_ACCESS);
     first_time(kind, texture, desc.as_ref(), cut.len());
+    list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
     slots.clear(&host.device, &list.list, texture, desc.as_ref(), kind, values, &cut);
     // Our heap is set now: the next draw or dispatch sets the title's again.
     super::with_state(this, |list, state| state.replay(list));

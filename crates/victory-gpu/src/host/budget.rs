@@ -450,7 +450,7 @@ pub(crate) fn relieve(need: u64) -> u64 {
 /// memory, which the next frame takes again (a frame's sends are tens of
 /// megabytes, and they keep 128 MB at most on a small PC).
 fn tend(need: u64) -> u64 {
-    let mut scratch = super::scratch_relieve;
+    let mut scratch = super::scratch_relieve_at_red;
     let mut staging = crate::pool::relieve_staging;
     let mut windows = |_: u64| crate::shadow::let_go_short().1;
     let done = relieve_with(

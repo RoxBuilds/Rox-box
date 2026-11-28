@@ -82,6 +82,43 @@ pub(crate) fn governor_look(s: &crate::host::budget::Sample, level: crate::host:
         Level::Red => 3,
     };
     report::memory_look(level, s.card);
+    // `[gpu_time]`: what the card and the PC had while the frames it times
+    // ran, from this same look.
+    report::gpu_time_look(s.card, s.shared, s.ram);
+}
+
+/// The card's time by kind of a frame-line second (`host::gpu_split`), as
+/// nanoseconds by kind in the order of `report::GPU_KINDS`, the volumes in
+/// the order of `host::gpu_split::Volume`, and the frames partly measured,
+/// over `frames` frames.
+pub(crate) fn gpu_split(
+    frames: u64,
+    ns: [u64; crate::host::gpu_split::KINDS],
+    volumes: [u64; crate::host::gpu_split::VOLUMES_N],
+    partly: u64,
+) {
+    use report::GpuFigure as G;
+    let mut values = [(G::Frames, frames); 2 + crate::host::gpu_split::KINDS + crate::host::gpu_split::VOLUMES_N];
+    values[1] = (G::PartlyFrames, partly);
+    for (i, (&kind, n)) in report::GPU_KINDS.iter().zip(ns).enumerate() {
+        values[2 + i] = (kind, n);
+    }
+    let volume = [
+        G::Fills,
+        G::FillBytes,
+        G::HashPasses,
+        G::HashedBytes,
+        G::ComparePasses,
+        G::ComparedBytes,
+        G::CopiedBackBytes,
+        G::UploadRanges,
+        G::UploadedBytes,
+        G::TextureBytes,
+    ];
+    for (i, (&figure, n)) in volume.iter().zip(volumes).enumerate() {
+        values[2 + crate::host::gpu_split::KINDS + i] = (figure, n);
+    }
+    report::gpu_time(crate::host::gpu_split::state(), &values);
 }
 
 // The frame line's figures. It takes its meters with `swap(0)` and says them
@@ -196,6 +233,7 @@ fn last_meters() {
         (Figure::HeapBufferUs, take(&crate::draw::HEAP_BUFFER_MICROS)),
         (Figure::RefreshAllUs, take(&crate::texture::REFRESH_WAITS[3])),
     ]);
+    crate::host::gpu_split::last(u64::from(frames));
 }
 
 /// The card's clock per frame (`host::card_clock_line`): ms with nothing of
@@ -418,6 +456,11 @@ pub fn sample() {
     );
     report::set(Stat::TailCopies, crate::resource::TAILS[0].load(Relaxed));
     report::set(Stat::TailBytes, crate::resource::TAILS[1].load(Relaxed));
+    let (cut, unwritten) = (&crate::resource::DETAIL_WHY, &crate::resource::UNWRITTEN);
+    report::set(Stat::DetailCutCard, cut[1].load(Relaxed) + cut[2].load(Relaxed));
+    report::set(Stat::DetailCutPc, cut[3].load(Relaxed));
+    report::set(Stat::PoolRoomWhole, crate::resource::POOL_WHOLE.load(Relaxed));
+    report::set(Stat::UnwrittenKept, [0, 1, 3, 4].iter().map(|&i| unwritten[i].load(Relaxed)).sum());
     // `[memory.views]`: the descriptor table's entries of views without a
     // resource (`VICTORY_OWNERLESS_VIEWS`).
     let [kept, dropped] = crate::descriptor::ownerless_counts();
@@ -596,5 +639,6 @@ mod tests {
         system_memory(u64::MAX, u64::MAX);
         let s = crate::host::budget::Sample::UNKNOWN;
         governor_look(&s, crate::host::budget::Level::Green);
+        gpu_split(30, [1_000; crate::host::gpu_split::KINDS], [7; crate::host::gpu_split::VOLUMES_N], 1);
     }
 }

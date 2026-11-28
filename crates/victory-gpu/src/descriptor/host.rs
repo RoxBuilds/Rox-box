@@ -2390,7 +2390,8 @@ impl HostHeap {
     }
 
     /// The slots that went on showing another texture than the title's for
-    /// [`keep_shown_frames`] frames by `frame` ([`Keeping`]) and still do:
+    /// [`keep_shown_frames`] frames by `frame`, or for [`keep_shown_ms`]
+    /// milliseconds, whichever came first ([`Keeping`]), and still do:
     /// they show the neutral texture from now on, as a slot does that waits
     /// for its upload ([`show_after`]), and are due now, so that the pass
     /// makes them from the title's view (of its smallest levels while the
@@ -2398,8 +2399,8 @@ impl HostHeap {
     /// title has slot `index`'s record. Slots tables read are left to their
     /// draws, which make them. Returns how many.
     pub(crate) fn texture_slots_kept_long(&self, frame: u64, handle: impl Fn(u32) -> Option<u64>) -> usize {
-        let frames = keep_shown_frames();
-        if frames == 0 || self.sampler {
+        let (frames, ms) = (keep_shown_frames(), keep_shown_ms());
+        if (frames == 0 && ms == 0) || self.sampler {
             return 0;
         }
         let expired = {
@@ -2407,7 +2408,7 @@ impl HostHeap {
             if keeping.0.is_empty() {
                 return 0;
             }
-            keeping.expired(frame, frames)
+            keeping.expired(frame, frames, crate::host::now_ms(), ms)
         };
         let mut due = Vec::new();
         for (index, shown) in expired {
@@ -2710,6 +2711,9 @@ impl HostHeap {
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
         let mut remade = 0;
+        // (No upload follows here: `crate::resource::show_written`.)
+        let _alone = crate::resource::NoUploadFollows::new();
+        let mut again = Vec::new();
         for slot in slots {
             let _made = self.made.lock(slot);
             let Some(key) = self.made.get(slot).filter(|&key| key != 0) else {
@@ -2722,9 +2726,82 @@ impl HostHeap {
                 self.put(slot);
                 self.keep(slot, kept);
                 remade += 1;
+                if crate::resource::stood_in() {
+                    self.stood_in(slot);
+                    again.push(slot);
+                }
             }
         }
+        self.due_again(&again);
         remade
+    }
+
+    /// Slot `index` (its lock held) shows a stand-in for its view
+    /// (`crate::resource::stand_in`): made from no record, so that the next
+    /// ask makes it from its view.
+    fn stood_in(&self, index: u32) {
+        self.quick_is(index, 0);
+        self.made.set(index, 0);
+        self.clear_twin(index);
+    }
+
+    /// The slots `slots`, given a stand-in, are due in the texture pass from
+    /// the next frame on (those tables read are left to their draws).
+    fn due_again(&self, slots: &[u32]) {
+        if slots.is_empty() || self.sampler {
+            return;
+        }
+        let frame = crate::frame::current();
+        let slots: Vec<u32> = slots.iter().copied().filter(|&slot| !self.tabled_lately(slot, frame)).collect();
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in slots {
+            textures.changed(slot, frame, frame + 1);
+        }
+    }
+
+    /// Of the texture pass: slot `index` was made from its view before its
+    /// upload, and the upload was held back (the commit guard): a host copy no
+    /// upload went into shows the neutral texture, and the slot is made from
+    /// no record ([`crate::resource::show_written`]; it stays due).
+    pub(crate) fn texture_slot_held_back(&self, index: u32) {
+        if self.sampler || !crate::resource::show_written() || index >= self.count {
+            return;
+        }
+        let _made = self.made.lock(index);
+        let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
+            return;
+        };
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return;
+        };
+        if !unwritten_view(&view) {
+            return;
+        }
+        crate::resource::UNWRITTEN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_before(index, key, "neutral, upload held back");
+        self.stood_in(index);
+        let kept = neutral_for(&view, self.at(index)).map(Held::from);
+        self.put(index);
+        self.keep(index, kept);
+    }
+
+    /// Of a draw: dynamic slot `index` was made from `view` before its
+    /// upload, and the upload was held back: a host copy no upload went into
+    /// shows the neutral texture ([`crate::resource::show_written`]). Asks
+    /// [`crate::resource::take_made_unwritten`], which the making of the slot
+    /// told (the caller takes it before that). Whether it did.
+    pub(crate) fn draw_slot_held_back(&self, index: u32, view: &View) -> bool {
+        if crate::resource::take_made_unwritten().is_none() || self.sampler || !crate::resource::show_written() {
+            return false;
+        }
+        crate::resource::UNWRITTEN[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let kept = neutral_for(view, self.at(index)).map(Held::from);
+        self.put(index);
+        self.clear_twin(index);
+        self.write_made_stride(index, 0);
+        self.keep(index, kept);
+        true
     }
 
     /// The memory of the texture title slot `index` views is not mapped
@@ -2877,7 +2954,14 @@ impl HostHeap {
         {
             return self.texture_slot_show_after(list, index, handle);
         }
+        let _ = crate::resource::take_made_unwritten();
         self.mirror(index, handle, true);
+        // The draw's upload was held back: the slot, which lists read by index
+        // too, does not show what no upload went into
+        // ([`crate::resource::show_written`]).
+        if crate::resource::take_made_unwritten().is_some() {
+            self.texture_slot_held_back(index);
+        }
     }
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
@@ -2915,6 +2999,9 @@ impl HostHeap {
             }
         }
         let mut flipped = 0;
+        // (No upload follows here: `crate::resource::show_written`.)
+        let _alone = crate::resource::NoUploadFollows::new();
+        let mut again = Vec::new();
         for f in ready {
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
@@ -2952,6 +3039,10 @@ impl HostHeap {
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
                 self.keep(f.index, kept);
+                if crate::resource::stood_in() {
+                    self.stood_in(f.index);
+                    again.push(f.index);
+                }
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -2974,6 +3065,8 @@ impl HostHeap {
                 }
             }
         }
+        drop(_alone);
+        self.due_again(&again);
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
         flipped
     }
@@ -3384,9 +3477,10 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            let again = views.made.get(&words).filter(|made| made.again).map(|made| made.at);
+            if again.is_some() || !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
+                let at = again.unwrap_or(2 * views.made.len() as u32);
                 // (A constant buffer's bytes are copied for each draw.)
                 if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
                     return None;
@@ -3400,7 +3494,7 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed, again: false });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -3859,6 +3953,9 @@ impl HostHeap {
                 super::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            // A slot that showed a texture and does not go on showing it
+            // shows the neutral texture meanwhile ([`neutral_at_once`]).
+            let mut neutral = false;
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -3884,15 +3981,17 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
-                        // For some frames at most ([`keep_shown_frames`]).
-                        if keep_shown_frames() > 0 {
-                            let frame = crate::frame::current();
-                            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).note(index, shown, frame);
+                        // For some frames or a short time at most
+                        // ([`keep_shown_frames`], [`keep_shown_ms`]).
+                        if keep_shown_frames() > 0 || keep_shown_ms() > 0 {
+                            let (frame, now) = (crate::frame::current(), crate::host::now_ms());
+                            self.keeping.lock().unwrap_or_else(|e| e.into_inner()).note(index, shown, frame, now);
                         }
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
                     }
+                    neutral = !self.sampler && is_texture_view(&view) && neutral_at_once();
                 }
             }
             // A texture made while lists sent before it may still run: those
@@ -3959,14 +4058,23 @@ impl HostHeap {
             if retry {
                 self.made.set(index, 0);
             }
+            let mut stand_in = None;
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
+                if neutral {
+                    #[cfg(feature = "diagnostics")]
+                    note_before(index, shown, "neutral at once, another texture");
+                    NEUTRAL_AT_ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stand_in = neutral_for(&view, self.at(index)).map(Held::from);
+                    self.clear_twin(index);
+                } else {
+                    null_for(&view, self.at(index));
+                }
             }
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            self.keep(index, kept.flatten().or(stand_in));
             self.quick_is(index, if later || retry { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -4927,6 +5035,39 @@ fn make_twinned(
                     let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
                     from_base(desc, copy.base, own_mips);
                 }
+                // Where no upload follows in the same list
+                // (`crate::resource::NoUploadFollows`): a copy no upload went
+                // into shows the neutral texture, one whose view starts below
+                // the levels an upload wrote shows those; either is made again
+                // later (`crate::resource::stand_in`).
+                if !crate::resource::no_upload_follows() {
+                    // (Its upload follows, unless it is held back: the caller
+                    // asks, `crate::resource::take_made_unwritten`.)
+                    if crate::resource::unwritten(resource, &copy) {
+                        crate::resource::made_unwritten(resource);
+                    }
+                } else {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if crate::resource::unwritten(resource, &copy) {
+                        crate::resource::stand_in();
+                        crate::resource::UNWRITTEN[0].fetch_add(1, Relaxed);
+                        return Some(neutral_for(view, at).map(Held::from));
+                    }
+                    let recorded = copy.recorded.load(Relaxed);
+                    if copy.pooled
+                        && let Some(desc) = &mut desc
+                        && let Some(from) = written_from(copy.base, recorded)
+                    {
+                        // SAFETY: a live resource.
+                        let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                        let before = first_level(desc);
+                        crate::tiles::show_from(desc, from, own_mips);
+                        if first_level(desc) != before {
+                            crate::resource::stand_in();
+                            crate::resource::UNWRITTEN[1].fetch_add(1, Relaxed);
+                        }
+                    }
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -5083,6 +5224,25 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u3
     shift_levels(desc, base, on.then_some(own_mips));
 }
 
+/// The first level of its own a view of a host copy whose level 0 is the
+/// title's level `base` may show, if an upload from the title's level
+/// `recorded` on is all that went into it (`u32::MAX`: none): `None` if every
+/// level of it was written (`crate::resource::show_written`).
+fn written_from(base: u32, recorded: u32) -> Option<u32> {
+    (recorded != u32::MAX && recorded > base).then(|| recorded - base)
+}
+
+/// The first level a 2D texture's or 2D array's view shows.
+fn first_level(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<u32> {
+    match desc.ViewDimension {
+        // SAFETY: the member its dimension says.
+        D3D12_SRV_DIMENSION_TEXTURE2D => Some(unsafe { desc.Anonymous.Texture2D.MostDetailedMip }),
+        // SAFETY: as above.
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => Some(unsafe { desc.Anonymous.Texture2DArray.MostDetailedMip }),
+        _ => None,
+    }
+}
+
 /// [`from_base`]: `own_mips` is the copy's level count; `None` does it as
 /// before (2D views only, nothing bounded by the copy's levels).
 fn shift_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: Option<u32>) {
@@ -5149,15 +5309,35 @@ enum Kin {
 }
 
 impl Kin {
-    /// Whether the slot goes on showing what it shows, by [`keep_shown`].
+    /// Whether the slot goes on showing what it shows, by [`keep_shown`] and
+    /// [`keep_sized`].
     fn kept(self, keep: u8) -> bool {
+        self.kept_as(keep, keep_sized())
+    }
+
+    /// [`Kin::kept`], with `sized`: whether a view of another size is kept
+    /// at `keep` 1 (as before) or only at 2, as one of another texture.
+    fn kept_as(self, keep: u8, sized: bool) -> bool {
         match self {
             Kin::Same => true,
-            Kin::Moved | Kin::Sized => keep >= 1,
+            Kin::Moved => keep >= 1,
+            Kin::Sized => keep >= if sized { 1 } else { 2 },
             Kin::Other => keep >= 2,
             Kin::None => false,
         }
     }
+}
+
+/// Whether a slot written with a view of a texture of the same format and
+/// shape in another size goes on showing the one it shows at
+/// `VICTORY_KEEP_SHOWN=1` (`VICTORY_KEEP_SHOWN_SIZED=1`, as before; by
+/// default not: it shows the neutral texture at once, [`neutral_at_once`],
+/// as one of another texture does). A texture of another size is another
+/// texture as often as the same one streamed in another size: the slot showed
+/// another picture, scaled, until the new one was made.
+fn keep_sized() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SHOWN_SIZED").is_some_and(|v| v == "1"))
 }
 
 /// [`Kin`] of the view `old`, which a slot shows, and `new`.
@@ -5194,9 +5374,12 @@ fn kin(old: &View, new: &View) -> Kin {
 
 /// Whether a slot that is written with a view of another texture goes on
 /// showing the one it shows until the new one is made and its upload has run
-/// (`VICTORY_KEEP_SHOWN`): 0: never, it reads as zeros, then as the neutral
-/// texture; 1: one of the same kind in another place or size; 2: any of the
-/// same dimension.
+/// (`VICTORY_KEEP_SHOWN`): 0: never, it shows the neutral texture meanwhile
+/// ([`neutral_at_once`]; with that off it reads as zeros, then as the neutral
+/// texture, as before); 1: one of the same kind in another place (and in
+/// another size with [`keep_sized`]); 2: any of the same dimension. A view of another dimension is never kept (no
+/// shader that reads the one reads the other). What is kept, is kept for
+/// [`keep_shown_frames`] frames or [`keep_shown_ms`] milliseconds at most.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
@@ -5223,33 +5406,65 @@ fn keep_shown_frames() -> u64 {
     })
 }
 
+/// For how many milliseconds at most a slot goes on showing another texture
+/// than the one the title wrote there ([`keep_shown`]), as well as for
+/// [`keep_shown_frames`] frames, whichever comes first
+/// (`VICTORY_KEEP_SHOWN_MS`, 250; 0: by frames only, as before).
+///
+/// A bound in frames alone is one of seconds at a few frames a second: a slot
+/// written with a texture of the same description in another place (another
+/// texture of its kind, as often as the same one moved) showed the wrong one,
+/// an unrelated picture, for some fifteen seconds at two frames a second.
+fn keep_shown_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250))
+}
+
+/// Whether a slot that showed a texture and is written with a view of another
+/// that it does not go on showing ([`keep_shown`]: one of another dimension,
+/// a buffer, or by the switch's value) shows the neutral texture at once
+/// until the new one is made, where the new view is of a 2D texture or array
+/// (`VICTORY_NEUTRAL_AT_ONCE`, on unless `0`: a null view meanwhile, which
+/// reads zeros, as before). Of the slots written with another texture, most
+/// were of another dimension: never kept, they showed black for as long as
+/// the new texture waited, then the neutral texture (as [`show_after`] gives
+/// it) or the new one.
+fn neutral_at_once() -> bool {
+    crate::toggled!("VICTORY_NEUTRAL_AT_ONCE")
+}
+
 /// Slots that went on showing the texture of another view than the title's
-/// ([`keep_shown`]): by slot, the record they show and the frame since which
-/// they do (the first such write, if the title writes the slot again
-/// meanwhile).
+/// ([`keep_shown`]): by slot, the record they show and the frame and the
+/// time (ms) since which they do (the first such write, if the title writes
+/// the slot again meanwhile).
 #[derive(Default)]
-struct Keeping(std::collections::HashMap<u32, (u64, u64)>);
+struct Keeping(std::collections::HashMap<u32, (u64, u64, u64)>);
 
 impl Keeping {
     /// Slot `index`, which shows the view of record `shown`, goes on doing
-    /// so in `frame` for a view of another texture written there.
-    fn note(&mut self, index: u32, shown: u64, frame: u64) {
+    /// so in `frame` at `now` (ms) for a view of another texture written
+    /// there.
+    fn note(&mut self, index: u32, shown: u64, frame: u64, now: u64) {
         match self.0.get(&index) {
-            Some(&(was, _)) if was == shown => {}
+            Some(&(was, _, _)) if was == shown => {}
             _ => {
-                self.0.insert(index, (shown, frame));
+                self.0.insert(index, (shown, frame, now));
             }
         }
     }
 
-    /// The slots that did so for `frames` frames by `frame`, each with the
-    /// record it showed then: out of the set.
-    fn expired(&mut self, frame: u64, frames: u64) -> Vec<(u32, u64)> {
+    /// The slots that did so for `frames` frames by `frame`, or for `ms`
+    /// milliseconds by `now` (either 0: no such bound), each with the record
+    /// it showed then: out of the set.
+    fn expired(&mut self, frame: u64, frames: u64, now: u64, ms: u64) -> Vec<(u32, u64)> {
+        let long = |since: u64, at: u64| {
+            (frames > 0 && frame.saturating_sub(since) >= frames) || (ms > 0 && now.saturating_sub(at) >= ms)
+        };
         let mut out: Vec<(u32, u64)> = self
             .0
             .iter()
-            .filter(|&(_, &(_, since))| frame.saturating_sub(since) >= frames)
-            .map(|(&index, &(shown, _))| (index, shown))
+            .filter(|&(_, &(_, since, at))| long(since, at))
+            .map(|(&index, &(shown, _, _))| (index, shown))
             .collect();
         for (index, _) in &out {
             self.0.remove(index);
@@ -5262,6 +5477,10 @@ impl Keeping {
 /// Slots that went on showing another texture for [`keep_shown_frames`]
 /// frames and were given the neutral texture then, since the start.
 static KEEP_EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Slots written with another texture that they did not go on showing, given
+/// the neutral texture at once ([`neutral_at_once`]), since the start.
+static NEUTRAL_AT_ONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Slots that showed a texture and were written with a view of another,
 /// since the start, by [`Kin`] (moved, sized, other, none), and those of
@@ -5283,15 +5502,18 @@ fn rewritten(kin: Kin, kept: bool) {
         tracing::info!(
             "slots that showed a texture and were written with another, since the start: {} of the same kind \
              elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed \
-             meanwhile (VICTORY_KEEP_SHOWN), {} of those for {} frames and shown neutral then \
-             (VICTORY_KEEP_SHOWN_FRAMES)",
+             meanwhile (VICTORY_KEEP_SHOWN), {} of those for {} frames or {} ms and shown neutral then \
+             (VICTORY_KEEP_SHOWN_FRAMES, VICTORY_KEEP_SHOWN_MS); {} not kept shown neutral at once \
+             (VICTORY_NEUTRAL_AT_ONCE)",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
             REWRITTEN[4].load(Relaxed),
             KEEP_EXPIRED.load(Relaxed),
-            keep_shown_frames()
+            keep_shown_frames(),
+            keep_shown_ms(),
+            NEUTRAL_AT_ONCE.load(Relaxed)
         );
     }
 }
@@ -5566,6 +5788,24 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let texture = crate::resource::texture_at(address, resource)?;
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+/// Whether `view` shows a host copy no upload went into, of memory another
+/// texture may have held (`crate::resource::unwritten`). Nothing is made or
+/// asked for here.
+fn unwritten_view(view: &View) -> bool {
+    let resource = match view {
+        &View::Shader(r, _) => r as crate::object::This,
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            match crate::resource::placed_known(address, resource) {
+                Some(texture) => texture,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    crate::resource::made_copy(resource).is_some_and(|copy| crate::resource::unwritten(resource, &copy))
 }
 
 /// Whether `view` is of a title texture that has no host copy because the
@@ -5944,6 +6184,42 @@ mod tests {
         assert_eq!(view(10, 4, 0.0), (7, 3, 0.0));
     }
 
+    /// A view of a copy cut from a block that an upload went into from a
+    /// later level than its first only (`crate::resource::show_written`)
+    /// starts at that level where no upload follows, with as many levels
+    /// fewer; one of a copy written whole, or never written, is not bounded
+    /// so ([`written_from`]).
+    #[test]
+    fn a_view_shows_only_the_levels_an_upload_wrote() {
+        // A copy of levels 3 to 12 (base 3, ten of its own), uploaded from
+        // the title's level 5 on.
+        assert_eq!(written_from(3, 5), Some(2));
+        assert_eq!(written_from(3, 3), None);
+        assert_eq!(written_from(0, 0), None);
+        assert_eq!(written_from(3, 1), None);
+        assert_eq!(written_from(0, u32::MAX), None);
+        let view = |first, levels| {
+            let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
+            from_base(&mut desc, 3, 10);
+            if let Some(from) = written_from(3, 5) {
+                crate::tiles::show_from(&mut desc, from, 10);
+            }
+            // SAFETY: the member its dimension says.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            (first_level(&desc), t.MostDetailedMip, t.MipLevels)
+        };
+        // From the title's level 3, four levels: from its 5, two.
+        assert_eq!(view(3, 4), (Some(2), 2, 2));
+        assert_eq!(view(3, u32::MAX), (Some(2), 2, u32::MAX));
+        // A view from past the written level stays as it was.
+        assert_eq!(view(7, 2), (Some(4), 4, 2));
+        // Arrays the same way; other dimensions have no first level here.
+        let mut array = srv_desc(&[98, 5, 5768, 0, 0, 10, 0, 1, 0, 0]);
+        crate::tiles::show_from(&mut array, 2, 10);
+        assert_eq!(first_level(&array), Some(2));
+        assert_eq!(first_level(&srv_desc(&[98, 7, 5768, 0, 0, 10, 0, 0, 0, 0])), None);
+    }
+
     /// A 2D array view (of the one layer) of such a copy counts from its
     /// first level too; as before (`VICTORY_BASE_VIEWS=0`) it was left as the
     /// title gave it.
@@ -6177,8 +6453,13 @@ mod tests {
         assert_eq!(kin(&old, &view(texture, 98, 9, 0x2000_0000)), Kin::None);
         assert_eq!(kin(&old, &view(buffer, 98, 1, 0x2000_0000)), Kin::None);
         for (kin, kept) in [(Kin::Same, [true; 3]), (Kin::Moved, [false, true, true]), (Kin::Sized, [false, true, true]), (Kin::Other, [false, false, true]), (Kin::None, [false; 3])] {
-            assert_eq!([0, 1, 2].map(|keep| kin.kept(keep)), kept, "{kin:?}");
+            assert_eq!([0, 1, 2].map(|keep| kin.kept_as(keep, true)), kept, "{kin:?}");
         }
+        // By default (`VICTORY_KEEP_SHOWN_SIZED` unset) a view of another size
+        // is kept only as one of another texture is; the others as before.
+        assert_eq!([0, 1, 2].map(|keep| Kin::Sized.kept_as(keep, false)), [false, false, true]);
+        assert_eq!([0, 1, 2].map(|keep| Kin::Moved.kept_as(keep, false)), [false, true, true]);
+        assert_eq!([0, 1, 2].map(|keep| Kin::None.kept_as(keep, false)), [false; 3]);
     }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the cap
@@ -6834,21 +7115,49 @@ mod tests {
     /// the slots whose time is up come out once.
     #[test]
     fn a_slot_keeps_another_texture_for_some_frames_only() {
+        // (By frames alone: `VICTORY_KEEP_SHOWN_MS=0`, as before; the time
+        // given stands still.)
+        let expired = |keeping: &mut Keeping, frame: u64| keeping.expired(frame, 30, 5_000, 0);
         let mut keeping = Keeping::default();
-        keeping.note(7, 0x1_0000_0005, 100);
+        keeping.note(7, 0x1_0000_0005, 100, 5_000);
         // Written again over the same shown view: still since frame 100.
-        keeping.note(7, 0x1_0000_0005, 120);
-        keeping.note(8, 0x2_0000_0006, 110);
-        assert!(keeping.expired(129, 30).is_empty());
-        assert_eq!(keeping.expired(130, 30), [(7, 0x1_0000_0005)]);
+        keeping.note(7, 0x1_0000_0005, 120, 5_000);
+        keeping.note(8, 0x2_0000_0006, 110, 5_000);
+        assert!(expired(&mut keeping, 129).is_empty());
+        assert_eq!(expired(&mut keeping, 130), [(7, 0x1_0000_0005)]);
         // Once: slot 7 is out of the set.
-        assert!(keeping.expired(135, 30).is_empty());
+        assert!(expired(&mut keeping, 135).is_empty());
         // Slot 8 made from a new view meanwhile and kept over that one: its
         // time starts again.
-        keeping.note(8, 0x3_0000_0007, 138);
-        assert!(keeping.expired(160, 30).is_empty());
-        assert_eq!(keeping.expired(168, 30), [(8, 0x3_0000_0007)]);
+        keeping.note(8, 0x3_0000_0007, 138, 5_000);
+        assert!(expired(&mut keeping, 160).is_empty());
+        assert_eq!(expired(&mut keeping, 168), [(8, 0x3_0000_0007)]);
         assert!(keeping.0.is_empty());
+    }
+
+    /// With a bound in time too (`VICTORY_KEEP_SHOWN_MS`), a slot keeps
+    /// another texture until the frames or the time are up, whichever comes
+    /// first: at two frames a second, a quarter of a second, not fifteen
+    /// seconds; at many frames a second, the frames. The clock is given.
+    #[test]
+    fn a_slot_keeps_another_texture_for_a_short_time_only() {
+        let mut keeping = Keeping::default();
+        // Two frames a second: frame 100 at 10,000 ms, frame 101 at 10,500.
+        keeping.note(3, 0x1_0000_0009, 100, 10_000);
+        assert!(keeping.expired(100, 30, 10_249, 250).is_empty());
+        assert_eq!(keeping.expired(101, 30, 10_500, 250), [(3, 0x1_0000_0009)]);
+        assert!(keeping.0.is_empty());
+        // Many frames a second: the frames come first.
+        keeping.note(4, 0x2_0000_000a, 200, 20_000);
+        assert!(keeping.expired(229, 30, 20_100, 250).is_empty());
+        assert_eq!(keeping.expired(230, 30, 20_120, 250), [(4, 0x2_0000_000a)]);
+        // The time alone (no bound in frames).
+        keeping.note(5, 0x3_0000_000b, 300, 30_000);
+        assert!(keeping.expired(9_999, 0, 30_249, 250).is_empty());
+        assert_eq!(keeping.expired(9_999, 0, 30_250, 250), [(5, 0x3_0000_000b)]);
+        // Neither bound: kept for as long as it takes.
+        keeping.note(6, 0x4_0000_000c, 400, 40_000);
+        assert!(keeping.expired(u64::MAX, 0, u64::MAX, 0).is_empty());
     }
 
     /// A view of a texture the title placed at address 0 is its null view: no
@@ -7524,6 +7833,8 @@ struct ListView {
     stride_word: u32,
     kept: Kept,
     listed: Listed,
+    /// To be made again in its slot ([`forget_listed`]).
+    again: bool,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record
@@ -7582,6 +7893,19 @@ pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
         let views = views.as_ref().filter(|v| v.recording == recording)?;
         views.made.get(&words).map(|m| m.view.clone())
     })
+}
+
+/// The view the record `words` names is made again, in its own slot of
+/// [`ListViews`], by the next draw of `recording` that holds it: its
+/// descriptor showed a stand-in (`HostHeap::draw_slot_held_back`).
+pub(crate) fn forget_listed(recording: u64, words: [u32; 3]) {
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+            && let Some(made) = views.made.get_mut(&words)
+        {
+            made.again = true;
+        }
+    });
 }
 
 /// Notes what is known of the record `words` in `recording`.

@@ -29,7 +29,10 @@
 //! 4. a translated shader: a compute program assembled by
 //!    `victory_shader::native::synth`, in a container, made into a host
 //!    pipeline the way a title's is, dispatched, and its stores read back
-//!    from title memory (twice, with other constants the second time);
+//!    from title memory (twice, with other constants the second time); the
+//!    card's time of those dispatches must have been measured by the split
+//!    of the card's time by kind (`host/gpu_split.rs`), unless the driver
+//!    refuses timestamp queries on the queue or `VICTORY_GPU_SPLIT=0`;
 //! 5. a translated draw: a vertex and a pixel program, also from `synth`,
 //!    with the signatures they link by and the pixel program's
 //!    export patch, made into a host graphics pipeline from a pipeline-state
@@ -576,6 +579,7 @@ fn compute(title: &Title, bench: &mut Bench) -> Result<String, Failed> {
         compute.pipeline,
         "no host pipeline 30 s after the pipeline's first use (the host refused it, see the log)",
     )?);
+    let timed_before = dispatch_time();
     for (round, constants) in [[0x1234_5678u32, 7, 0, 0], [0x0bad_f00d, 1000, 0, 0]].into_iter().enumerate() {
         title.frame(|t| {
             compute.record_dispatch(t, constants);
@@ -584,6 +588,7 @@ fn compute(title: &Title, bench: &mut Bench) -> Result<String, Failed> {
         title.sync()?;
         compute.check_stores(constants, &format!("dispatch {}", round + 1))?;
     }
+    let timed = dispatches_timed(timed_before)?;
     // The shader's buffer has a host copy now, so a list's copy into it
     // is made on the card at its place in the list (`host/place.rs`) and
     // must come back into title memory as the shader's stores did.
@@ -597,10 +602,40 @@ fn compute(title: &Title, bench: &mut Bench) -> Result<String, Failed> {
     compute.check_copy_in()?;
     Ok(format!(
         "a {}-byte compute container translated, made a host pipeline, dispatched twice; its stores and a list's copy \
-         {} landed in title memory",
+         {} landed in title memory; {timed}",
         container.len(),
         if on_card { "on the card" } else { "at submission" }
     ))
+}
+
+/// The card's time of the title's dispatches since the start, as the split
+/// of the card's time by kind measures it (`host::gpu_split`): nanoseconds,
+/// runs; `None` while it measures nothing.
+fn dispatch_time() -> Option<(u64, u64)> {
+    use crate::host::gpu_split::{Kind, measured};
+    let (a, b) = (measured(Kind::Dispatches)?, measured(Kind::Wave64)?);
+    Some((a.0 + b.0, a.1 + b.1))
+}
+
+/// What the split of the card's time by kind says of the stage's dispatches
+/// (`before`: [`dispatch_time`] ahead of them): where it is on they must have
+/// a time, more than none; where the driver refuses timestamp queries on the
+/// queue, or the split is off (`VICTORY_GPU_SPLIT=0`), that is said and
+/// nothing is checked.
+fn dispatches_timed(before: Option<(u64, u64)>) -> Result<String, Failed> {
+    use victory_pipeline::report::GpuSplit;
+    match (crate::host::gpu_split::state(), dispatch_time()) {
+        (GpuSplit::On, Some((ns, runs))) => {
+            let (was_ns, was_runs) = before.unwrap_or_default();
+            if runs <= was_runs || ns <= was_ns {
+                return Err("the card's time by kind (VICTORY_GPU_SPLIT) measured no time for the stage's dispatches".into());
+            }
+            Ok(format!("the card's time of the dispatches measured ({} runs)", runs - was_runs))
+        }
+        (GpuSplit::Off, _) => Ok("the card's time by kind not measured (VICTORY_GPU_SPLIT=0)".into()),
+        (GpuSplit::Refused, _) => Ok("the card's time by kind not measured: the driver refuses timestamp queries".into()),
+        _ => Err("the card's time by kind (VICTORY_GPU_SPLIT) never began on the stage's dispatches".into()),
+    }
 }
 
 fn rates(title: &Title, measured: Bench) -> Vec<Rate> {

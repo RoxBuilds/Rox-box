@@ -178,7 +178,7 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (4; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (5; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
 | `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
@@ -211,6 +211,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
 | **`[frame_time.spared]`**, **`.steady`** | Per frame, work the unified-memory synchronisation switches spared (all 0 with them off; [below](#reading-the-spared-work)) |
+| **`[gpu_time]`**, **`[gpu_time.steady]`** | Per frame, the card's own time on the host queue by kind of work (the title's draws and dispatches, each kind of bookkeeping of ours), what our work moved, and the memory the budget governor saw meanwhile; the steady state as `[frame_time.steady]`'s ([below](#reading-the-gpu-time)) |
 | **`[pipelines]`** | `created_by_title`; host pipelines `host_made_now` (compiled during the run) and `host_from_library`; `host_failed` |
 | **`[shaders]`** | Translations `translated_now`, `from_cache`, `failed` |
 | **`[shaders.failures]`** | Failed translations by the translator's own kind (`not_a_container`, `malformed`, `native_code`, `unsupported`) and wording |
@@ -283,6 +284,83 @@ fills, textures), `step_of_ours`, `lists_in_the_air` (more lists sent ahead
 than `VICTORY_LATE_WAIT_LISTS` lets fly), `bottom_of_pipe_writes`
 (`VICTORY_LATE_WAIT_WRITES`), `blocking_fence_wait` (the title blocks on a
 fence).
+
+### Reading the GPU time
+
+`[gpu_time]` says what the card spent its own time on, in every build
+(`VICTORY_GPU_SPLIT`, on by default; `host/gpu_split.rs`). A list writes a
+GPU timestamp (`EndQuery` on a TIMESTAMP query heap) where a run of commands
+of one kind begins: the thousands of draws of a frame cost one timestamp each
+time the kind of work changes, not one each. A small list of ours at the end
+of each submission writes one more and resolves them all into a read-back
+buffer, which is read once that submission has landed (where the host already
+learns it): nothing waits for the card to read them, and no command moves.
+
+A run's time is the difference between its timestamp and the next one: when
+the card reached the one point and when it reached the other. It holds the
+run's work, the waits of its barriers, and any time the card waited inside
+those commands for memory to be paged in or made resident (the card's memory
+paged out to the PC's, or the PC's own memory paged to disk). Time the card
+was idle between submissions is in no run, so `measured_ms` is at most the
+card's busy time ([`[frame_time]`](#reading-the-frame-figures)'s `frame_ms`
+times `card_busy_pct`); much less than it means work outside any run (see
+below). Each second the frame line takes what landed in it, so a submission is
+counted in the second it landed, divided by the frames the frame meter counted
+then.
+
+| Key | What |
+|---|---|
+| `split` | `on`; `off` (`VICTORY_GPU_SPLIT=0`: nothing recorded, no query heap); `refused_by_driver` (the queue gave no timestamp frequency or the heap could not be made: logged once, then off); `not_started` (no list has marked a run yet) |
+| `frames`, `partly_measured_pct` | The frame meter's frames; the share of them in which some run could not be given one kind: the frame's budget of boundaries ran out (4,096 by default, `VICTORY_GPU_SPLIT=<n>` sets another, 16 to 16,384) or the heap had no slot left. Such a run is `unattributed_ms` |
+| `draws_ms` | The title's draws, mesh dispatches and indirect draws (with what the list does unmarked behind them: barriers, state) |
+| `dispatches_wave64_ms` | The title's dispatches of compute programs written for 64-lane waves (the console program says so). On a card whose `wave_lanes_max` is 32 these are the programs the translator gives one of its forms for 64-lane waves (meetings at group barriers, halves meeting by themselves, lane-serial, or the approximate form its guard falls back to); the host pipeline does not keep which form, so this is all of them |
+| `dispatches_other_ms` | The title's other dispatches |
+| `title_other_ms` | The title's copies, clears, resolves and texture read-backs |
+| `fills_ms` | Ours: the steps done on the card instead of waiting for flights (`VICTORY_CARD_STEPS`: fills of constant buffers, buffer copies) |
+| `hashes_ms` | Ours: the hash passes over copies in the card's memory after ranges were sent up |
+| `compares_ms` | Ours: the compare passes after a submission's lists |
+| `copy_backs_ms` | Ours: the fetches of pieces shaders wrote in copies in the card's memory (on the drawing queue; with `VICTORY_RELAY_COPY=1` they go over the copy queue and are not measured), and textures copied back at a list's close |
+| `uploads_ms` | Ours: what changed of copies in the card's memory sent up to them |
+| `texture_uploads_ms` | Ours: staging buffers copied into textures |
+| `other_passes_ms` | Ours: twin copies and depth planes, the state preludes, the clamps of indirect arguments, the ambient stand-in, the planes of a present put together, the present's copy |
+| `unattributed_ms` | Runs holding work of more than one kind (see `partly_measured_pct`) |
+| `title_ms`, `ours_ms`, `measured_ms` | The title's four kinds, our seven, and every kind with the unattributed |
+| `fills`, `fills_mb` | Fills done on the card per frame, and their bytes |
+| `hash_passes`, `hashed_mb` | Hash passes per frame, and the bytes they read |
+| `compare_passes`, `compared_mb` | Compare passes per frame, and the bytes they read |
+| `copied_back_mb` | Bytes of the pieces fetched from copies in the card's memory (textures copied back are not in it) |
+| `upload_ranges`, `uploaded_mb` | Ranges sent up to copies in the card's memory per frame, and their bytes |
+| `texture_uploads_mb` | Bytes of staging buffers copied into textures per frame |
+| `governor_looks` and the `*_mib_*` keys | What the budget governor saw at its looks (about one a second, from the asks it makes anyway; none with `VICTORY_BUDGET=0`) while those frames ran: the card's own memory in use (average, peak) and its budget (average), the same of the shared memory (the PC's memory the card uses), free physical memory (average, lowest) |
+| `looks_card_over_budget`, `looks_free_ram_under_512_mib` | Looks that found the card's memory in use past its budget, and free physical memory under 512 MiB |
+
+**Telling the suspects apart.** Read the steady state, and two runs with
+`victory report --diff` where one thing changed:
+
+- **Our bookkeeping** is `ours_ms` against `measured_ms`, and which of its
+  kinds holds it. The volumes say why: `hashed_mb / hashes_ms` and
+  `compared_mb / compares_ms` are MB per ms (GB/s) of those passes. Near the
+  card's bandwidth, the volume is the cost (fewer or smaller ranges would
+  help); far under it with many `hash_passes`, each pass's fixed cost is
+  (fewer, joined passes would help). A small `ours_ms` clears our bookkeeping.
+- **The title's compute in the 64-lane forms** is `dispatches_wave64_ms`
+  against `dispatches_other_ms` and `draws_ms`, and it stays as large in a run
+  with little memory pressure; a run with the forms changed
+  (`VICTORY_WAVE_GUARD`, `VICTORY_WAVE_SERIAL`) moves it alone.
+- **The card's memory paged** shows as every kind growing together while the
+  volumes stay the same (the rates in MB per ms fall), with
+  `looks_card_over_budget`, `card_used_mib_avg` at `card_budget_mib_avg`, much
+  `shared_used_mib_avg`, a low `free_ram_mib_lowest` and
+  `looks_free_ram_under_512_mib` above 0. Compare the whole run with the steady
+  state, or a run with more free memory: time that falls with the pressure,
+  work the same, was waiting for memory.
+
+What it costs: at each change of kind in a list, a load, a lock and an
+`EndQuery`; a submission, one list of ours more (one `EndQuery` and a
+`ResolveQueryData` per run of consecutive slots); a second, reading what
+landed. On the card each timestamp may let the work before it drain before
+it is written (some microseconds each, up to the budget a frame). A 1 MiB
+query heap and a 512 KiB read-back buffer are made at the first mark.
 
 ### Reading the memory map
 
@@ -357,6 +435,9 @@ switch is off.
 | `uploaded_again_changed_unseen` | "changed after its upload with nothing to tell of it: uploaded again" | The title rewrote textures in a way no watch saw; each was found by looking again |
 | `uploaded_again_while_full` | Uploads of textures already on the card made while it had no room | Bytes spent while the card was full |
 | `smallest_levels_only`, `_mib` | "host copies of only the smallest levels" made while the card had no room (`VICTORY_TEXTURE_TAIL`) | Textures shown blurry for want of card memory |
+| `detail_cut_for_card`, `detail_cut_for_pc` | Host copies made with fewer levels for the card's band, and for the PC's commit (`VICTORY_TEXTURE_DETAIL=pc` only) | Textures shown blurry, and for which shortage |
+| `made_whole_in_pool_room` | Slots whose texture was made whole in the room the blocks of textures had free while the card counted short (`VICTORY_CARD_SHORT`) | Detail kept where the card's memory was there |
+| `not_shown_unwritten` | Slots that showed the neutral texture, or fewer levels, instead of a host copy's memory no upload went into (`VICTORY_SHOW_WRITTEN`) | Uploads held back or late; nothing unwritten was shown |
 | `refresh_ms`, `refresh_ms_steady` | "texture refreshes per frame, all threads: N ms" | Texture work on every thread, the submitting one included |
 
 ### Reading `[memory.views]`
@@ -397,7 +478,7 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 4
+format = 5
 kind = "run"
 
 [rox_box]
@@ -575,6 +656,104 @@ slot_writes_sparing_spans = 0.00
 heap_rounds_begun_first = 0.00
 heap_rounds_asked_at_submit = 0.00
 
+[gpu_time]
+# the card's own time on the host queue per frame by kind of work, ms (GPU timestamps around
+# runs of commands of one kind; VICTORY_GPU_SPLIT), what our work moved, MB (10^6 bytes), and
+# the memory the budget governor saw meanwhile, MiB; whole run here, [gpu_time.steady] as
+# [frame_time.steady]
+split = "on"
+frames = 1000
+partly_measured_pct = 2.00
+# the title's work
+draws_ms = 6.00
+dispatches_wave64_ms = 3.50
+dispatches_other_ms = 1.20
+title_other_ms = 0.40
+# ours
+fills_ms = 0.80
+hashes_ms = 2.10
+compares_ms = 1.30
+copy_backs_ms = 0.30
+uploads_ms = 0.60
+texture_uploads_ms = 0.20
+other_passes_ms = 0.50
+# runs no one kind could be given (past the frame's budget of boundaries)
+unattributed_ms = 0.10
+# sums: the title's, ours, and all measured (the unattributed with them)
+title_ms = 11.10
+ours_ms = 5.80
+measured_ms = 17.00
+# what our work moved, per frame
+fills = 2800.00
+fills_mb = 0.90
+hash_passes = 80.00
+hashed_mb = 10.50
+compare_passes = 7.00
+compared_mb = 488.00
+copied_back_mb = 3.20
+upload_ranges = 580.00
+uploaded_mb = 52.00
+texture_uploads_mb = 1.50
+# memory while those frames ran: the budget governor's looks (about one a second), MiB
+governor_looks = 60
+card_used_mib_avg = 7100.00
+card_used_mib_peak = 7300.00
+card_budget_mib_avg = 7600.00
+shared_used_mib_avg = 4800.00
+shared_used_mib_peak = 5100.00
+shared_budget_mib_avg = 7900.00
+free_ram_mib_avg = 900.00
+free_ram_mib_lowest = 612.00
+looks_card_over_budget = 3
+looks_free_ram_under_512_mib = 0
+
+[gpu_time.steady]
+from_s = 40.00
+frames = 370
+partly_measured_pct = 0.00
+# the title's work
+draws_ms = 5.50
+dispatches_wave64_ms = 3.60
+dispatches_other_ms = 1.10
+title_other_ms = 0.30
+# ours
+fills_ms = 0.80
+hashes_ms = 2.00
+compares_ms = 1.30
+copy_backs_ms = 0.30
+uploads_ms = 0.50
+texture_uploads_ms = 0.10
+other_passes_ms = 0.40
+# runs no one kind could be given (past the frame's budget of boundaries)
+unattributed_ms = 0.00
+# sums: the title's, ours, and all measured (the unattributed with them)
+title_ms = 10.50
+ours_ms = 5.40
+measured_ms = 15.90
+# what our work moved, per frame
+fills = 2800.00
+fills_mb = 0.90
+hash_passes = 80.00
+hashed_mb = 10.50
+compare_passes = 7.00
+compared_mb = 488.00
+copied_back_mb = 3.20
+upload_ranges = 580.00
+uploaded_mb = 52.00
+texture_uploads_mb = 1.50
+# memory while those frames ran: the budget governor's looks (about one a second), MiB
+governor_looks = 20
+card_used_mib_avg = 7100.00
+card_used_mib_peak = 7300.00
+card_budget_mib_avg = 7600.00
+shared_used_mib_avg = 4800.00
+shared_used_mib_peak = 5100.00
+shared_budget_mib_avg = 7900.00
+free_ram_mib_avg = 900.00
+free_ram_mib_lowest = 612.00
+looks_card_over_budget = 3
+looks_free_ram_under_512_mib = 0
+
 [pipelines]
 created_by_title = 4212
 host_made_now = 310
@@ -643,67 +822,29 @@ ownerless_entries_dropped = 52000
 # MiB, sampled when the report is written; a category left out is one nothing counted (not known)
 # private: what the process holds in its own private memory; accounted_total is their sum,
 # unaccounted the process's private commit less it (the driver, the title's own heaps, what is not counted)
-process_private_commit_mib = 18700
-accounted_total_mib = 9300
-unaccounted_mib = 9400
+process_private_commit_mib = 9000
+accounted_total_mib = 6200
+unaccounted_mib = 2800
 # private memory, in the total
-title_committed_mib = 4100
-title_default_blocks_mib = 120
-title_buffer_copies_mib = 900
-windows_of_title_memory_mib = 2100
-snapshot_buffers_mib = 64
+title_committed_mib = 4000
+windows_of_title_memory_mib = 1500
 list_scratch_mib = 700
-list_upload_buffers_mib = 250
-texture_staging_mib = 900
 send_spare_mib = 0
-view_table_mib = 12
-shader_containers_mib = 40
-shader_translations_mib = 60
-pipeline_library_mib = 30
 # beside it (card memory, mapped sections, descriptor heaps): not in the total
-title_page_pool_mib = 6200
-card_textures_filled_mib = 4300
-card_textures_rendered_mib = 1500
-card_texture_tiles_mib = 0
-card_buffer_copies_mib = 800
-card_sparse_tiles_mib = 1300
-descriptor_heaps_mib = 96
+card_textures_filled_mib = 3000
 # counts
 host_lists_alive = 640
 
 [memory.map.peak]
 # the most each category held when a report was written (a report is written every 30 s and at the end)
-accounted_total_mib = 9800
-unaccounted_mib = 9500
+accounted_total_mib = 6400
+unaccounted_mib = 3000
 title_committed_mib = 4100
-title_default_blocks_mib = 120
-title_buffer_copies_mib = 1200
-windows_of_title_memory_mib = 2600
-snapshot_buffers_mib = 64
-list_scratch_mib = 900
-list_upload_buffers_mib = 300
-texture_staging_mib = 1100
-send_spare_mib = 0
-view_table_mib = 12
-shader_containers_mib = 40
-shader_translations_mib = 60
-pipeline_library_mib = 30
-title_page_pool_mib = 6200
-card_textures_filled_mib = 4400
-card_textures_rendered_mib = 1500
-card_texture_tiles_mib = 0
-card_buffer_copies_mib = 800
-card_sparse_tiles_mib = 1500
-descriptor_heaps_mib = 96
+windows_of_title_memory_mib = 1600
+list_scratch_mib = 800
+send_spare_mib = 100
+card_textures_filled_mib = 3100
 host_lists_alive = 700
-
-[memory.view_copies]
-# copies of buffer views' own bytes since the start: cut from blocks (VICTORY_VIEW_BYTES_POOL), buffers of their own made
-cut_from_blocks = 48000
-own_buffers_made = 30
-# the blocks they are cut from now, and their MiB
-blocks = 14
-blocks_mib = 14
 
 [textures]
 # textures picked by index (from the view heap by shaders), since the start
@@ -716,6 +857,10 @@ uploaded_again_changed_unseen = 7
 uploaded_again_while_full = 0
 smallest_levels_only = 330
 smallest_levels_only_mib = 21
+detail_cut_for_card = 0
+detail_cut_for_pc = 0
+made_whole_in_pool_room = 0
+not_shown_unwritten = 0
 # texture refreshes on all threads, ms per frame (whole run, steady state)
 refresh_ms = 4.50
 refresh_ms_steady = 1.62
@@ -780,6 +925,16 @@ calls = 1
   second, not every pass's.
 - **`[memory.pressure]` with `VICTORY_BUDGET=0`** has no lowest free memory
   or commit headroom and no time at the levels: the governor does not look.
+  `[gpu_time]` then has no memory figures either.
+- **`[gpu_time]`** counts a submission in the second it landed, not the frame
+  it was made in. Not measured: the relay's fetches over the copy queue
+  (`VICTORY_RELAY_COPY=1`), the compares sent ahead of a plan's sends
+  (`VICTORY_CARD_JOIN`), and lists other threads of ours put on the queue on
+  their own (textures loaded ahead, tile mappings). A run that spans two of a
+  submission's calls to the queue holds whatever another thread put there
+  between them (a fetch of the relay's on the drawing queue): counted twice.
+  Commands of ours inside the title's lists that are not marked (barriers,
+  batched clamps) are in the run before them.
 
 ## Adding to it
 

@@ -1889,6 +1889,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1991,26 +1992,26 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let buffer = match list.place_source(data as usize, bytes as usize) {
+            let (buffer, at) = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
+                Some(buffer) => (buffer, 0),
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some((buffer, at, staging)) = list.upload_at(host, bytes) else {
                         return;
                     };
-                    // The list owns this mapped D3D12 upload buffer. Wine can
+                    // The list owns this mapped D3D12 upload memory. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
                     list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
-                    buffer
+                    (buffer, at)
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = at;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
             }
             _upload = buffer;
         } else {
@@ -2105,6 +2106,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -2177,6 +2179,7 @@ fn read_back(
             src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
         )
     });
+    list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
@@ -2238,6 +2241,7 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
@@ -2318,6 +2322,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -2362,6 +2367,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        list.gpu_kind(crate::host::gpu_split::Kind::TitleOther);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

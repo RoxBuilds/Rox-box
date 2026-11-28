@@ -138,6 +138,10 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// A compute program written for 64-lane waves, as the console program
+    /// says (`NativeProgram::wave64`): its dispatches are timed apart
+    /// (`crate::host::gpu_split`).
+    pub(crate) wave64: bool,
 }
 
 #[cfg(windows)]
@@ -212,6 +216,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let wave64 = programs.iter().any(|p| p.stage == HwStage::Cs && p.wave64);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -229,6 +234,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
+        wave64,
     })
 }
 
