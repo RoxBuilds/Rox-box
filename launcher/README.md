@@ -16,8 +16,8 @@ next to `victory.exe`, `play.cmd` and `play.ps1` (or from the source tree).
 - **Library / Play**: the active title as a hero card with one big button. It
   is **PLAY**; while shaders are prepared or the title runs it is **STOP**, and
   the line beside it says which, with a clock. Under it the quick toggles
-  (Fast, Log, Safe, Prepare first, console model), then the **system
-  readiness** strip (GPU, VRAM, RAM, page file, preflight), then the library.
+  (Fast, Log, Safe, Prepare first, console model), the **Upscaler** choice and
+  **Pictures of a run**, then the **system readiness** strip (GPU, VRAM, RAM, page file, preflight), then the library.
 - **Diagnostics**: every line of `victory check`, and the maintenance tools.
 - **Settings**, in groups: General & behavior, Launch defaults, Updates,
   Auto-backups, Accessibility, About & folders.
@@ -39,7 +39,10 @@ touch it; PLAY writes it, and so does a button in Settings.
 |---|---|
 | **Add folder / drop** | A folder dialog, or a folder (or a title's `.exe`) dropped on the window. Several are kept; the active one is the title of every command. |
 | **PLAY** | `victory.exe play [--fast] [--safe] [--log] [--console series-s] [--shots N] [--warm]`, with the title folder as `VICTORY_GAME_DIR` and the saved switches as variables of the run: no script and no PowerShell in between. It checks the PC, translates the shaders when they are stale, then starts the title; the status line says which step it is at. **Prepare first** adds `--warm`: the pipeline warm-up runs first when it is stale. An engine older than `victory play` is started the old way, `play.ps1 <folder> [-Fast] ...` as `play.cmd` starts it. |
-| **Pictures of a run** | Settings, Launch defaults: adds `-Shots <seconds>` to the run (a half-size picture every so often, into `<data_dir>\shots`). Shown only when the engine's `play.ps1` has the option. |
+| **Pictures of a run** | A toggle on the Play page (and in Settings, Launch defaults, where the interval is): adds `-Shots <seconds>` to the run (a half-size picture every so often, into `<data_dir>\shots`). Shown only when the engine's `play.ps1` has the option. |
+| **Upscaler** | On the Play page, three choices kept in `local\launcher.toml`: *Host FSR (if installed)* (the default: `VICTORY_HOST_UPSCALER=1` when `vendor\amd_fidelityfx_dx12.dll` is beside `victory.exe` or under the engine's `data_dir`, nothing otherwise; the page says installed or not, and links `docs/upscaling.md`); *Title's own* (`VICTORY_HOST_UPSCALER=0`); *Title's simple (faster, grainier)* (`VICTORY_HOST_UPSCALER=0`, and `VICTORY_UPSCALER=<group>` only when Settings, Launch defaults turns on **Local patch group for the simple upscaler**; the value is yours, default 6, and only your own local patch file can define such an upscaler). The launcher ships and knows no upscaler DLL. |
+| **First run notices** | While the status is "Translating shaders (first run of this version)" a line says it happens once and takes a few minutes. When a run prints `WARNING: Pipelines: the warm-up is stale`, a notice with **Warm up now** appears (`victory play --prepare-only --warm` for the active title). |
+| **Safe** | Hover says it turns off the newer optimisations and is for troubleshooting only. |
 | **STOP** | Ends the whole process tree at once: what is started is put into a Windows job object, and Stop ends the job, so `victory.exe` and the title go with the script, also when a parent in between has ended already. (`taskkill /T /F` where the job could not be made.) |
 | **Readiness** | GPU and video memory from `victory check`; RAM, Windows, page file from Windows. It reads; it changes nothing. |
 | **Prepare shaders** | `victory shaders` |
@@ -60,9 +63,11 @@ into `-More` for every run, as toggles in named profiles.
   that is off stays in the profile and is not given to a run.
 - One profile is chosen, or none. A profile can be tied to a title folder:
   choosing that title chooses it.
-- A run is given the chosen profile's switches that are on, then the extra
-  text of Settings; where both name a switch, the extra text stands (it comes
-  later in `-More`). The page shows the exact text, with Copy.
+- A run is given, in this order, the Play page's Upscaler choice, the chosen
+  profile's switches that are on, then the extra text of Settings; where two
+  name a switch, the later stands (it comes later in `-More`), so a profile
+  can override the Upscaler and the extra text overrides both. The page shows
+  the exact text, with Copy.
 
 The launcher knows no switch by name: a name is capitals, digits and `_`, a
 value is one line without `;` or a quote, and that is all it checks. So a
@@ -186,6 +191,17 @@ opens no window. `cargo test` runs its tests; none needs a title or a GPU.
 It is written in Rust with egui, not with a web view: the repository's asset
 policy (`cargo xtask policy`) admits source and text files only, and a web
 front end would need page, style and image files that it refuses.
+
+## When the window cannot open
+
+The window is drawn with OpenGL (eframe's `glow`). It is asked for twice: with
+the graphics driver's own OpenGL, and, if that fails before the window is
+shown, again with a software one (`ROXBOX_RENDERER=software` starts with the
+second). If both fail a message box says what each said, and `--probe` and
+`--export-logs` still work with no window. A DirectX 12 renderer (eframe's
+`wgpu`, DX12 only) was measured and not taken: the release program grew from
+3.6 MB to 6.7 MB and by 61 crates. A PC with no OpenGL 2 at all (some
+Remote Desktop sessions and virtual machines) can play with `play.cmd`.
 
 ## What it needs of the engine
 

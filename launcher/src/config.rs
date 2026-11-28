@@ -165,6 +165,12 @@ pub struct Library {
     pub shots: bool,
     /// Seconds between pictures (1 to 86400).
     pub shots_every: u32,
+    /// The Upscaler of the Play page: one of [`crate::upscaler::CHOICES`]' keys.
+    pub upscaler: String,
+    /// "Title's simple" gives the local patch group below (the person's own patch file defines it).
+    pub simple_patch: bool,
+    /// Its value (default [`crate::upscaler::DEFAULT_GROUP`]).
+    pub simple_group: String,
 }
 
 /// The smallest and largest [`Library::scale`].
@@ -193,6 +199,9 @@ impl Default for Library {
             reduced_motion: false,
             shots: false,
             shots_every: 10,
+            upscaler: "host".to_string(),
+            simple_patch: false,
+            simple_group: crate::upscaler::DEFAULT_GROUP.to_string(),
         }
     }
 }
@@ -220,6 +229,10 @@ impl Library {
                 lib.backup_dir = v;
             } else if let Some(v) = string_value(line, "save_dir") {
                 lib.save_dir = v;
+            } else if let Some(v) = string_value(line, "upscaler") {
+                lib.upscaler = v;
+            } else if let Some(v) = string_value(line, "simple_group") {
+                lib.simple_group = v;
             } else if let Some((key, value)) = line.split_once('=') {
                 let on = value.trim() == "true";
                 match key.trim() {
@@ -232,6 +245,7 @@ impl Library {
                     "high_contrast" => lib.high_contrast = on,
                     "reduced_motion" => lib.reduced_motion = on,
                     "shots" => lib.shots = on,
+                    "simple_patch" => lib.simple_patch = on,
                     "shots_every" => lib.shots_every = value.trim().parse().unwrap_or(10),
                     "backup_keep" => lib.backup_keep = value.trim().parse().unwrap_or(lib.backup_keep).min(99),
                     "scale" => lib.scale = value.trim().parse().unwrap_or(100),
@@ -247,6 +261,13 @@ impl Library {
         }
         lib.scale = lib.scale.clamp(SCALE.0, SCALE.1);
         lib.shots_every = lib.shots_every.clamp(1, 86_400);
+        if !crate::upscaler::CHOICES.iter().any(|(key, _)| *key == lib.upscaler) {
+            lib.upscaler = "host".to_string();
+        }
+        lib.simple_group = lib.simple_group.trim().to_string();
+        if lib.simple_group.is_empty() || !crate::switches::valid_value(&lib.simple_group) {
+            lib.simple_group = crate::upscaler::DEFAULT_GROUP.to_string();
+        }
         if lib.console != "SeriesS" {
             lib.console = "SeriesX".to_string();
         }
@@ -278,7 +299,7 @@ impl Library {
             toml_path(&self.on_play)
         );
         out += &format!(
-            "\nauto_update = {}\nbackup = {}\nbackup_dir = {}\nbackup_keep = {}\nsave_dir = {}\n\nscale = {}\nhigh_contrast = {}\nreduced_motion = {}\n\nshots = {}\nshots_every = {}\n",
+            "\nauto_update = {}\nbackup = {}\nbackup_dir = {}\nbackup_keep = {}\nsave_dir = {}\n\nscale = {}\nhigh_contrast = {}\nreduced_motion = {}\n\nshots = {}\nshots_every = {}\n\nupscaler = {}\nsimple_patch = {}\nsimple_group = {}\n",
             self.auto_update,
             self.backup,
             toml_path(&self.backup_dir),
@@ -288,7 +309,10 @@ impl Library {
             self.high_contrast,
             self.reduced_motion,
             self.shots,
-            self.shots_every
+            self.shots_every,
+            toml_path(&self.upscaler),
+            self.simple_patch,
+            toml_path(&self.simple_group)
         );
         out
     }
@@ -390,6 +414,9 @@ mod tests {
         lib.reduced_motion = true;
         lib.shots = true;
         lib.shots_every = 30;
+        lib.upscaler = "simple".to_string();
+        lib.simple_patch = true;
+        lib.simple_group = "9".to_string();
         assert_eq!(Library::parse(&lib.render()), lib);
         lib.remove("C:\\Titles\\One");
         assert_eq!(lib.active.as_deref(), Some("D:\\Two"));
@@ -403,6 +430,8 @@ mod tests {
         assert_eq!(Library::parse("scale = 10\n").scale, 85);
         assert_eq!(Library::parse("backup_keep = 500\n").backup_keep, 99);
         assert_eq!(Library::parse("shots_every = 0\n").shots_every, 1);
+        assert_eq!(Library::parse("upscaler = 'bogus'\nsimple_group = 'a;b'\n"), Library::default());
+        assert_eq!(Library::parse("simple_group = ''\n").simple_group, "6");
     }
 
     #[test]

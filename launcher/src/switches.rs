@@ -110,17 +110,17 @@ impl Profile {
     }
 }
 
-/// What a run is given as `-More`: the active profile's switches, then the
-/// extra text of Settings (whose pairs come later, so they stand where both
-/// name the same switch).
-pub fn more_for_run(profile: Option<&Profile>, extra: &str) -> String {
+/// What a run is given as `-More`, in this order so that the later of two
+/// pairs naming the same switch stands: the Play page's toggles (the
+/// Upscaler), then the active profile's switches, then the extra text of
+/// Settings.
+pub fn more_for_run(toggles: &str, profile: Option<&Profile>, extra: &str) -> String {
     let saved = profile.map(Profile::more).unwrap_or_default();
-    let extra = extra.trim().trim_matches(';');
-    match (saved.is_empty(), extra.is_empty()) {
-        (true, _) => extra.to_string(),
-        (false, true) => saved,
-        (false, false) => format!("{saved};{extra}"),
-    }
+    [toggles.trim().trim_matches(';'), saved.as_str(), extra.trim().trim_matches(';')]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 impl Book {
@@ -347,11 +347,16 @@ mod tests {
         let profile = Profile { name: "P".into(), switches: vec![switch("A", "1", true), switch("B", "2", false), switch("C", "x,y", true)] };
         assert_eq!(profile.more(), "A=1;C=x,y");
         assert_eq!(profile.on_count(), 2);
-        assert_eq!(more_for_run(Some(&profile), ""), "A=1;C=x,y");
-        assert_eq!(more_for_run(Some(&profile), " A=9; "), "A=1;C=x,y;A=9", "the extra text comes last, so it stands");
-        assert_eq!(more_for_run(None, " D=4 "), "D=4");
-        assert_eq!(more_for_run(None, ""), "");
-        assert_eq!(more_for_run(Some(&Profile::default()), "D=4"), "D=4");
+        assert_eq!(more_for_run("", Some(&profile), ""), "A=1;C=x,y");
+        assert_eq!(more_for_run("", Some(&profile), " A=9; "), "A=1;C=x,y;A=9", "the extra text comes last, so it stands");
+        assert_eq!(more_for_run("", None, " D=4 "), "D=4");
+        assert_eq!(more_for_run("", None, ""), "");
+        assert_eq!(more_for_run("", Some(&Profile::default()), "D=4"), "D=4");
+        // Toggles first, the profile after them, the extra text last: the later wins.
+        assert_eq!(more_for_run("U=1;V=2", Some(&profile), " A=9 "), "U=1;V=2;A=1;C=x,y;A=9");
+        assert_eq!(more_for_run("U=1", None, ""), "U=1");
+        assert_eq!(more_for_run(" ;U=1; ", None, "D=4"), "U=1;D=4");
+        assert_eq!(more_for_run("U=1", Some(&Profile::default()), ""), "U=1");
     }
 
     #[test]

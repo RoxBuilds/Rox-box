@@ -18,6 +18,7 @@ mod switches;
 mod system;
 mod theme;
 mod update;
+mod upscaler;
 
 use std::collections::VecDeque;
 use std::os::windows::process::CommandExt;
@@ -197,7 +198,16 @@ struct App {
     new_switch: (String, String),
     profile_name: String,
     confirm_delete: bool,
+    /// The host upscaler's DLL, when it was found (beside the engine, or in its data folder).
+    fsr_dll: Option<PathBuf>,
+    /// The engine's warning that the warm-up is stale, from the last run.
+    stale_warmup: Option<String>,
+    /// Whether the launcher script knows `-Shots` (the Pictures toggle is shown only then).
+    shots_known: bool,
 }
+
+/// What the engine says when the pipeline warm-up is stale (it ends in the reason and what happens).
+const STALE_WARMUP: &str = "WARNING: Pipelines: the warm-up is stale";
 
 impl App {
     fn new(ctx: &egui::Context) -> App {
@@ -221,6 +231,9 @@ impl App {
             paste: String::new(),
             new_switch: Default::default(),
             confirm_delete: false,
+            fsr_dll: None,
+            stale_warmup: None,
+            shots_known: home.as_ref().and_then(|h| std::fs::read_to_string(h.play_script()).ok()).is_some_and(|text| runner::knows_shots(&text)),
             saved: lib.clone(),
             look: (lib.high_contrast, lib.reduced_motion),
             scale_shown: lib.scale as f32,
@@ -258,6 +271,7 @@ impl App {
             Some(home) => {
                 // What an update renamed aside while the old program still ran.
                 update::clean_up(&home.root);
+                app.refresh_fsr();
                 app.enqueue_victory(Kind::Version, &["--version"]);
                 app.enqueue_victory(Kind::Check, &["check"]);
                 if app.lib.auto_update {
@@ -316,6 +330,27 @@ impl App {
         command.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
     }
 
+    /// Looks for the host upscaler's DLL again (it is quick: `victory config` reads a file).
+    fn refresh_fsr(&mut self) {
+        let exe = self.victory_exe();
+        let data = config_value(&self.engine_config(), "data_dir");
+        self.fsr_dll = upscaler::find_dll(exe.as_deref().and_then(Path::parent), data.as_deref());
+    }
+
+    /// What the Upscaler choice gives a run (the first of the run's switches).
+    fn upscaler_switches(&self) -> String {
+        upscaler::switches(self.upscaler_choice())
+    }
+
+    fn upscaler_choice(&self) -> upscaler::Choice<'_> {
+        upscaler::Choice { which: &self.lib.upscaler, installed: self.fsr_dll.is_some(), simple_on: self.lib.simple_patch, group: &self.lib.simple_group }
+    }
+
+    /// What a run is given as `-More`: the toggles, the saved switches, then the extra text.
+    fn run_switches(&self) -> String {
+        switches::more_for_run(&self.upscaler_switches(), self.book.active_profile(), &self.lib.more)
+    }
+
     /// Keeps `victory.toml` naming the active title. In a release folder that
     /// happens by itself, when a title is added, chosen or played. In a source
     /// tree the file is a developer's own: it is written only when asked for
@@ -340,7 +375,8 @@ impl App {
         self.sync_config(true);
         // What the run is given: the toggles, with the saved switches before the extra text.
         let mut given = self.lib.clone();
-        given.more = switches::more_for_run(self.book.active_profile(), &self.lib.more);
+        given.more = self.run_switches();
+        self.stale_warmup = None;
         // An engine with `victory play`: one job, no script or PowerShell in between.
         if let Some(exe) = self.victory_exe().filter(|exe| runner::knows_play(exe)) {
             let mut run = runner::play_direct(&exe, &given, false);
@@ -409,12 +445,16 @@ impl App {
     /// Reads what the running command said since the last frame.
     fn poll(&mut self, ctx: &egui::Context) {
         let mut ended = None;
+        let mut stale = None;
         if let Some(job) = &mut self.job {
             let quiet = job.spec.kind.quiet();
             let mut lines = Vec::new();
             while let Ok(event) = job.events.try_recv() {
                 match event {
                     Event::Line(line) => {
+                        if line.starts_with(STALE_WARMUP) {
+                            stale = Some(line.clone());
+                        }
                         if !quiet {
                             lines.push(line.clone());
                         }
@@ -427,6 +467,9 @@ impl App {
             for line in lines {
                 self.say(line);
             }
+        }
+        if stale.is_some() {
+            self.stale_warmup = stale;
         }
         if let Some(how) = ended
             && let Some(job) = self.job.take()
@@ -454,6 +497,7 @@ impl App {
         match kind {
             Kind::Version => self.version = runner::version_of(&job.output.join(" ")),
             Kind::Check => {
+                self.refresh_fsr();
                 let (checks, summary) = system::parse_check(&job.output);
                 self.checks = checks;
                 self.check_summary = summary;
@@ -491,7 +535,13 @@ impl App {
                 self.queue.retain(|s| s.kind != Kind::Launch);
                 self.toast(Mark::Err, "Preparing did not finish: the title was not started. The console says why.");
             }
-            Kind::Prepare => {}
+            Kind::Prepare => {
+                // A warm-up that was asked for and finished is no longer stale.
+                if ok && job.spec.args.iter().any(|a| a == "--warm") {
+                    self.stale_warmup = None;
+                    self.toast(Mark::Ok, "Pipelines warmed.");
+                }
+            }
             Kind::Launch | Kind::Shaders | Kind::Warm => {
                 if kind == Kind::Launch {
                     if self.lib.on_play == "minimize" {
@@ -502,6 +552,9 @@ impl App {
                         self.backup_now();
                     }
                 } else if ok {
+                    if kind == Kind::Warm {
+                        self.stale_warmup = None;
+                    }
                     self.toast(Mark::Ok, if kind == Kind::Shaders { "Shaders prepared." } else { "Pipelines warmed." });
                 }
                 // What a run or a preparation changed, the check should show.
@@ -515,6 +568,20 @@ impl App {
                 self.update_failed(ctx, format!("{} did not finish", kind.label()));
             }
         }
+    }
+
+    /// "Warm up now": `victory play --prepare-only --warm` for the active title.
+    fn warm_now(&mut self, ctx: &egui::Context) {
+        let Some(exe) = self.victory_exe() else {
+            self.toast(Mark::Err, "The engine is not there: nothing to warm up.");
+            return;
+        };
+        if !runner::knows_play(&exe) {
+            self.toast(Mark::Warn, "This engine has no `victory play`: use Diagnostics, Warm cache.");
+            return;
+        }
+        self.queue.push_back(runner::play_direct(&exe, &self.lib, true));
+        self.pump(ctx);
     }
 
     fn add_title(&mut self, path: &Path) {
@@ -1214,12 +1281,19 @@ impl App {
                         ui.label(RichText::new(state).size(17.5).strong().color(theme::text()));
                     });
                     ui.label(RichText::new(detail).color(theme::dim()).small());
+                    let translating = matches!(running, Some((Kind::Launch, _)))
+                        && self.job.as_ref().is_some_and(|j| runner::phase(&j.output) == runner::Phase::Shaders);
+                    if translating {
+                        ui.label(RichText::new("This happens once for each version and takes a few minutes. Next time it is skipped.").color(theme::dim()).small());
+                    }
                 });
             });
             ui.add_space(20.0);
             ui.horizontal_wrapped(|ui| {
                 self.launch_pills(ui);
             });
+            ui.add_space(10.0);
+            self.upscaler_row(ui, ctx);
             ui.add_space(6.0);
             let saved = match self.book.active_profile() {
                 Some(profile) => format!("Switches: {}  \u{00b7}  {} on", profile.name, profile.on_count()),
@@ -1230,6 +1304,28 @@ impl App {
                 self.page = Page::Switches;
             }
         });
+
+        if let Some(line) = self.stale_warmup.clone() {
+            ui.add_space(14.0);
+            theme::banner().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 150.0).max(220.0));
+                        ui.label(RichText::new("The pipeline warm-up is stale").size(16.0).strong().color(theme::text()));
+                        ui.add(egui::Label::new(RichText::new(line.trim_start_matches("WARNING: ")).color(theme::dim()).small()).wrap());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary(ui, "Warm up now", !self.busy() && self.home.is_some())
+                            .on_hover_text("victory play --prepare-only --warm for the active title: makes the pipelines now so the run does not stutter. It can take a while.")
+                            .clicked()
+                        {
+                            self.warm_now(ctx);
+                        }
+                    });
+                });
+            });
+        }
 
         ui.add_space(24.0);
         self.readiness_strip(ui);
@@ -1295,7 +1391,7 @@ impl App {
         if theme::pill(ui, "Log", self.lib.log).on_hover_text("Also write the run's output under %LOCALAPPDATA%\\victory\\logs (play.cmd -Log).").clicked() {
             self.lib.log = !self.lib.log;
         }
-        if theme::pill(ui, "Safe", self.lib.safe).on_hover_text("Newer experimental optimizations off (play.cmd -Safe).").clicked() {
+        if theme::pill(ui, "Safe", self.lib.safe).on_hover_text("Turns off the newer optimisations. For troubleshooting only: the title runs slower, so switch it on to see whether a problem comes from them (play.cmd -Safe).").clicked() {
             self.lib.safe = !self.lib.safe;
         }
         if theme::pill(ui, "Prepare first", self.lib.prepare)
@@ -1308,6 +1404,38 @@ impl App {
         if let Some(model) = theme::segmented(ui, &[("SeriesX", "Series X"), ("SeriesS", "Series S")], &self.lib.console) {
             self.lib.console = model.to_string();
         }
+    }
+
+    /// The Upscaler choice and the Pictures toggle: what a player asks for, not switch text.
+    fn upscaler_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Upscaler").color(theme::dim()));
+            if let Some(choice) = theme::segmented(ui, &upscaler::CHOICES, &self.lib.upscaler) {
+                self.lib.upscaler = choice.to_string();
+            }
+            if self.shots_known {
+                ui.add_space(8.0);
+                if theme::pill(ui, "Pictures of a run", self.lib.shots)
+                    .on_hover_text("Save a half-size picture of the run every few seconds (Settings says how often) into the shots folder of the engine's data folder. Your own data: in no report.")
+                    .clicked()
+                {
+                    self.lib.shots = !self.lib.shots;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if self.lib.upscaler == "host" {
+                if let Some(dll) = &self.fsr_dll {
+                    ui.label(RichText::new("FSR: installed").color(theme::GOOD).small()).on_hover_text(dll.display().to_string());
+                } else {
+                    ui.label(RichText::new("FSR: not installed").color(theme::WARN).small()).on_hover_text(format!("vendor\\{} beside victory.exe or in the engine's data folder", upscaler::FSR_DLL));
+                    if theme::link(ui, "How to install it").on_hover_text("docs/upscaling.md, on GitHub").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(upscaler::DOCS_URL));
+                    }
+                }
+            }
+            ui.label(RichText::new(upscaler::explain(self.upscaler_choice())).color(theme::dim()).small());
+        });
     }
 
     /// Nothing is set up yet: one place to drop a folder, one button.
@@ -1644,7 +1772,7 @@ impl App {
         ui.add_space(18.0);
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let given = switches::more_for_run(self.book.active_profile(), &self.lib.more);
+            let given = self.run_switches();
             ui.horizontal(|ui| {
                 theme::eyebrow(ui, "WHAT A RUN IS GIVEN AS -MORE");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1655,9 +1783,7 @@ impl App {
                 });
             });
             ui.add(egui::Label::new(RichText::new(if given.is_empty() { "(nothing)" } else { given.as_str() }).font(theme::mono(12.5)).color(theme::text())).wrap());
-            if !self.lib.more.trim().is_empty() {
-                ui.label(RichText::new("The end of it is the extra text of Settings, Launch defaults.").color(theme::dim()).small());
-            }
+            ui.label(RichText::new("In this order, so the later of two pairs with one name stands: the Play page's Upscaler, the saved switches above, the extra text of Settings, Launch defaults.").color(theme::dim()).small());
         });
     }
 
@@ -1733,6 +1859,21 @@ impl App {
                 });
                 ui.label(RichText::new("The pictures are your own data: they stay in that folder and are in no report.").color(theme::dim()).small());
             }
+            ui.add_space(12.0);
+            theme::eyebrow(ui, "SIMPLE UPSCALER");
+            ui.horizontal_wrapped(|ui| {
+                if theme::pill(ui, "Local patch group for the simple upscaler", self.lib.simple_patch)
+                    .on_hover_text("Only if your own local patch file defines a simple upscaler: Upscaler, Title's simple then also gives VICTORY_UPSCALER=<this value>. Off: it only switches the host's upscaler off.")
+                    .clicked()
+                {
+                    self.lib.simple_patch = !self.lib.simple_patch;
+                }
+                ui.label(RichText::new("value").color(theme::dim()));
+                ui.add_enabled(
+                    self.lib.simple_patch,
+                    egui::TextEdit::singleline(&mut self.lib.simple_group).font(theme::mono(12.5)).desired_width(80.0).margin(egui::vec2(8.0, 6.0)),
+                );
+            });
             ui.add_space(12.0);
             theme::eyebrow(ui, "EXTRA SWITCHES");
             ui.add(egui::TextEdit::singleline(&mut self.lib.more).font(theme::mono(12.5)).hint_text(RichText::new("VICTORY_NAME=value;VICTORY_OTHER=value").color(theme::faint())).desired_width(f32::INFINITY).margin(egui::vec2(10.0, 8.0)));
@@ -1994,7 +2135,17 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    let options = eframe::NativeOptions {
+    run_window()
+}
+
+/// How a window's OpenGL context is asked for, in the order they are tried:
+/// the driver's own, then a software one (a PC with no graphics driver for
+/// OpenGL, a Remote Desktop session or a virtual machine may still have one).
+/// `ROXBOX_RENDERER=software` starts with the second.
+const RENDERERS: [(&str, eframe::HardwareAcceleration); 2] = [("hardware OpenGL", eframe::HardwareAcceleration::Preferred), ("software OpenGL", eframe::HardwareAcceleration::Off)];
+
+fn options(acceleration: eframe::HardwareAcceleration) -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rox-Box")
             .with_inner_size([1180.0, 820.0])
@@ -2003,18 +2154,54 @@ fn main() -> eframe::Result {
             .with_decorations(false)
             .with_drag_and_drop(true)
             .with_icon(theme::icon()),
+        hardware_acceleration: acceleration,
         ..Default::default()
-    };
-    let shown = eframe::run_native("Rox-Box", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))));
-    if let Err(e) = &shown {
+    }
+}
+
+/// Opens the window, trying [`RENDERERS`] in turn while the failure is the
+/// renderer's: eframe's event loop is kept for a second call (a window can be
+/// opened again after one failed before the app was made), so nothing else
+/// is redone. The MessageBox says what each try ended with.
+fn run_window() -> eframe::Result {
+    let first = usize::from(std::env::var("ROXBOX_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("software")));
+    let mut failures: Vec<String> = Vec::new();
+    let mut last = Ok(());
+    for (name, acceleration) in &RENDERERS[first..] {
+        let made = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = made.clone();
+        let shown = eframe::run_native(
+            "Rox-Box",
+            options(*acceleration),
+            Box::new(move |cc| {
+                flag.set(true);
+                Ok(Box::new(App::new(&cc.egui_ctx)))
+            }),
+        );
+        match shown {
+            Ok(()) => return Ok(()),
+            // The app was made: the window was shown, and what failed is not the renderer.
+            Err(e) if made.get() => {
+                last = Err(e);
+                failures.clear();
+                break;
+            }
+            Err(e) => {
+                failures.push(format!("{name}: {e}"));
+                last = Err(e);
+            }
+        }
+    }
+    if let Err(e) = &last {
         // A windowed program has no console: without this, a PC whose graphics driver cannot
         // draw the window would see nothing at all.
+        let tried = if failures.is_empty() { e.to_string() } else { failures.join("\n") };
         alert(&format!(
-            "The Rox-box window could not be opened: {e}\n\nUpdating the graphics driver usually fixes this. Until then you can still play: \
+            "The Rox-box window could not be opened:\n{tried}\n\nUpdating the graphics driver usually fixes this. Until then you can still play: \
              double-click play.cmd in the Rox-box folder. To collect logs for a bug report, run\n    roxbox-launcher.exe --export-logs"
         ));
     }
-    shown
+    last
 }
 
 #[cfg(test)]
