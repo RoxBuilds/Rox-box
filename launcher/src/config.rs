@@ -161,6 +161,10 @@ pub struct Library {
     pub scale: u32,
     pub high_contrast: bool,
     pub reduced_motion: bool,
+    /// A picture of the run every [`Library::shots_every`] seconds (play.cmd -Shots).
+    pub shots: bool,
+    /// Seconds between pictures (1 to 86400).
+    pub shots_every: u32,
 }
 
 /// The smallest and largest [`Library::scale`].
@@ -187,6 +191,8 @@ impl Default for Library {
             scale: 100,
             high_contrast: false,
             reduced_motion: false,
+            shots: false,
+            shots_every: 10,
         }
     }
 }
@@ -225,6 +231,8 @@ impl Library {
                     "backup" => lib.backup = on,
                     "high_contrast" => lib.high_contrast = on,
                     "reduced_motion" => lib.reduced_motion = on,
+                    "shots" => lib.shots = on,
+                    "shots_every" => lib.shots_every = value.trim().parse().unwrap_or(10),
                     "backup_keep" => lib.backup_keep = value.trim().parse().unwrap_or(lib.backup_keep).min(99),
                     "scale" => lib.scale = value.trim().parse().unwrap_or(100),
                     _ => {}
@@ -238,6 +246,7 @@ impl Library {
             lib.on_play = "stay".to_string();
         }
         lib.scale = lib.scale.clamp(SCALE.0, SCALE.1);
+        lib.shots_every = lib.shots_every.clamp(1, 86_400);
         if lib.console != "SeriesS" {
             lib.console = "SeriesX".to_string();
         }
@@ -269,7 +278,7 @@ impl Library {
             toml_path(&self.on_play)
         );
         out += &format!(
-            "\nauto_update = {}\nbackup = {}\nbackup_dir = {}\nbackup_keep = {}\nsave_dir = {}\n\nscale = {}\nhigh_contrast = {}\nreduced_motion = {}\n",
+            "\nauto_update = {}\nbackup = {}\nbackup_dir = {}\nbackup_keep = {}\nsave_dir = {}\n\nscale = {}\nhigh_contrast = {}\nreduced_motion = {}\n\nshots = {}\nshots_every = {}\n",
             self.auto_update,
             self.backup,
             toml_path(&self.backup_dir),
@@ -277,7 +286,9 @@ impl Library {
             toml_path(&self.save_dir),
             self.scale,
             self.high_contrast,
-            self.reduced_motion
+            self.reduced_motion,
+            self.shots,
+            self.shots_every
         );
         out
     }
@@ -377,6 +388,8 @@ mod tests {
         lib.scale = 125;
         lib.high_contrast = true;
         lib.reduced_motion = true;
+        lib.shots = true;
+        lib.shots_every = 30;
         assert_eq!(Library::parse(&lib.render()), lib);
         lib.remove("C:\\Titles\\One");
         assert_eq!(lib.active.as_deref(), Some("D:\\Two"));
@@ -389,6 +402,7 @@ mod tests {
         assert_eq!(Library::parse("scale = 400\nbackup_keep = 500\n").scale, 150);
         assert_eq!(Library::parse("scale = 10\n").scale, 85);
         assert_eq!(Library::parse("backup_keep = 500\n").backup_keep, 99);
+        assert_eq!(Library::parse("shots_every = 0\n").shots_every, 1);
     }
 
     #[test]

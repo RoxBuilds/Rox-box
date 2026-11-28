@@ -1397,6 +1397,19 @@ impl App {
                     self.lib.build = choice.to_string();
                 }
             }
+            let knows_shots = self.home.as_ref().and_then(|h| std::fs::read_to_string(h.play_script()).ok()).is_some_and(|text| runner::knows_shots(&text));
+            if knows_shots {
+                ui.add_space(12.0);
+                theme::eyebrow(ui, "PICTURES OF A RUN");
+                ui.horizontal_wrapped(|ui| {
+                    if theme::pill(ui, "Save a picture while playing", self.lib.shots).on_hover_text("play.cmd -Shots: a half-size picture of the run, at most 120 a run, into the shots folder of the engine's data folder.").clicked() {
+                        self.lib.shots = !self.lib.shots;
+                    }
+                    ui.label(RichText::new("every").color(theme::dim()));
+                    ui.add_enabled(self.lib.shots, egui::DragValue::new(&mut self.lib.shots_every).range(1..=86_400).speed(0.2).suffix(" s"));
+                });
+                ui.label(RichText::new("The pictures are your own data: they stay in that folder and are in no report.").color(theme::dim()).small());
+            }
             ui.add_space(12.0);
             theme::eyebrow(ui, "EXTRA SWITCHES");
             ui.add(egui::TextEdit::singleline(&mut self.lib.more).font(theme::mono(12.5)).hint_text(RichText::new("VICTORY_NAME=value;VICTORY_OTHER=value").color(theme::faint())).desired_width(f32::INFINITY).margin(egui::vec2(10.0, 8.0)));

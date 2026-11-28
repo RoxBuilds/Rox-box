@@ -99,8 +99,14 @@ pub fn victory(kind: Kind, exe: &Path, args: &[&str], title: Option<&str>) -> Sp
     }
 }
 
+/// Whether a launcher script's text knows `-Shots` (it came with a later
+/// engine: an older script stops at an option it does not know).
+pub fn knows_shots(script: &str) -> bool {
+    script.contains("]$Shots")
+}
+
 /// The options of play.ps1 the toggles stand for (not the title, not
-/// `-Prepare`): the same words a person gives play.cmd.
+/// `-Prepare`, not `-Shots`): the same words a person gives play.cmd.
 pub fn play_options(lib: &Library, source_tree: bool) -> Vec<String> {
     let mut args = Vec::new();
     if lib.fast {
@@ -140,6 +146,9 @@ pub fn play(script: &Path, lib: &Library, source_tree: bool, prepare: bool) -> S
     args.extend(play_options(lib, source_tree));
     if prepare {
         args.push("-Prepare".to_string());
+    } else if lib.shots && std::fs::read_to_string(script).is_ok_and(|text| knows_shots(&text)) {
+        // Pictures are of a run, not of its preparation.
+        args.extend(["-Shots".to_string(), lib.shots_every.to_string()]);
     }
     Spec {
         kind: if prepare { Kind::Prepare } else { Kind::Launch },
@@ -438,6 +447,26 @@ mod tests {
         let prepare = play(script, &lib(), true, true);
         assert_eq!(prepare.kind, Kind::Prepare);
         assert_eq!(prepare.args.last().map(String::as_str), Some("-Prepare"));
+    }
+
+    #[test]
+    fn shots_are_asked_for_only_of_a_script_that_knows_them() {
+        assert!(knows_shots("    [ValidateRange(1, 86400)][int]$Shots,\n"));
+        assert!(!knows_shots("param([switch]$Fast, [switch]$Log)\n# -Shots is not here"));
+        let dir = std::env::temp_dir().join(format!("roxbox-launcher-shots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (new, old) = (dir.join("new.ps1"), dir.join("old.ps1"));
+        std::fs::write(&new, "param([int]$Shots)").unwrap();
+        std::fs::write(&old, "param([switch]$Fast)").unwrap();
+        let mut l = lib();
+        l.shots = true;
+        l.shots_every = 30;
+        assert_eq!(play(&new, &l, false, false).args[play(&new, &l, false, false).args.len() - 2..], ["-Shots", "30"]);
+        assert!(!play(&old, &l, false, false).args.contains(&"-Shots".to_string()), "an older script is not given it");
+        assert!(!play(&new, &l, false, true).args.contains(&"-Shots".to_string()), "nor is a preparation");
+        l.shots = false;
+        assert!(!play(&new, &l, false, false).args.contains(&"-Shots".to_string()));
     }
 
     #[test]

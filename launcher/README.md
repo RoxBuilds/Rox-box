@@ -39,6 +39,7 @@ touch it; PLAY writes it, and so does a button in Settings.
 |---|---|
 | **Add folder / drop** | A folder dialog, or a folder (or a title's `.exe`) dropped on the window. Several are kept; the active one is the title of every command. |
 | **PLAY** | `play.ps1 <folder> [-Fast] [-Safe] [-Log] [-Build ..] [-Console SeriesS] [-More "..."]`, started the way `play.cmd` starts it. **Prepare first** runs the same with `-Prepare` before it and starts the title only if that succeeds. |
+| **Pictures of a run** | Settings, Launch defaults: adds `-Shots <seconds>` to the run (a half-size picture every so often, into `<data_dir>\shots`). Shown only when the engine's `play.ps1` has the option. |
 | **STOP** | Ends the whole process tree at once: what is started is put into a Windows job object, and Stop ends the job, so `victory.exe` and the title go with the script, also when a parent in between has ended already. (`taskkill /T /F` where the job could not be made.) |
 | **Readiness** | GPU and video memory from `victory check`; RAM, Windows, page file from Windows. It reads; it changes nothing. |
 | **Prepare shaders** | `victory shaders` |
