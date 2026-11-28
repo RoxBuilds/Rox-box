@@ -192,6 +192,34 @@ pub fn validate_title_exe(exe: &Path) -> Result<()> {
     }
 }
 
+/// The host upscaler (docs/upscaling.md): the user's FSR DLL where a run
+/// looks for it, loaded and asked which upscaler it has. Optional: without
+/// it a title's own upscaler runs.
+fn upscaler_item(cfg: &Config) -> Item {
+    #[cfg(windows)]
+    {
+        let places = victory_gpu::upscale::Places {
+            configured: cfg.upscaler_dll.clone(),
+            exe_dir: std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)),
+            data_dir: Some(cfg.data_dir.clone()),
+        };
+        match victory_gpu::upscale::probe(&places) {
+            Ok(None) => Item::ok("Host upscaler", "not installed (optional; docs/upscaling.md): a title's own upscaler runs"),
+            Ok(Some((path, version))) => Item::ok("Host upscaler", format!("FSR {version} from {}", path.display())),
+            Err((path, why)) => Item::warn(
+                "Host upscaler",
+                format!("{}: {why}; a title's own upscaler runs", path.display()),
+                "use amd_fidelityfx_dx12.dll from FidelityFX SDK v1.1.x (docs/upscaling.md)",
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cfg;
+        Item::ok("Host upscaler", "Windows only")
+    }
+}
+
 /// The user's optional files: each one that is configured must be there and
 /// well formed (one that is not is otherwise left out without a word).
 pub fn optional_files(cfg: &Config) -> Vec<Item> {
@@ -498,6 +526,7 @@ fn user_items(cfg: &Config, exe: Option<&Path>) -> Vec<Item> {
         });
     }
     items.extend(optional_files(cfg));
+    items.push(upscaler_item(cfg));
     for dir in &cfg.test_titles {
         if let Some(inside) = game_files_in_source_tree(dir) {
             items.push(Item::warn("Test title folder", inside, MOVE_GAME_FILES));

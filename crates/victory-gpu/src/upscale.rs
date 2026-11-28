@@ -95,6 +95,30 @@ pub fn dll() -> Option<&'static std::path::Path> {
         .as_deref()
 }
 
+/// For `victory check`: the user's upscaler DLL in `places`, loaded and
+/// asked which upscaler versions it has for a device of the default
+/// adapter. `Ok(None)`: none found (optional); `Ok(Some((path, version)))`:
+/// a run would use it; `Err((path, why))`: found, and a run would fall back
+/// to the title's own upscaler for that reason.
+#[cfg(windows)]
+pub fn probe(places: &Places) -> Result<Option<(std::path::PathBuf, String)>, (std::path::PathBuf, String)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+    use windows::core::Interface;
+    let found = discover(places, &|p| p.is_file(), &|p| p.is_dir());
+    let Some((path, _)) = found.dll else { return Ok(None) };
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: an out pointer for the device; no adapter: the default one.
+    if let Err(e) = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) } {
+        return Err((path, format!("no Direct3D 12 device to ask it with ({e})")));
+    }
+    let Some(device) = device else { return Err((path, "no Direct3D 12 device to ask it with".to_owned())) };
+    match fsr::Fsr::load(&path, device.as_raw()) {
+        Ok(fsr) => Ok(Some((path, fsr.version))),
+        Err(why) => Err((path, why)),
+    }
+}
+
 /// Whether a title's FidelityFX entry points are worth binding to shims:
 /// asked for and a DLL found.
 pub fn interposing() -> bool {
