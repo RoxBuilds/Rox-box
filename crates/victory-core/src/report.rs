@@ -502,6 +502,38 @@ fn left_out_total() -> u64 {
     LEFT_OUT.iter().map(|n| n.load(Relaxed)).sum()
 }
 
+/// `[gpu_work.descriptor_slots]`: the dynamic slots of the largest view heap,
+/// which descriptor tables made afresh for draws take (the GPU side's
+/// `descriptor::host::ring` counts them, in this order), sampled whole before
+/// a report is written. Kept apart from [`Stat`].
+pub const DESCRIPTOR_SLOT_KEYS: [&str; 14] = [
+    "pool_slots",
+    "title_slots",
+    "title_heap_slots",
+    "title_slots_used",
+    "tables_made",
+    "slots_taken",
+    "largest_table",
+    "fewest_free_slots",
+    "waits",
+    "waited_ms",
+    "longest_wait_ms",
+    "refused_after_stall",
+    "refused_at_once",
+    "lists_back_when_run",
+];
+
+static DESCRIPTOR_SLOTS: [AtomicU64; DESCRIPTOR_SLOT_KEYS.len()] =
+    [const { AtomicU64::new(0) }; DESCRIPTOR_SLOT_KEYS.len()];
+
+/// The dynamic descriptor slots' counts now, in [`DESCRIPTOR_SLOT_KEYS`]'
+/// order and units.
+pub fn descriptor_slots(values: [u64; DESCRIPTOR_SLOT_KEYS.len()]) {
+    for (at, value) in DESCRIPTOR_SLOTS.iter().zip(values) {
+        at.store(value, Relaxed);
+    }
+}
+
 /// Video memory now, as `[budget, used]` bytes of the card's own memory and
 /// of the PC's memory shared with it (`QueryVideoMemoryInfo`): keeps the
 /// peaks, with the budget at the time of each.
@@ -2622,6 +2654,8 @@ struct Snapshot {
     map: MapSnapshot,
     /// The card's time by kind (`[gpu_time]`).
     gpu_time: GpuTime,
+    /// `[gpu_work.descriptor_slots]` ([`DESCRIPTOR_SLOT_KEYS`]).
+    descriptor_slots: [u64; DESCRIPTOR_SLOT_KEYS.len()],
 }
 
 impl Snapshot {
@@ -2656,6 +2690,7 @@ impl Snapshot {
             gpu: state.gpu.clone(),
             stats: std::array::from_fn(|i| load(&STAT[i])),
             left_out: std::array::from_fn(|i| load(&LEFT_OUT[i])),
+            descriptor_slots: std::array::from_fn(|i| load(&DESCRIPTOR_SLOTS[i])),
             presents: load(&PRESENTS),
             first_present_us,
             intervals: load(&INTERVALS),
@@ -3107,6 +3142,7 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     for why in LeftOut::ALL {
         d.int(why.key(), s.left_out[why as usize]);
     }
+    descriptor_slots_table(d, s);
 
     d.table("frame_time");
     d.comment("per frame, from the meters of the log's once-a-second frame line; ms, MB (10^6 bytes)");
@@ -3295,6 +3331,18 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
         let name = d.quoted(name);
         d.line(format_args!("name = {name}"));
         d.int("calls", calls);
+    }
+}
+
+/// `[gpu_work.descriptor_slots]` (in a function of its own, apart from the
+/// sections beside it).
+fn descriptor_slots_table(d: &mut Doc, s: &Snapshot) {
+    d.table("gpu_work.descriptor_slots");
+    d.comment("the largest view heap's slots for descriptor tables made afresh for draws, whole run: its");
+    d.comment("size beside the title's slots, what was taken, and the tables that waited or were refused");
+    d.comment("(each refusal a draw left out, counted in no_descriptor_slots above; VICTORY_SLOTS_PACED)");
+    for (key, value) in DESCRIPTOR_SLOT_KEYS.iter().zip(s.descriptor_slots) {
+        d.int(key, value);
     }
 }
 
@@ -3761,6 +3809,7 @@ mod tests {
             other_imports: (2, 5),
             map: synthetic_map(),
             gpu_time: synthetic_gpu_time(),
+            descriptor_slots: [262_144, 737_855, 1_200_000, 650_000, 900_000, 9_100_000, 120, 1_200, 40, 310, 95, 0, 0, 8_000],
         }
     }
 
@@ -4019,6 +4068,11 @@ mod tests {
             parsed["gpu_work"]["left_out"]["pipeline_not_ready"].as_integer(),
             Some(1_830)
         );
+        let slots = &parsed["gpu_work"]["descriptor_slots"];
+        assert_eq!(slots.as_table().map(toml::Table::len), Some(DESCRIPTOR_SLOT_KEYS.len()));
+        assert_eq!(slots["pool_slots"].as_integer(), Some(262_144));
+        assert_eq!(slots["largest_table"].as_integer(), Some(120));
+        assert_eq!(slots["lists_back_when_run"].as_integer(), Some(8_000));
         assert_eq!(
             parsed["unimplemented"]["method"][0]["offset"].as_integer(),
             Some(0x218)

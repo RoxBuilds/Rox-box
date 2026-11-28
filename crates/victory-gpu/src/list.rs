@@ -436,6 +436,7 @@ impl Detached {
 pub(crate) fn tables_landed(lists: &mut Vec<Detached>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_AT_LANDING").is_none_or(|v| v != "0")) {
+        TABLES_AT_LANDING.store(true, std::sync::atomic::Ordering::Relaxed);
         for detached in lists.iter_mut() {
             detached._state.tables_done();
         }
@@ -443,6 +444,31 @@ pub(crate) fn tables_landed(lists: &mut Vec<Detached>) {
     if reset_at_landing() && pools() {
         reset_landed(std::mem::take(lists), |host| host.reset_ran(true), give_back, crate::host::retire);
     }
+}
+
+/// Whether [`tables_landed`] gives tables' slots back (it has been asked
+/// once and `VICTORY_TABLES_AT_LANDING` is not `0`).
+#[cfg(windows)]
+static TABLES_AT_LANDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The card has run the submission of these host sides (the fence behind
+/// it has passed), and its landing (the copies back, the resets) is still
+/// to come: with `crate::descriptor::host::ring::paced` the slots of their
+/// descriptor tables go back now, and [`tables_landed`] finds none left to
+/// give back. A landing took up to 105 ms of a frame, and the slots of every
+/// flight in it waited for all of it. As [`tables_landed`] does, and only
+/// where it gives them back at all (it was asked before: the first flight's
+/// go back at its landing).
+#[cfg(windows)]
+pub(crate) fn tables_ran(lists: &mut [Detached]) {
+    if !crate::descriptor::host::ring::paced() || !TABLES_AT_LANDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut back = 0;
+    for detached in lists.iter_mut() {
+        back += u64::from(detached._state.tables_done());
+    }
+    crate::descriptor::host::ring::add(crate::descriptor::host::ring::Count::BackWhenRun, back);
 }
 
 /// Whether the host lists of a flight are reset when it lands

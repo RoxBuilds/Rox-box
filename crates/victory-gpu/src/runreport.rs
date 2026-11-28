@@ -498,6 +498,8 @@ pub fn sample() {
     let [kept, dropped] = crate::descriptor::ownerless_counts();
     report::set(Stat::OwnerlessViewsKept, kept);
     report::set(Stat::OwnerlessViewsDropped, dropped);
+    // `[gpu_work.descriptor_slots]`: the dynamic slots of the view heaps.
+    report::descriptor_slots(crate::descriptor::host::ring::report());
     // One more look at video memory (at most every 32 ms, and it feeds the
     // peaks), in case nothing else asked lately.
     let _ = crate::host::budget::sample();

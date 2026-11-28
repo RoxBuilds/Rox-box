@@ -207,6 +207,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[timeline]`** | Per window since the start (10 s; merged into longer windows to show at most 180): `presents`, `fps` (the last window's over the time the run spent in it, at least 1 s), `worst_frame_ms`. Loading and warm-up come first, then the steady state |
 | **`[gpu_work]`** | Per frame (between two presents; the first present's loading is left out), average and most: `submissions`, `draws` (with mesh dispatches) and `dispatches` run on the host, and those `left_out`; `left_out_avg_steady`, the same over the steady state (below); `submissions_total` |
 | **`[gpu_work.left_out]`** | Draws and dispatches the title recorded and the host did not run, the whole run, by reason: `pipeline_not_ready` (not made within the frame's wait budget), `shader_not_translated`, `pipeline_refused` (by the host), `out_of_memory` (constants, scratch, vertices refused), `no_descriptor_slots`, `indirect_not_bounded`, `ray_tracing_builder_off`, `no_pipeline_set`, `asked_to_leave_out` (a shader of its pipeline is named in `VICTORY_LEAVE_OUT`), `other` |
+| **`[gpu_work.descriptor_slots]`** | The dynamic slots of the largest view heap, which descriptor tables made afresh for a draw take (those holding a constant buffer, or reaching past a host heap smaller than the title's), the whole run: `pool_slots` (2^18 on a host heap capped at 1,000,000 views), `title_slots` (the title's slots with a host slot of their own), `title_heap_slots` (the title's heap), `title_slots_used` (up to the highest title slot seen); `tables_made` and `slots_taken` (runs taken, slots in them), `largest_table`, `fewest_free_slots` (the fewest left after a take: 0 or near it, the ring ran short); `waits` (tables that found no run and waited for slots to come back), `waited_ms` (all of them), `longest_wait_ms`; `refused_after_stall` (waited 1 s with no slot given back at all), `refused_at_once` (on a thread that gives slots back, with `VICTORY_DYNAMIC_WAIT_MS=0`, or after such a stall with nothing back since): each refusal is a draw in `no_descriptor_slots`; `lists_back_when_run` (lists whose slots went back when the card had run them, before their flight's landing). With `VICTORY_SLOTS_PACED=0` the waits are at most `VICTORY_DYNAMIC_WAIT_MS` each and nothing goes back before the landing |
 | **`[frame_time]`** | What a frame cost, per frame over the whole run, from the meters of the log's once-a-second frame line (["Reading the frame figures"](#reading-the-frame-figures)) |
 | **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
@@ -603,6 +604,25 @@ ray_tracing_builder_off = 0
 no_pipeline_set = 0
 asked_to_leave_out = 0
 other = 0
+
+[gpu_work.descriptor_slots]
+# the largest view heap's slots for descriptor tables made afresh for draws, whole run: its
+# size beside the title's slots, what was taken, and the tables that waited or were refused
+# (each refusal a draw left out, counted in no_descriptor_slots above; VICTORY_SLOTS_PACED)
+pool_slots = 262144
+title_slots = 737855
+title_heap_slots = 1200000
+title_slots_used = 650000
+tables_made = 900000
+slots_taken = 9100000
+largest_table = 120
+fewest_free_slots = 1200
+waits = 40
+waited_ms = 310
+longest_wait_ms = 95
+refused_after_stall = 0
+refused_at_once = 0
+lists_back_when_run = 8000
 
 [frame_time]
 # per frame, from the meters of the log's once-a-second frame line; ms, MB (10^6 bytes)

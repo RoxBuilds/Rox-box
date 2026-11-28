@@ -7138,8 +7138,15 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run them (their fences have passed): their tables'
+        // slots need not wait for the copies below.
+        for item in &mut items {
+            if let Late::Run(flight) = item {
+                crate::list::tables_ran(&mut flight.lists);
+            }
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items

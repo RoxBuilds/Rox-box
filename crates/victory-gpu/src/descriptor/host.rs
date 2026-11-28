@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod ring;
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of tens of thousands under its lock kept everyone who writes slots
 /// waiting for milliseconds of a frame).
@@ -159,9 +161,9 @@ pub(crate) struct HostHeap {
     /// waited for most (several percent of their time: each descriptor made
     /// for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<Held>>]>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset), and the recordings waiting for some.
+    next: Mutex<ring::Ring>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once a scene
     /// had taken them all, every later table of the frame searched every
@@ -1648,7 +1650,8 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let at = index - host.count;
+            let taken = (at < host.dynamic).then(|| host.next.lock().unwrap_or_else(|e| e.into_inner()).is_taken(at));
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1901,7 +1904,9 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
 
 /// How long a table that finds no run of free dynamic slots waits for lists
 /// that have run to give theirs back before it is refused
-/// (`VICTORY_DYNAMIC_WAIT_MS`, 50; 0: refused at once, as before). A refused
+/// (`VICTORY_DYNAMIC_WAIT_MS`, 50; 0: refused at once, as before; with
+/// `VICTORY_SLOTS_PACED`, the default, any other value only says that tables
+/// wait: for as long as slots come back, [`ring::paced`]). A refused
 /// table is a draw dropped: on a host heap capped at 1,000,000 views (NVIDIA)
 /// the ring stays at [`DYNAMIC`] (the title's own slots reach about 720,000 of
 /// the 737,855 left to them), and in a busy scene hundreds to thousands of
@@ -1979,6 +1984,10 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        if !sampler {
+            ring::most(ring::Count::TitleHeap, u64::from(count));
+            ring::most(ring::Count::Pool, u64::from(extra));
+        }
         let (heap, count, size) = if sampler && full_sampler_heaps() {
             // The title's slots, the rest null (`fill_null` below), so slot
             // 2,047 of a heap smaller than the most is a null sampler.
@@ -2024,6 +2033,9 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        if !sampler {
+            ring::most(ring::Count::TitleSlots, u64::from(count));
+        }
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         HEAP_BYTES.fetch_add(u64::from(size) * u64::from(step), std::sync::atomic::Ordering::Relaxed);
@@ -2068,7 +2080,7 @@ impl HostHeap {
             away: Mutex::default(),
             keeping: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(ring::Ring::new(extra)),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             given: std::sync::Condvar::new(),
@@ -2180,8 +2192,17 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. Asked for no recording in
+    /// particular: first in [`ring::paced`]'s order.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.dynamic_as(n, 0)
+    }
+
+    /// [`HostHeap::dynamic`] for a table of the recording `order`
+    /// ([`ring::next_order`]): with [`ring::paced`], one that finds no run
+    /// waits as long as slots keep coming back, the oldest recording's first.
+    pub(crate) fn dynamic_as(&self, n: u32, order: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -2189,38 +2210,26 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let paced = ring::paced();
+        // (A thread that gives slots back, or one with no wait asked for,
+        // neither waits nor waits its turn.)
+        let waits = SLOT_WAITS.get() && slot_wait().is_some();
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         // When this table began to wait for slots to come back, and until when
-        // it may ([`slot_wait`]).
+        // it may ([`slot_wait`]; paced: until [`ring::STALL`] after slots were
+        // last given back).
         let mut waiting: Option<(std::time::Instant, std::time::Instant)> = None;
+        // Paced: the count of times slots were given back when the wait was
+        // last looked at, and whether the table waits its turn.
+        let mut gave_seen = 0;
+        let mut queued = false;
         let found = loop {
-            let (next, taken) = &mut *guard;
-            let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-                && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-            let n = n as usize;
-            // Search from `next` on, then from the start (extending past cursor by
-            // n - 1 so contiguous runs crossing the cursor are not missed).
-            let cursor = *next as usize;
-            let end = self.dynamic as usize;
-            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-            let starts = (cursor..end).chain(0..second_end);
-            let mut run = 0;
-            let mut found = None;
-            let mut last = usize::MAX;
-            for at in starts.take(if enough { usize::MAX } else { 0 }) {
-                // A run cannot wrap past the end.
-                if at != last.wrapping_add(1) {
-                    run = 0;
-                }
-                last = at;
-                run = if taken[at] { 0 } else { run + 1 };
-                if run == n {
-                    found = Some(at + 1 - n);
-                    break;
-                }
-            }
-            if found.is_none() && enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+            let ring = &mut *guard;
+            let enough = self.free.load(Relaxed) >= n && n < self.too_long.load(Relaxed);
+            let turn = !paced || !waits || ring.turn(order);
+            let found = if enough && turn { ring.find(n) } else { None };
+            if found.is_none() && enough && turn {
+                self.too_long.fetch_min(n, Relaxed);
             }
             // No run: the slots are held by lists still in the air, which give
             // them back as they land. The table waits for that (the lock is let
@@ -2228,39 +2237,59 @@ impl HostHeap {
             // thread that gives slots back itself, nor while the ring ran dry
             // last time with nothing coming back since.
             let now = std::time::Instant::now();
+            let gave = self.gave.load(SeqCst);
             let until = match (found, waiting) {
                 (Some(_), _) => None,
+                (None, Some((began, until))) if paced => {
+                    // Slots came back since: the line of flights moves, and
+                    // the table goes on waiting.
+                    let until = if gave == gave_seen { until } else { now + ring::STALL };
+                    gave_seen = gave;
+                    waiting = Some((began, until));
+                    (now < until).then_some(until)
+                }
                 (None, Some((_, until))) => (now < until).then_some(until),
                 (None, None) => {
-                    let gave = self.gave.load(std::sync::atomic::Ordering::SeqCst);
-                    let wait = slot_wait().filter(|_| SLOT_WAITS.get() && self.dry.load(std::sync::atomic::Ordering::SeqCst) != gave);
+                    let wait = slot_wait().filter(|_| waits && self.dry.load(SeqCst) != gave);
                     wait.map(|wait| {
-                        waiting = Some((now, now + wait));
-                        now + wait
+                        let until = now + if paced { ring::STALL } else { wait };
+                        waiting = Some((now, until));
+                        gave_seen = gave;
+                        if paced {
+                            ring.wait_in(order);
+                            queued = true;
+                        }
+                        until
                     })
                 }
             };
             let Some(until) = until else { break found };
             guard = self.given.wait_timeout(guard, until - now).map_or_else(|e| e.into_inner().0, |(g, _)| g);
         };
-        if let Some((_began, _)) = waiting {
+        if queued && guard.wait_out(order) {
+            // The next oldest may have its turn now.
+            self.given.notify_all();
+        }
+        if let Some((began, _)) = waiting {
+            let us = began.elapsed().as_micros() as u64;
+            ring::add(ring::Count::Waits, 1);
+            ring::add(ring::Count::WaitedUs, us);
+            ring::most(ring::Count::LongestWaitUs, us);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicWaits, 1);
-                add(C::DynamicWaitNs, _began.elapsed().as_nanos() as u64);
+                add(C::DynamicWaitNs, us * 1000);
             }
             if found.is_none() {
                 // Out of time: tables do not wait again until slots come back.
-                self.dry.store(self.gave.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
+                self.dry.store(self.gave.load(SeqCst), SeqCst);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::DynamicDry, 1);
             }
         }
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        let end = self.dynamic as usize;
         let Some(first) = found else {
+            ring::add(if waiting.is_some() { ring::Count::RefusedStalled } else { ring::Count::RefusedAtOnce }, 1);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -2273,10 +2302,13 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        guard.take(first, n);
+        let free = self.free.fetch_sub(n, Relaxed).saturating_sub(n);
+        ring::add(ring::Count::Tables, 1);
+        ring::add(ring::Count::Slots, u64::from(n));
+        ring::most(ring::Count::Longest, u64::from(n));
+        ring::least(ring::Count::FewestFree, u64::from(free));
+        Some(self.count + first)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -3434,12 +3466,10 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if at < self.dynamic {
+            let given = guard.give(at, at.saturating_add(n));
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
             if given > 0 {
                 // (Under the lock, as the tables that wait look at the count.)
                 self.gave.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3910,6 +3940,8 @@ impl HostHeap {
             }
             return None;
         }
+        // (How much of the host heap the title's slots need: the run report.)
+        ring::most(ring::Count::HighestTitleSlot, u64::from(index) + 1);
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -7894,6 +7926,76 @@ mod tests {
             .unwrap()
         });
         assert!(took < std::time::Duration::from_millis(20), "it did not wait: {took:?}");
+    }
+
+    /// Paced ([`ring::paced`], the default): a table goes on waiting past
+    /// [`ring::STALL`] for as long as slots keep coming back, though none of
+    /// them is a run it can take, and gets its run when one comes.
+    #[test]
+    fn a_paced_table_waits_while_slots_keep_coming_back() {
+        if !ring::paced() {
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let all = heap.dynamic(heap.dynamic).unwrap();
+        let at = std::ptr::from_ref(&heap) as usize;
+        let started = std::time::Instant::now();
+        let got = std::thread::scope(|s| {
+            s.spawn(move || {
+                // SAFETY: the heap outlives this scoped thread.
+                let heap = unsafe { &*(at as *const HostHeap) };
+                // Single slots apart, a fifth of the stall each, for twice
+                // the stall in all; then a run of eight.
+                let step = ring::STALL / 5;
+                for k in 0..10 {
+                    std::thread::sleep(step);
+                    heap.release(all + 2 * k, 1);
+                }
+                std::thread::sleep(step);
+                heap.release(all + 100, 8);
+            });
+            heap.dynamic_as(8, 7)
+        });
+        let waited = started.elapsed();
+        assert_eq!(got, Some(all + 100), "after {waited:?}");
+        assert!(waited > ring::STALL, "it had its run only at the end: {waited:?}");
+    }
+
+    /// Paced: slots that come back go to the oldest recording that waits; a
+    /// younger one waits on until more come back.
+    #[test]
+    fn slots_given_back_go_to_the_oldest_waiting_recording() {
+        if !ring::paced() {
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let all = heap.dynamic(heap.dynamic).unwrap();
+        let at = std::ptr::from_ref(&heap) as usize;
+        // SAFETY (both): the heap outlives the scoped threads.
+        let heap_at = move || unsafe { &*(at as *const HostHeap) };
+        let waiting = |orders: &[u64]| {
+            let ring = heap.next.lock().unwrap_or_else(|e| e.into_inner());
+            orders.iter().all(|&o| ring.waits(o))
+        };
+        std::thread::scope(|s| {
+            let young = s.spawn(move || heap_at().dynamic_as(4, 9));
+            while !waiting(&[9]) {
+                std::thread::yield_now();
+            }
+            let old = s.spawn(move || heap_at().dynamic_as(4, 5));
+            while !waiting(&[5, 9]) {
+                std::thread::yield_now();
+            }
+            heap.release(all, 4);
+            assert_eq!(old.join().unwrap(), Some(all), "the oldest first");
+            assert!(!young.is_finished(), "the younger waits on");
+            heap.release(all + 40, 4);
+            assert_eq!(young.join().unwrap(), Some(all + 40));
+        });
     }
 }
 

@@ -409,6 +409,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// This recording's place in the order its tables are served dynamic
+    /// slots in when the ring is short
+    /// (`crate::descriptor::host::ring::next_order`; 0: none yet).
+    slot_order: u64,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
@@ -432,23 +436,35 @@ impl State {
     /// thousand tables; held until the resets they ran the 131,072 slots
     /// out, and thousands of draws a frame went without their tables.
     /// shortcut: a list the title runs a second time without a reset then
-    /// reads slots others may have taken (logged once).
-    pub(crate) fn tables_done(&mut self) {
+    /// reads slots others may have taken (logged once). Whether it gave
+    /// any back.
+    pub(crate) fn tables_done(&mut self) -> bool {
         if self.tables_gone && self.dynamic.is_empty() {
-            return;
+            return false;
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
+        let gave = !self.dynamic.is_empty();
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
+        self.slot_order = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+        gave
+    }
+
+    /// [`State::slot_order`], taken when first asked for.
+    fn slot_order(&mut self) -> u64 {
+        if self.slot_order == 0 {
+            self.slot_order = crate::descriptor::host::ring::next_order();
+        }
+        self.slot_order
     }
 
     /// Draws and dispatches bound in the list ([`State::bind`]).
@@ -1982,6 +1998,7 @@ impl State {
         compute: bool,
         writes: bool,
     ) -> bool {
+        let order = self.slot_order();
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -2043,7 +2060,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_as(1, order) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -2096,6 +2113,7 @@ impl State {
         compute: bool,
         biased: bool,
     ) -> bool {
+        let order = self.slot_order();
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
@@ -2114,7 +2132,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic_as(1, order) else {
                     return false;
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
@@ -3764,6 +3782,7 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let order = self.slot_order();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
@@ -3913,7 +3932,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic_as(n, order) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
