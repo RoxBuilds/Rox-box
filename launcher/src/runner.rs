@@ -25,6 +25,12 @@ pub enum Kind {
     Report,
     Version,
     Latest,
+    /// An update's checksum file, its package, and the unpacking of it.
+    UpdateChecksum,
+    UpdatePackage,
+    UpdateUnpack,
+    /// The save folder packed into a zip.
+    Backup,
 }
 
 impl Kind {
@@ -39,12 +45,21 @@ impl Kind {
             Kind::Report => "report",
             Kind::Version => "version",
             Kind::Latest => "latest release",
+            Kind::UpdateChecksum => "update checksum",
+            Kind::UpdatePackage => "update download",
+            Kind::UpdateUnpack => "update unpack",
+            Kind::Backup => "save backup",
         }
+    }
+
+    /// What a person started and watches: it turns PLAY into STOP.
+    pub fn foreground(self) -> bool {
+        matches!(self, Kind::Launch | Kind::Prepare | Kind::Shaders | Kind::Warm | Kind::SelfTest)
     }
 
     /// Jobs whose output is for the launcher, not for the console drawer.
     pub fn quiet(self) -> bool {
-        matches!(self, Kind::Check | Kind::Report | Kind::Version | Kind::Latest)
+        matches!(self, Kind::Check | Kind::Report | Kind::Version | Kind::Latest | Kind::UpdateChecksum)
     }
 }
 
@@ -316,9 +331,21 @@ impl Job {
 /// The newest release's tag, asked of GitHub's public API with the curl.exe
 /// Windows ships. Read-only, and only when the person presses the button.
 pub fn latest_release() -> Spec {
+    // `ROXBOX_RELEASE_JSON` names a file to read instead (the API's answer, saved):
+    // the banner and the update's steps can then be looked at without the network.
+    if let Some(file) = std::env::var_os("ROXBOX_RELEASE_JSON") {
+        return Spec {
+            kind: Kind::Latest,
+            program: crate::update::system_tool("cmd.exe"),
+            args: vec!["/c".into(), "type".into(), file.to_string_lossy().into_owned()],
+            envs: Vec::new(),
+            cwd: None,
+            detached: false,
+        };
+    }
     Spec {
         kind: Kind::Latest,
-        program: PathBuf::from("curl.exe"),
+        program: crate::update::system_tool("curl.exe"),
         args: ["-s", "-m", "15", "-H", "User-Agent: roxbox-launcher", "-H", "Accept: application/vnd.github+json", crate::RELEASE_API]
             .iter()
             .map(|a| a.to_string())
@@ -329,12 +356,32 @@ pub fn latest_release() -> Spec {
     }
 }
 
-/// `"tag_name": "<tag>"` out of the API's answer.
-pub fn tag_of(json: &str) -> Option<String> {
-    let rest = &json[json.find("\"tag_name\"")? + 10..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    let tag = &rest[..rest.find('"')?];
-    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || ".-_+".contains(c))).then(|| tag.to_string())
+/// A file of a release fetched to `to` with the curl.exe Windows ships:
+/// redirects followed, nothing written on an error answer.
+pub fn download(kind: Kind, url: &str, to: &Path) -> Spec {
+    Spec {
+        kind,
+        program: crate::update::system_tool("curl.exe"),
+        args: ["-s", "-S", "-L", "--fail", "-m", "900", "-H", "User-Agent: roxbox-launcher", "-o", &to.to_string_lossy(), url]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        envs: Vec::new(),
+        cwd: None,
+        detached: false,
+    }
+}
+
+/// A downloaded package unpacked into `to` with the tar.exe Windows ships.
+pub fn unpack(zip: &Path, to: &Path) -> Spec {
+    Spec {
+        kind: Kind::UpdateUnpack,
+        program: crate::update::system_tool("tar.exe"),
+        args: vec!["-x".into(), "-f".into(), zip.to_string_lossy().into_owned(), "-C".into(), to.to_string_lossy().into_owned()],
+        envs: Vec::new(),
+        cwd: None,
+        detached: false,
+    }
 }
 
 /// `0.2.0` out of `victory 0.2.0` or `v0.2.0`.
@@ -402,10 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn versions_and_tags_are_read() {
-        assert_eq!(tag_of("{\"url\":\"x\",\"tag_name\": \"v0.2.0\",\"name\":\"n\"}").as_deref(), Some("v0.2.0"));
-        assert_eq!(tag_of("{\"message\":\"Not Found\"}"), None);
-        assert_eq!(tag_of("{\"tag_name\":\"<script>\"}"), None);
+    fn versions_are_read_and_compared() {
         assert_eq!(version_of("victory 0.2.0\n").as_deref(), Some("0.2.0"));
         assert_eq!(version_of("v0.10.1").as_deref(), Some("0.10.1"));
         assert_eq!(version_of("no version here"), None);

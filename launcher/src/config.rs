@@ -147,7 +147,24 @@ pub struct Library {
     /// What the launcher's window does when a title starts: `"stay"`,
     /// `"minimize"` (and come back when the title ends) or `"close"`.
     pub on_play: String,
+    /// Ask GitHub for the newest release when the launcher starts.
+    pub auto_update: bool,
+    /// Pack the save folder into a zip after each session.
+    pub backup: bool,
+    /// Where the zips go (empty: `local\backups` beside the engine).
+    pub backup_dir: String,
+    /// How many zips are kept (0: all).
+    pub backup_keep: u32,
+    /// The folder that is packed (empty: the engine's data folder).
+    pub save_dir: String,
+    /// The size of everything in the window, in percent (85 to 150).
+    pub scale: u32,
+    pub high_contrast: bool,
+    pub reduced_motion: bool,
 }
+
+/// The smallest and largest [`Library::scale`].
+pub const SCALE: (u32, u32) = (85, 150);
 
 impl Default for Library {
     fn default() -> Self {
@@ -162,6 +179,14 @@ impl Default for Library {
             console: "SeriesX".to_string(),
             more: String::new(),
             on_play: "stay".to_string(),
+            auto_update: true,
+            backup: false,
+            backup_dir: String::new(),
+            backup_keep: 5,
+            save_dir: String::new(),
+            scale: 100,
+            high_contrast: false,
+            reduced_motion: false,
         }
     }
 }
@@ -185,6 +210,10 @@ impl Library {
                 lib.more = v;
             } else if let Some(v) = string_value(line, "on_play") {
                 lib.on_play = v;
+            } else if let Some(v) = string_value(line, "backup_dir") {
+                lib.backup_dir = v;
+            } else if let Some(v) = string_value(line, "save_dir") {
+                lib.save_dir = v;
             } else if let Some((key, value)) = line.split_once('=') {
                 let on = value.trim() == "true";
                 match key.trim() {
@@ -192,6 +221,12 @@ impl Library {
                     "log" => lib.log = on,
                     "prepare" => lib.prepare = on,
                     "safe" => lib.safe = on,
+                    "auto_update" => lib.auto_update = on,
+                    "backup" => lib.backup = on,
+                    "high_contrast" => lib.high_contrast = on,
+                    "reduced_motion" => lib.reduced_motion = on,
+                    "backup_keep" => lib.backup_keep = value.trim().parse().unwrap_or(lib.backup_keep).min(99),
+                    "scale" => lib.scale = value.trim().parse().unwrap_or(100),
                     _ => {}
                 }
             }
@@ -202,6 +237,7 @@ impl Library {
         if !["minimize", "close"].contains(&lib.on_play.as_str()) {
             lib.on_play = "stay".to_string();
         }
+        lib.scale = lib.scale.clamp(SCALE.0, SCALE.1);
         if lib.console != "SeriesS" {
             lib.console = "SeriesX".to_string();
         }
@@ -231,6 +267,17 @@ impl Library {
             toml_path(&self.console),
             toml_path(&self.more),
             toml_path(&self.on_play)
+        );
+        out += &format!(
+            "\nauto_update = {}\nbackup = {}\nbackup_dir = {}\nbackup_keep = {}\nsave_dir = {}\n\nscale = {}\nhigh_contrast = {}\nreduced_motion = {}\n",
+            self.auto_update,
+            self.backup,
+            toml_path(&self.backup_dir),
+            self.backup_keep,
+            toml_path(&self.save_dir),
+            self.scale,
+            self.high_contrast,
+            self.reduced_motion
         );
         out
     }
@@ -322,6 +369,14 @@ mod tests {
         lib.console = "SeriesS".to_string();
         lib.more = "VICTORY_AMBIENT=0.8;VICTORY_PIPELINE_BOOK=0".to_string();
         lib.on_play = "minimize".to_string();
+        lib.auto_update = false;
+        lib.backup = true;
+        lib.backup_dir = "D:\\Backups".to_string();
+        lib.backup_keep = 9;
+        lib.save_dir = "D:\\Saves".to_string();
+        lib.scale = 125;
+        lib.high_contrast = true;
+        lib.reduced_motion = true;
         assert_eq!(Library::parse(&lib.render()), lib);
         lib.remove("C:\\Titles\\One");
         assert_eq!(lib.active.as_deref(), Some("D:\\Two"));
@@ -331,6 +386,9 @@ mod tests {
     fn what_the_library_does_not_know_falls_back() {
         let lib = Library::parse("build = 'fastest'\nconsole = 'Other'\nactive = 'C:\\gone'\nfast = yes\non_play = 'explode'\n");
         assert_eq!(lib, Library::default());
+        assert_eq!(Library::parse("scale = 400\nbackup_keep = 500\n").scale, 150);
+        assert_eq!(Library::parse("scale = 10\n").scale, 85);
+        assert_eq!(Library::parse("backup_keep = 500\n").backup_keep, 99);
     }
 
     #[test]

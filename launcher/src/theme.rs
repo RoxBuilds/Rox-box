@@ -2,10 +2,16 @@
 //! one accent colour with a soft glow where something is alive. Everything
 //! is drawn here by code, the emblem and the wordmark too: the launcher
 //! ships no image, font or artwork file of any kind.
+//!
+//! Every widget drawn here says what it is to a screen reader (its role and
+//! its name), takes the keyboard's focus and shows a ring when it has it.
+//! A state is never a colour alone: it has a shape and a word as well.
+
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, Pos2, Rect, Response, RichText, Rounding, Sense, Shape, Stroke,
-    TextStyle, Ui, Vec2, pos2, vec2,
+    TextStyle, Ui, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 
 pub const BG: Color32 = Color32::from_rgb(0x0b, 0x0c, 0x0f);
@@ -13,19 +19,54 @@ pub const RAIL: Color32 = Color32::from_rgb(0x0f, 0x11, 0x15);
 pub const CARD: Color32 = Color32::from_rgb(0x15, 0x18, 0x1d);
 pub const CARD_HI: Color32 = Color32::from_rgb(0x1c, 0x20, 0x27);
 pub const WELL: Color32 = Color32::from_rgb(0x07, 0x08, 0x0a);
-pub const LINE: Color32 = Color32::from_rgb(0x26, 0x2b, 0x33);
-pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xee);
-pub const DIM: Color32 = Color32::from_rgb(0x8a, 0x91, 0x9c);
-pub const FAINT: Color32 = Color32::from_rgb(0x55, 0x5b, 0x66);
 pub const ACCENT: Color32 = Color32::from_rgb(0xc8, 0xf0, 0x31);
 pub const ACCENT_DEEP: Color32 = Color32::from_rgb(0x7f, 0x9c, 0x14);
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0x23, 0x2b, 0x10);
 pub const GOOD: Color32 = Color32::from_rgb(0x4a, 0xd6, 0x6d);
 pub const WARN: Color32 = Color32::from_rgb(0xff, 0xb0, 0x20);
-pub const BAD: Color32 = Color32::from_rgb(0xff, 0x55, 0x45);
+pub const BAD: Color32 = Color32::from_rgb(0xff, 0x6b, 0x5c);
+/// The keyboard's focus ring: white, so it shows on the accent too.
+pub const FOCUS: Color32 = Color32::WHITE;
 
 /// Corner radius of cards.
 pub const RADIUS: f32 = 12.0;
+
+static HIGH_CONTRAST: AtomicBool = AtomicBool::new(false);
+static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
+
+/// Body text. On the cards it stands at 15:1 and more.
+pub fn text() -> Color32 {
+    if HIGH_CONTRAST.load(Relaxed) { Color32::WHITE } else { Color32::from_rgb(0xe8, 0xea, 0xee) }
+}
+
+/// Secondary text: 5.5:1 on a card, 11:1 in high contrast.
+pub fn dim() -> Color32 {
+    if HIGH_CONTRAST.load(Relaxed) { Color32::from_rgb(0xd3, 0xd8, 0xe0) } else { Color32::from_rgb(0x8f, 0x97, 0xa3) }
+}
+
+/// The faintest text (counts, hints): 4.6:1 on the ground, 7:1 in high contrast.
+pub fn faint() -> Color32 {
+    if HIGH_CONTRAST.load(Relaxed) { Color32::from_rgb(0xae, 0xb5, 0xc0) } else { Color32::from_rgb(0x7d, 0x85, 0x92) }
+}
+
+/// Edges of cards and controls: quiet, or 4.5:1 in high contrast.
+pub fn line() -> Color32 {
+    if HIGH_CONTRAST.load(Relaxed) { Color32::from_rgb(0x8a, 0x94, 0xa3) } else { Color32::from_rgb(0x26, 0x2b, 0x33) }
+}
+
+/// The contrast of `a` on `b` as WCAG counts it (1 to 21).
+#[cfg(test)]
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let f = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
 
 /// `a` towards `b` by `t` (0 to 1).
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -41,10 +82,13 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
-pub fn apply(ctx: &egui::Context) {
+/// Sets the style. `high_contrast`: brighter text and edges. `reduced_motion`: nothing fades or slides.
+pub fn apply(ctx: &egui::Context, high_contrast: bool, reduced_motion: bool) {
+    HIGH_CONTRAST.store(high_contrast, Relaxed);
+    REDUCED_MOTION.store(reduced_motion, Relaxed);
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Small, sans(12.0)),
+        (TextStyle::Small, sans(12.5)),
         (TextStyle::Body, sans(14.5)),
         (TextStyle::Monospace, mono(12.5)),
         (TextStyle::Button, sans(14.0)),
@@ -55,7 +99,9 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.button_padding = vec2(14.0, 8.0);
     style.spacing.interact_size.y = 32.0;
     style.spacing.scroll.bar_width = 8.0;
+    style.spacing.slider_width = 220.0;
     style.interaction.tooltip_delay = 0.25;
+    style.animation_time = if reduced_motion { 0.0 } else { 0.12 };
 
     let v = &mut style.visuals;
     *v = egui::Visuals::dark();
@@ -65,21 +111,21 @@ pub fn apply(ctx: &egui::Context) {
     v.faint_bg_color = CARD;
     v.window_rounding = Rounding::same(10.0);
     v.menu_rounding = Rounding::same(10.0);
-    v.window_stroke = Stroke::new(1.0_f32, LINE);
+    v.window_stroke = Stroke::new(1.0_f32, line());
     v.selection.bg_fill = ACCENT_SOFT;
-    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    v.selection.stroke = Stroke::new(if high_contrast { 2.0_f32 } else { 1.0_f32 }, FOCUS);
     v.hyperlink_color = ACCENT;
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.rounding = Rounding::same(8.0);
-        w.bg_stroke = Stroke::new(1.0_f32, LINE);
+        w.bg_stroke = Stroke::new(1.0_f32, line());
         w.expansion = 0.0;
         w.weak_bg_fill = CARD_HI;
         w.bg_fill = CARD_HI;
-        w.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        w.fg_stroke = Stroke::new(1.0_f32, text());
     }
     v.widgets.noninteractive.bg_fill = CARD;
-    v.widgets.hovered.weak_bg_fill = mix(CARD_HI, DIM, 0.15);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, DIM);
+    v.widgets.hovered.weak_bg_fill = mix(CARD_HI, dim(), 0.15);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, dim());
     v.widgets.active.weak_bg_fill = ACCENT_SOFT;
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     ctx.set_style(style);
@@ -89,9 +135,9 @@ pub fn apply(ctx: &egui::Context) {
 pub fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .stroke(Stroke::new(1.0_f32, line()))
         .rounding(Rounding::same(RADIUS))
-        .inner_margin(egui::Margin::same(20.0))
+        .inner_margin(egui::Margin::same(22.0))
         .shadow(egui::epaint::Shadow { offset: vec2(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(90) })
 }
 
@@ -100,10 +146,19 @@ pub fn hero(alive: bool) -> egui::Frame {
     let glow = if alive { Color32::from_rgba_unmultiplied(0xc8, 0xf0, 0x31, 26) } else { Color32::from_black_alpha(110) };
     egui::Frame::none()
         .fill(CARD_HI)
-        .stroke(Stroke::new(1.0_f32, if alive { mix(LINE, ACCENT, 0.35) } else { LINE }))
+        .stroke(Stroke::new(1.0_f32, if alive { mix(line(), ACCENT, 0.35) } else { line() }))
         .rounding(Rounding::same(16.0))
-        .inner_margin(egui::Margin::same(28.0))
+        .inner_margin(egui::Margin::same(30.0))
         .shadow(egui::epaint::Shadow { offset: vec2(0.0, 10.0), blur: 36.0, spread: 0.0, color: glow })
+}
+
+/// A banner across the page (an update, a notice).
+pub fn banner() -> egui::Frame {
+    egui::Frame::none()
+        .fill(mix(CARD_HI, ACCENT, 0.05))
+        .stroke(Stroke::new(1.0_f32, mix(line(), ACCENT, 0.5)))
+        .rounding(Rounding::same(RADIUS))
+        .inner_margin(egui::Margin::symmetric(20.0, 14.0))
 }
 
 /// A bar or rail: a flat surface with no edge of its own.
@@ -113,40 +168,132 @@ pub fn surface(fill: Color32, margin: Vec2) -> egui::Frame {
 
 /// A small label in capitals over a group ("ACTIVE TITLE").
 pub fn eyebrow(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(sans(11.5)).color(DIM).extra_letter_spacing(1.6));
+    ui.label(RichText::new(text).font(sans(11.5)).color(dim()).extra_letter_spacing(1.6));
 }
 
 /// A page's heading with its line of explanation.
 pub fn page_title(ui: &mut Ui, title: &str, about: &str) {
-    ui.label(RichText::new(title).font(sans(28.0)).strong());
-    ui.label(RichText::new(about).color(DIM));
+    ui.label(RichText::new(title).font(sans(28.0)).color(text()).strong());
+    ui.label(RichText::new(about).color(dim()));
     ui.add_space(10.0);
 }
 
-fn width_of(ui: &Ui, text: &str, font: &FontId) -> f32 {
-    ui.painter().layout_no_wrap(text.to_string(), font.clone(), TEXT).size().x
+/// A group's heading inside a page.
+pub fn section(ui: &mut Ui, title: &str) {
+    ui.add_space(20.0);
+    ui.label(RichText::new(title).font(sans(18.0)).color(text()).strong());
+    ui.add_space(2.0);
 }
 
+fn width_of(ui: &Ui, text: &str, font: &FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x
+}
+
+/// How far a widget is into its hover (0 to 1); at once with reduced motion.
 fn hover(ui: &Ui, resp: &Response) -> f32 {
+    if REDUCED_MOTION.load(Relaxed) {
+        return if resp.hovered() { 1.0 } else { 0.0 };
+    }
     ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered())
 }
 
-/// A status dot.
-pub fn dot(ui: &Ui, center: Pos2, color: Color32) {
-    ui.painter().circle_filled(center, 7.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40));
-    ui.painter().circle_filled(center, 4.0, color);
+/// The ring around what has the keyboard's focus.
+fn ring(ui: &Ui, resp: &Response, rect: Rect, rounding: f32) {
+    if resp.has_focus() {
+        ui.painter().rect_stroke(rect.expand(3.0), Rounding::same(rounding + 3.0), Stroke::new(2.0_f32, FOCUS));
+    }
+}
+
+/// What a widget is, for a screen reader.
+fn named(resp: &Response, role: WidgetType, enabled: bool, label: &str) {
+    resp.widget_info(|| WidgetInfo::labeled(role, enabled, label));
+}
+
+/// A widget that is chosen or not, for a screen reader.
+fn chosen(resp: &Response, role: WidgetType, on: bool, label: &str) {
+    resp.widget_info(|| WidgetInfo::selected(role, true, on, label));
+}
+
+/// A state, which is never a colour alone: each has its shape and its word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Ok,
+    Warn,
+    Err,
+    /// Not known yet.
+    Off,
+}
+
+impl Mark {
+    pub fn color(self) -> Color32 {
+        match self {
+            Mark::Ok => GOOD,
+            Mark::Warn => WARN,
+            Mark::Err => BAD,
+            Mark::Off => faint(),
+        }
+    }
+
+    /// The word that goes with the shape.
+    pub fn word(self) -> &'static str {
+        match self {
+            Mark::Ok => "OK",
+            Mark::Warn => "WARN",
+            Mark::Err => "ERR",
+            Mark::Off => "\u{2013}",
+        }
+    }
+
+    /// A disc for OK, a triangle for a warning, a square for an error, a ring for unknown.
+    pub fn draw(self, ui: &Ui, c: Pos2) {
+        let p = ui.painter();
+        let color = self.color();
+        match self {
+            Mark::Ok => {
+                p.circle_filled(c, 7.5, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40));
+                p.circle_filled(c, 4.5, color);
+            }
+            Mark::Warn => {
+                p.add(Shape::convex_polygon(vec![pos2(c.x, c.y - 6.0), pos2(c.x + 6.5, c.y + 5.0), pos2(c.x - 6.5, c.y + 5.0)], color, Stroke::NONE));
+            }
+            Mark::Err => {
+                p.rect_filled(Rect::from_center_size(c, vec2(10.0, 10.0)), Rounding::same(1.5), color);
+            }
+            Mark::Off => {
+                p.circle_stroke(c, 4.5, Stroke::new(1.5_f32, color));
+            }
+        }
+    }
+}
+
+/// A mark with its word beside it, as one small widget.
+pub fn mark_word(ui: &mut Ui, mark: Mark) {
+    let font = sans(11.5);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width_of(ui, mark.word(), &font) + 24.0, 20.0), Sense::hover());
+    mark.draw(ui, pos2(rect.left() + 8.0, rect.center().y));
+    ui.painter().text(pos2(rect.left() + 21.0, rect.center().y), Align2::LEFT_CENTER, mark.word(), font, mark.color());
+    named(&resp, WidgetType::Label, true, mark.word());
 }
 
 /// A pill that is on or off.
 pub fn pill(ui: &mut Ui, label: &str, on: bool) -> Response {
     let font = sans(13.5);
-    let size = vec2(width_of(ui, label, &font) + 30.0, 32.0);
+    // A tick before the word when it is on: the state is not the colour alone.
+    let size = vec2(width_of(ui, label, &font) + if on { 46.0 } else { 30.0 }, 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let t = hover(ui, &resp);
     let fill = if on { mix(ACCENT_SOFT, ACCENT, 0.06 * t) } else { mix(CARD, CARD_HI, t) };
-    let edge = if on { ACCENT } else { mix(LINE, DIM, t) };
+    let edge = if on { ACCENT } else { mix(line(), dim(), t) };
     ui.painter().rect(rect, Rounding::same(16.0), fill, Stroke::new(1.0_f32, edge));
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, if on { ACCENT } else { mix(DIM, TEXT, t) });
+    let mut x = rect.left() + 15.0;
+    if on {
+        let c = pos2(x + 5.0, rect.center().y);
+        ui.painter().add(Shape::line(vec![pos2(c.x - 5.0, c.y), pos2(c.x - 1.5, c.y + 4.0), pos2(c.x + 5.5, c.y - 4.5)], Stroke::new(1.8_f32, ACCENT)));
+        x += 16.0;
+    }
+    ui.painter().text(pos2(x, rect.center().y), Align2::LEFT_CENTER, label, font, if on { ACCENT } else { mix(dim(), text(), t) });
+    ring(ui, &resp, rect, 16.0);
+    chosen(&resp, WidgetType::Checkbox, on, label);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -155,7 +302,7 @@ pub fn segmented<'a>(ui: &mut Ui, choices: &[(&'a str, &str)], current: &str) ->
     let font = sans(13.5);
     let widths: Vec<f32> = choices.iter().map(|c| width_of(ui, c.1, &font) + 28.0).collect();
     let (rect, _) = ui.allocate_exact_size(vec2(widths.iter().sum(), 32.0), Sense::hover());
-    ui.painter().rect(rect, Rounding::same(16.0), CARD, Stroke::new(1.0_f32, LINE));
+    ui.painter().rect(rect, Rounding::same(16.0), CARD, Stroke::new(1.0_f32, line()));
     let mut clicked = None;
     let mut x = rect.left();
     for ((value, label), w) in choices.iter().zip(widths) {
@@ -167,7 +314,9 @@ pub fn segmented<'a>(ui: &mut Ui, choices: &[(&'a str, &str)], current: &str) ->
         if on {
             ui.painter().rect(part.shrink(3.0), Rounding::same(13.0), ACCENT_SOFT, Stroke::new(1.0_f32, ACCENT));
         }
-        ui.painter().text(part.center(), Align2::CENTER_CENTER, *label, font.clone(), if on { ACCENT } else { mix(DIM, TEXT, t) });
+        ui.painter().text(part.center(), Align2::CENTER_CENTER, *label, font.clone(), if on { ACCENT } else { mix(dim(), text(), t) });
+        ring(ui, &resp, part.shrink(3.0), 13.0);
+        chosen(&resp, WidgetType::RadioButton, on, label);
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && !on {
             clicked = Some(*value);
         }
@@ -189,18 +338,18 @@ pub fn big_button(ui: &mut Ui, label: &str, kind: Big) -> Response {
     let t = hover(ui, &resp);
     let (fill, ink, glow) = match kind {
         Big::Play => (mix(ACCENT, Color32::WHITE, 0.18 * t), BG, Some(ACCENT)),
-        Big::Stop => (mix(Color32::from_rgb(0x3a, 0x14, 0x12), BAD, 0.25 * t), BAD, Some(BAD)),
-        Big::Off => (CARD, FAINT, None),
+        Big::Stop => (mix(Color32::from_rgb(0x3a, 0x14, 0x12), BAD, 0.25 * t), Color32::from_rgb(0xff, 0xc9, 0xc3), Some(BAD)),
+        Big::Off => (CARD, faint(), None),
     };
     if let Some(g) = glow {
-        for (grow, alpha) in [(10.0, 10), (6.0, 20), (3.0, 34)] {
-            let a = (f32::from(alpha as u8) * (0.6 + 0.4 * t)) as u8;
+        for (grow, alpha) in [(10.0, 10.0), (6.0, 20.0), (3.0, 34.0)] {
+            let a = (alpha * (0.6 + 0.4 * t)) as u8;
             ui.painter().rect_filled(rect.expand(grow), Rounding::same(14.0 + grow), Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), a));
         }
     }
     let edge = match kind {
         Big::Stop => BAD,
-        Big::Off => LINE,
+        Big::Off => line(),
         Big::Play => fill,
     };
     ui.painter().rect(rect, Rounding::same(14.0), fill, Stroke::new(1.0_f32, edge));
@@ -218,45 +367,61 @@ pub fn big_button(ui: &mut Ui, label: &str, kind: Big) -> Response {
         }
     }
     ui.painter().text(pos2(rect.center().x + 8.0, rect.center().y), Align2::CENTER_CENTER, label, font, ink);
+    ring(ui, &resp, rect, 14.0);
+    named(&resp, WidgetType::Button, kind != Big::Off, label);
     if kind == Big::Off { resp } else { resp.on_hover_cursor(CursorIcon::PointingHand) }
 }
 
-/// An ordinary button; `strong` gives it the accent's outline.
+/// An ordinary button.
 pub fn button(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     ui.add_enabled(enabled, egui::Button::new(text).rounding(Rounding::same(8.0)).min_size(vec2(0.0, 34.0)))
+}
+
+/// The button of a banner or a card that is the thing to do.
+pub fn primary(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    let ink = if enabled { BG } else { faint() };
+    let fill = if enabled { ACCENT } else { CARD };
+    ui.add_enabled(enabled, egui::Button::new(RichText::new(label).color(ink).strong()).fill(fill).rounding(Rounding::same(8.0)).min_size(vec2(0.0, 34.0)))
 }
 
 /// A button that removes or ends something.
 pub fn danger(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(text).color(BAD)).stroke(Stroke::new(1.0_f32, mix(LINE, BAD, 0.6))).rounding(Rounding::same(8.0)).min_size(vec2(0.0, 34.0)),
+        egui::Button::new(RichText::new(text).color(BAD)).stroke(Stroke::new(1.0_f32, mix(line(), BAD, 0.6))).rounding(Rounding::same(8.0)).min_size(vec2(0.0, 34.0)),
     )
 }
 
 /// A word that is a button (footers, card corners).
 pub fn link(ui: &mut Ui, text: &str) -> Response {
-    ui.add(egui::Button::new(RichText::new(text).color(DIM).font(sans(13.0))).frame(false)).on_hover_cursor(CursorIcon::PointingHand)
+    ui.add(egui::Button::new(RichText::new(text).color(dim()).font(sans(13.0))).frame(false)).on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// A small outlined word: a badge.
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
     let font = sans(11.5);
-    let (rect, _) = ui.allocate_exact_size(vec2(width_of(ui, text, &font) + 18.0, 22.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(width_of(ui, text, &font) + 18.0, 22.0), Sense::hover());
     ui.painter().rect(rect, Rounding::same(11.0), Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 22), Stroke::new(1.0_f32, color));
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, font, color);
+    named(&resp, WidgetType::Label, true, text);
 }
 
-/// A fact of the PC as a pill: a dot, what it is, its value. `tip` is said on hover.
-pub fn fact(ui: &mut Ui, name: &str, value: &str, color: Color32, tip: &str) -> Response {
+/// A fact of the PC as a pill: its mark and the mark's word, what it is, its
+/// value. `tip` is said on hover and to a screen reader.
+pub fn fact(ui: &mut Ui, name: &str, value: &str, mark: Mark, tip: &str) -> Response {
     let (small, body) = (sans(11.0), sans(14.0));
-    let w = width_of(ui, name, &small).max(width_of(ui, value, &body)) + 52.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(w.max(120.0), 54.0), Sense::hover());
+    let head = format!("{name}  \u{00b7}  {}", mark.word());
+    let w = width_of(ui, &head, &small).max(width_of(ui, value, &body)) + 56.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w.max(128.0), 56.0), Sense::click());
     let t = hover(ui, &resp);
-    ui.painter().rect(rect, Rounding::same(RADIUS), mix(CARD, CARD_HI, t), Stroke::new(1.0_f32, mix(LINE, color, 0.25 + 0.35 * t)));
-    dot(ui, pos2(rect.left() + 20.0, rect.center().y), color);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 17.0), Align2::LEFT_CENTER, name, small, DIM);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 36.0), Align2::LEFT_CENTER, value, body, TEXT);
+    ui.painter().rect(rect, Rounding::same(RADIUS), mix(CARD, CARD_HI, t), Stroke::new(1.0_f32, mix(line(), mark.color(), 0.25 + 0.35 * t)));
+    mark.draw(ui, pos2(rect.left() + 21.0, rect.center().y));
+    let after = ui.painter().text(pos2(rect.left() + 40.0, rect.top() + 18.0), Align2::LEFT_CENTER, format!("{name}  \u{00b7}  "), small.clone(), dim());
+    ui.painter().text(pos2(after.right(), rect.top() + 18.0), Align2::LEFT_CENTER, mark.word(), small, mark.color());
+    ui.painter().text(pos2(rect.left() + 40.0, rect.top() + 37.0), Align2::LEFT_CENTER, value, body, text());
+    ring(ui, &resp, rect, RADIUS);
+    let spoken = if tip.is_empty() { format!("{name}: {value}. {}", mark.word()) } else { format!("{name}: {value}. {}. {tip}", mark.word()) };
+    named(&resp, WidgetType::Button, true, &spoken);
     if tip.is_empty() { resp } else { resp.on_hover_text(tip) }
 }
 
@@ -270,9 +435,11 @@ pub fn nav(ui: &mut Ui, sign: Sign, label: &str, on: bool) -> Response {
     if on {
         ui.painter().rect_filled(Rect::from_min_size(pos2(rect.left(), rect.top() + 11.0), vec2(3.0, 22.0)), Rounding::same(2.0), ACCENT);
     }
-    let ink = if on { ACCENT } else { mix(DIM, TEXT, t) };
+    let ink = if on { ACCENT } else { mix(dim(), text(), t) };
     sign.draw(ui, pos2(rect.left() + 28.0, rect.center().y), ink);
-    ui.painter().text(pos2(rect.left() + 52.0, rect.center().y), Align2::LEFT_CENTER, label, sans(14.5), if on { TEXT } else { ink });
+    ui.painter().text(pos2(rect.left() + 52.0, rect.center().y), Align2::LEFT_CENTER, label, sans(14.5), if on { text() } else { ink });
+    ring(ui, &resp, rect.shrink(2.0), 10.0);
+    chosen(&resp, WidgetType::SelectableLabel, on, label);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -288,6 +455,17 @@ pub enum Sign {
 }
 
 impl Sign {
+    fn name(self) -> &'static str {
+        match self {
+            Sign::Play => "Play",
+            Sign::Pulse => "Diagnostics",
+            Sign::Sliders => "Settings",
+            Sign::Minimize => "Minimize",
+            Sign::Maximize => "Maximize",
+            Sign::Close => "Close",
+        }
+    }
+
     fn draw(self, ui: &Ui, c: Pos2, ink: Color32) {
         let p = ui.painter();
         let s = Stroke::new(1.6_f32, ink);
@@ -327,8 +505,51 @@ pub fn window_button(ui: &mut Ui, sign: Sign) -> Response {
         let fill = if sign == Sign::Close { mix(RAIL, Color32::from_rgb(0xc4, 0x2b, 0x1c), t) } else { mix(RAIL, CARD_HI, t) };
         ui.painter().rect_filled(rect, Rounding::ZERO, fill);
     }
-    sign.draw(ui, rect.center(), mix(DIM, TEXT, t));
-    resp
+    sign.draw(ui, rect.center(), mix(dim(), text(), t));
+    if resp.has_focus() {
+        ui.painter().rect_stroke(rect.shrink(2.0), Rounding::same(3.0), Stroke::new(2.0_f32, FOCUS));
+    }
+    named(&resp, WidgetType::Button, true, sign.name());
+    resp.on_hover_text(sign.name())
+}
+
+/// A bar that fills from the left, with its words over it.
+pub fn progress(ui: &mut Ui, fraction: f32, label: &str) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().min(520.0), 26.0), Sense::hover());
+    ui.painter().rect(rect, Rounding::same(13.0), WELL, Stroke::new(1.0_f32, line()));
+    let filled = Rect::from_min_size(rect.min, vec2((rect.width() * fraction.clamp(0.0, 1.0)).max(26.0), rect.height()));
+    ui.painter().rect_filled(filled, Rounding::same(13.0), mix(ACCENT_SOFT, ACCENT, 0.35));
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, sans(12.5), text());
+    named(&resp, WidgetType::ProgressIndicator, true, label);
+}
+
+/// The place a folder is dropped: a dashed outline, brighter while something hovers over the window.
+pub fn drop_zone(ui: &mut Ui, height: f32, hot: bool) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let edge = if hot { ACCENT } else { mix(line(), dim(), 0.6) };
+    ui.painter().rect_filled(rect, Rounding::same(4.0), if hot { ACCENT_SOFT } else { CARD });
+    let r = rect.shrink(1.0);
+    let corners = vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    ui.painter().extend(Shape::dashed_line(&corners, Stroke::new(1.6_f32, edge), 9.0, 7.0));
+    rect
+}
+
+/// A notice that comes and goes: its mark, its words.
+pub fn toast(ui: &mut Ui, mark: Mark, words: &str) {
+    egui::Frame::none()
+        .fill(CARD_HI)
+        .stroke(Stroke::new(1.0_f32, mix(line(), mark.color(), 0.55)))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .shadow(egui::epaint::Shadow { offset: vec2(0.0, 6.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(120) })
+        .show(ui, |ui| {
+            ui.set_max_width(360.0);
+            ui.horizontal(|ui| {
+                let (spot, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
+                mark.draw(ui, spot.center());
+                ui.add(egui::Label::new(RichText::new(words).color(text())).wrap());
+            });
+        });
 }
 
 /// The emblem: a box seen from its corner, its lid in the accent colour.
@@ -373,7 +594,7 @@ pub fn wordmark(ui: &Ui, left_center: Pos2, height: f32) {
     let top = left_center.y - height / 2.0;
     for (i, c) in "ROX-BOX".chars().enumerate() {
         let (advance, strokes) = glyph(c);
-        let ink = if i >= 3 { ACCENT } else { TEXT };
+        let ink = if i >= 3 { ACCENT } else { text() };
         for line in strokes {
             let points = line.iter().map(|(gx, gy)| pos2(x + gx * height, top + gy * height)).collect();
             ui.painter().add(Shape::line(points, Stroke::new(height * 0.17, ink)));
@@ -464,5 +685,31 @@ mod tests {
         assert_eq!(mix(Color32::BLACK, Color32::WHITE, 1.0), Color32::WHITE);
         assert_eq!(mix(Color32::BLACK, Color32::WHITE, 0.5), Color32::from_rgb(128, 128, 128));
         assert!(wordmark_width(20.0) > 100.0 && wordmark_width(20.0) < 160.0, "{}", wordmark_width(20.0));
+    }
+
+    #[test]
+    fn text_and_edges_have_the_contrast_they_claim() {
+        // One test for both looks: the switch is one for the whole program.
+        apply(&egui::Context::default(), false, false);
+        assert!(contrast(text(), CARD_HI) >= 12.0);
+        assert!(contrast(dim(), CARD_HI) >= 4.5, "{}", contrast(dim(), CARD_HI));
+        assert!(contrast(faint(), CARD) >= 4.5, "{}", contrast(faint(), CARD));
+        for state in [Mark::Ok, Mark::Warn, Mark::Err] {
+            assert!(contrast(state.color(), CARD_HI) >= 4.5, "{state:?}");
+        }
+        assert!(contrast(BG, ACCENT) >= 7.0, "the words on the big button");
+        apply(&egui::Context::default(), true, true);
+        assert!(contrast(dim(), CARD_HI) >= 7.0);
+        assert!(contrast(faint(), CARD_HI) >= 7.0, "{}", contrast(faint(), CARD_HI));
+        assert!(contrast(line(), CARD) >= 4.5, "edges are told from the cards: {}", contrast(line(), CARD));
+        apply(&egui::Context::default(), false, false);
+        assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn every_state_has_its_own_word() {
+        let words: Vec<&str> = [Mark::Ok, Mark::Warn, Mark::Err, Mark::Off].iter().map(|m| m.word()).collect();
+        assert_eq!(words[..3], ["OK", "WARN", "ERR"]);
+        assert_eq!(words.iter().collect::<std::collections::HashSet<_>>().len(), 4);
     }
 }
