@@ -128,6 +128,18 @@ front of them: `.\play.cmd -Check`, `.\victory.exe shaders`.
 
 The same steps, shorter, are in [QUICKSTART.txt](QUICKSTART.txt) inside the zip.
 
+### The launcher
+
+`launcher\` holds a window over `victory.exe` and `play.cmd`: a library of
+title folders, one button to play or stop, the checks, shader and warm-up
+steps, the run report and the switches, with nothing to install. It knows no
+title: a title is a folder you name. Today it is built from the source tree
+(`cd launcher`, then `cargo build --release`; the file is
+`launcher	argeteleaseoxbox-launcher.exe`, run next to `victory.exe` or
+from the checkout) and is not yet in the release package; `play.cmd` works as
+before either way. [launcher/README.md](launcher/README.md) describes every
+part.
+
 ### Check your PC without a title
 
 ```

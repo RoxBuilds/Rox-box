@@ -121,9 +121,34 @@ four costs has diminishing returns. The structural moves are:
   descriptors read as data;
 - mesh-shader fallbacks for cards without them.
 
-### 5. Zero-friction play
+### 5. The host's own upscaling, where the user has it
+
+A title that upscales through a public upscaling interface names, at each
+upscale, everything a host upscaler needs: colour, depth, motion vectors, the
+camera's jitter and planes, its masks and exposure. Run as translated compute,
+a console's upscaler can cost more than the rest of the frame; left out for a
+simpler one, the patterns it was meant to blend (thin geometry, soft shadows)
+show.
+
+- take the title's upscale call at that interface and hand it to an upscaler
+  of the host's: first one that speaks the same interface, then others;
+- the vendors' files are never part of this repository or of a release. They
+  are looked for at run time in a folder the user fills, under the terms the
+  user accepted for them; with none there, or on any failure, the title's own
+  upscaler runs as before;
+- nothing here knows a title: what makes a title take that path is the
+  title's own choice or a file the user supplies;
+- frame generation on our present path, once the rate before it is near 30
+  frames a second (an interface drawn as a plane of its own is kept out of
+  the generated frames).
+
+### 6. Zero-friction play
 
 - setup with no terminal and no file editing;
+- a launcher: one window over `victory.exe` and `play.cmd` for choosing a
+  title folder, starting and stopping, the checks and the switches (in
+  `launcher\`, built in CI; in the release package once its build is as
+  hermetic as the engine's);
 - shader translation and pipeline warm-up as automatic, resumable background
   steps with progress, not commands to learn;
 - presets chosen from the self-test's result instead of by hand.
@@ -169,5 +194,7 @@ run report shows, and describe it in platform terms. Never name the title.
 - Per-title code. If one title needs different behaviour, the platform rule
   that explains it is the thing to implement; what is left goes into a file
   the user supplies.
-- Shipping proprietary runtimes or SDK components to lift a host limit.
+- Shipping proprietary runtimes or SDK components. (Loading, at run time, a
+  component the user obtained from its vendor is not shipping it; see the
+  strategy's part 5.)
 - Payment, sponsorship or advertising of any kind.

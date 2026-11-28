@@ -42,6 +42,30 @@ jobs:
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\play.ps1 -SelfTest
 
+  # The launcher (launcher\) is a workspace of its own, a window over
+  # victory.exe and play.ps1: the job above does not build it. It needs no
+  # graphics card and no title.
+  launcher:
+    name: Launcher
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: launcher
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # The version and components pinned in the root's rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+
   # The translator and the format code need nothing from Windows, so
   # contributors without a Windows PC can work on them: this job proves they
   # build and test on Linux. The crates holding Windows-only code (loader,

@@ -5,6 +5,13 @@ its own. Nothing outside `launcher\` was changed for it. These are the changes
 outside it that shipping it needs, each with its commands and paths, so they
 can be made in one pass. Delete this file when they are done.
 
+Done on main: the CI job (part 2; it is named `Launcher`, not yet required by
+the branch rule) and the first words in `README.md` and `ROADMAP.md` (part 4).
+Still to do: parts 1 and 3, together, as the package may only carry a file
+whose crates the licence file lists. Part 1 also needs the launcher built as
+hermetically as `cargo xtask dist` builds the engine (no build-machine paths:
+`cargo xtask verify-dist` must pass on it) and with the static C runtime.
+
 ## 1. `scripts\package-release.ps1`: the launcher in the package
 
 Build it with the same hermetic habits as the engine, and put the one file
