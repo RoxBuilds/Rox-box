@@ -449,6 +449,7 @@ pub enum Sign {
     Play,
     Pulse,
     Sliders,
+    Toggles,
     Minimize,
     Maximize,
     Close,
@@ -460,6 +461,7 @@ impl Sign {
             Sign::Play => "Play",
             Sign::Pulse => "Diagnostics",
             Sign::Sliders => "Settings",
+            Sign::Toggles => "Switches",
             Sign::Minimize => "Minimize",
             Sign::Maximize => "Maximize",
             Sign::Close => "Close",
@@ -481,6 +483,19 @@ impl Sign {
                 for (y, knob) in [(-5.0, 3.0), (0.0, -4.0), (5.0, 1.0)] {
                     p.line_segment([pos2(c.x - 8.0, c.y + y), pos2(c.x + 8.0, c.y + y)], Stroke::new(1.4_f32, ink));
                     p.circle_filled(pos2(c.x + knob, c.y + y), 2.6, ink);
+                }
+            }
+            Sign::Toggles => {
+                // Two little switches, one on (its knob to the right, filled) and one off.
+                for (y, on) in [(-4.5, true), (4.5, false)] {
+                    let body = Rect::from_center_size(pos2(c.x, c.y + y), vec2(17.0, 7.0));
+                    p.rect_stroke(body, Rounding::same(3.5), Stroke::new(1.3_f32, ink));
+                    let knob = pos2(if on { body.right() - 3.5 } else { body.left() + 3.5 }, body.center().y);
+                    if on {
+                        p.circle_filled(knob, 2.4, ink);
+                    } else {
+                        p.circle_stroke(knob, 1.8, Stroke::new(1.2_f32, ink));
+                    }
                 }
             }
             Sign::Minimize => {

@@ -16,7 +16,7 @@ pub fn toml_path(path: &str) -> String {
 }
 
 /// The value of a `key = <string>` line (literal or basic string), if `line` is one.
-fn string_value(line: &str, key: &str) -> Option<String> {
+pub(crate) fn string_value(line: &str, key: &str) -> Option<String> {
     let rest = line.trim_start().strip_prefix(key)?.trim_start().strip_prefix('=')?.trim();
     if let Some(body) = rest.strip_prefix('\'') {
         return body.split('\'').next().map(str::to_string);

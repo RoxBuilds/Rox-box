@@ -66,6 +66,12 @@ impl Home {
         self.root.join("local").join("launcher.toml")
     }
 
+    /// The saved switches, in profiles: beside the launcher's own file, and
+    /// as local as it.
+    pub fn switches_file(&self) -> PathBuf {
+        self.root.join("local").join("switches.toml")
+    }
+
     /// The builds that exist. A release folder has the one beside it.
     pub fn builds(&self) -> Vec<&'static str> {
         match self.layout {

@@ -8,7 +8,7 @@ next to `victory.exe`, `play.cmd` and `play.ps1` (or from the source tree).
 ## The window
 
 - **The rail** on the left: the Rox-Box emblem and wordmark, **Library / Play**,
-  **Diagnostics**, **Settings**, and the engine's version at the bottom (with
+  **Diagnostics**, **Switches**, **Settings**, and the engine's version at the bottom (with
   a badge when a newer release is out).
 - **First run**: one place to drop your title folder, and **Browse**. That is
   all the setup there is: the launcher finds the engine beside it by itself
@@ -48,6 +48,30 @@ touch it; PLAY writes it, and so does a button in Settings.
 | **Run report** | `victory report`, its text to the clipboard. The report holds numbers and Rox-box's own words only (`docs/run-report.md`), so it can go into a public issue as it is. |
 | **Reset pipeline cache** | After a confirmation, removes the host pipeline library and the warm-up's marks from `<cache_dir>\pipelines` (the folder `victory config` names). What earlier runs recorded stays, so **Warm cache** makes everything again. |
 | **Open ... folder** | Explorer, on the Rox-box folder, the logs folder, the backups folder, or `victory.toml`. |
+
+## Saved switches
+
+The **Switches** page keeps the `VICTORY_*` settings you would otherwise paste
+into `-More` for every run, as toggles in named profiles.
+
+- **Paste** the text you already use (`NAME=value;NAME=value`, with or without
+  `-More` and its quotes) and it becomes toggles; or add one by name and value.
+- Each switch has its value, an on/off state and a note of your own. A switch
+  that is off stays in the profile and is not given to a run.
+- One profile is chosen, or none. A profile can be tied to a title folder:
+  choosing that title chooses it.
+- A run is given the chosen profile's switches that are on, then the extra
+  text of Settings; where both name a switch, the extra text stands (it comes
+  later in `-More`). The page shows the exact text, with Copy.
+
+The launcher knows no switch by name: a name is capitals, digits and `_`, a
+value is one line without `;` or a quote, and that is all it checks. So a
+switch the engine gains or drops needs no change in the launcher
+(`docs/switches.md` in the source tree lists what the engine reads).
+
+Profiles are kept in `local\switches.toml`. That file is of this PC and is
+never committed, so what belongs to one title (a list of its programs, a
+choice from its patch file) stays out of the repository.
 
 ## Updates
 
@@ -122,6 +146,7 @@ for this run").
 
 - `victory.toml`: only the `game_dir` line (see above).
 - `local\launcher.toml`: your title folders and settings.
+- `local\switches.toml`: your saved switches, in profiles.
 - `local\update\`: a downloaded release, while it is installed.
 - `local\backups\` (or the folder you name): save backups, when switched on.
 

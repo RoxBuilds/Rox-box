@@ -13,6 +13,7 @@ mod backup;
 mod config;
 mod paths;
 mod runner;
+mod switches;
 mod system;
 mod theme;
 mod update;
@@ -28,6 +29,7 @@ use eframe::egui::{self, RichText};
 use config::Library;
 use paths::{Home, Layout};
 use runner::{Event, Job, Kind, Spec};
+use switches::Book;
 use system::{CheckLine, Host, Level};
 use theme::Mark;
 use update::Release;
@@ -57,6 +59,7 @@ enum Status {
 enum Page {
     Play,
     Diagnostics,
+    Switches,
     Settings,
 }
 
@@ -185,6 +188,14 @@ struct App {
     look: (bool, bool),
     /// The scale the slider shows while it is dragged, in percent.
     scale_shown: f32,
+    /// The saved switches, and what of them is on disk.
+    book: Book,
+    book_saved: Book,
+    /// What the Switches page's fields hold while they are typed in.
+    paste: String,
+    new_switch: (String, String),
+    profile_name: String,
+    confirm_delete: bool,
 }
 
 impl App {
@@ -201,7 +212,14 @@ impl App {
         }
         theme::apply(ctx, lib.high_contrast, lib.reduced_motion);
         ctx.set_zoom_factor(lib.scale as f32 / 100.0);
+        let book = home.as_ref().map(|h| Book::load(&h.switches_file())).unwrap_or_default();
         let mut app = App {
+            book_saved: book.clone(),
+            profile_name: book.active.clone().unwrap_or_default(),
+            book,
+            paste: String::new(),
+            new_switch: Default::default(),
+            confirm_delete: false,
             saved: lib.clone(),
             look: (lib.high_contrast, lib.reduced_motion),
             scale_shown: lib.scale as f32,
@@ -229,6 +247,7 @@ impl App {
             // `ROXBOX_PAGE` opens on another page (for pictures of the launcher).
             page: match std::env::var("ROXBOX_PAGE").as_deref() {
                 Ok("diagnostics") => Page::Diagnostics,
+                Ok("switches") => Page::Switches,
                 Ok("settings") => Page::Settings,
                 _ => Page::Play,
             },
@@ -318,13 +337,16 @@ impl App {
         let script = home.play_script();
         let source = self.source_tree();
         self.sync_config(true);
+        // What the run is given: the toggles, with the saved switches before the extra text.
+        let mut given = self.lib.clone();
+        given.more = switches::more_for_run(self.book.active_profile(), &self.lib.more);
         if self.lib.prepare {
-            self.queue.push_back(runner::play(&script, &self.lib, source, true));
+            self.queue.push_back(runner::play(&script, &given, source, true));
         }
-        let mut run = runner::play(&script, &self.lib, source, false);
+        let mut run = runner::play(&script, &given, source, false);
         if self.lib.on_play == "close" {
             // The launcher will be gone: no pipes to it, and the log file keeps the output.
-            let mut logged = self.lib.clone();
+            let mut logged = given.clone();
             logged.log = true;
             run = runner::play(&script, &logged, source, false);
             run.detached = true;
@@ -493,6 +515,10 @@ impl App {
     }
 
     fn activate(&mut self, title: String) {
+        // A profile tied to this title is chosen with it.
+        if let Some(profile) = self.book.for_title(&title).map(str::to_string) {
+            self.set_profile(Some(profile));
+        }
         self.lib.active = Some(title);
         self.sync_config(false);
         self.enqueue_victory(Kind::Check, &["check"]);
@@ -714,6 +740,12 @@ impl App {
         }
     }
 
+    fn set_profile(&mut self, name: Option<String>) {
+        self.profile_name = name.clone().unwrap_or_default();
+        self.book.active = name;
+        self.confirm_delete = false;
+    }
+
     fn missing(&self) -> usize {
         self.checks.iter().filter(|c| c.status != "OK" && c.status != "WARN").count()
     }
@@ -769,6 +801,7 @@ impl eframe::App for App {
                     match self.page {
                         Page::Play => self.play_page(ui, ctx),
                         Page::Diagnostics => self.diagnostics_page(ui),
+                        Page::Switches => self.switches_page(ui, ctx),
                         Page::Settings => self.settings_page(ui, ctx),
                     }
                 });
@@ -802,6 +835,15 @@ impl eframe::App for App {
             }
             self.saved = self.lib.clone();
         }
+        if self.book != self.book_saved
+            && let Some(home) = &self.home
+        {
+            match self.book.save(&home.switches_file()) {
+                Ok(()) => self.note = "Saved.".to_string(),
+                Err(e) => self.toast(Mark::Err, format!("The saved switches could not be written: {e}")),
+            }
+            self.book_saved = self.book.clone();
+        }
     }
 }
 
@@ -827,8 +869,9 @@ impl App {
             self.console_open = !self.console_open;
         }
         if escape {
-            if self.confirm_reset {
+            if self.confirm_reset || self.confirm_delete {
                 self.confirm_reset = false;
+                self.confirm_delete = false;
             } else if self.console_open {
                 self.console_open = false;
             } else {
@@ -907,6 +950,7 @@ impl App {
             for (page, sign, label) in [
                 (Page::Play, theme::Sign::Play, "Library / Play"),
                 (Page::Diagnostics, theme::Sign::Pulse, "Diagnostics"),
+                (Page::Switches, theme::Sign::Toggles, "Switches"),
                 (Page::Settings, theme::Sign::Sliders, "Settings"),
             ] {
                 if theme::nav(ui, sign, label, self.page == page).clicked() {
@@ -1093,6 +1137,15 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 self.launch_pills(ui);
             });
+            ui.add_space(6.0);
+            let saved = match self.book.active_profile() {
+                Some(profile) => format!("Switches: {}  \u{00b7}  {} on", profile.name, profile.on_count()),
+                None if self.book.profiles.is_empty() => "Switches: none saved yet".to_string(),
+                None => "Switches: no profile chosen".to_string(),
+            };
+            if theme::link(ui, &saved).on_hover_text("The saved switches this run is given. Opens the Switches page.").clicked() {
+                self.page = Page::Switches;
+            }
         });
 
         ui.add_space(24.0);
@@ -1338,6 +1391,190 @@ impl App {
         });
     }
 
+    /// The saved switches: profiles of toggles that stand for what would be pasted into `-More`.
+    fn switches_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        theme::page_title(ui, "Switches", "The VICTORY_* settings you would paste into -More for every run, kept as toggles. They stay in local\\switches.toml on this PC; nothing of a title enters the launcher.");
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "PROFILE");
+            let mut choose = None;
+            ui.horizontal_wrapped(|ui| {
+                if theme::pill(ui, "None", self.book.active.is_none()).on_hover_text("No saved switches are given to a run.").clicked() {
+                    choose = Some(None);
+                }
+                for profile in &self.book.profiles {
+                    let on = self.book.active.as_deref() == Some(profile.name.as_str());
+                    if theme::pill(ui, &profile.name, on).clicked() && !on {
+                        choose = Some(Some(profile.name.clone()));
+                    }
+                }
+                if theme::button(ui, "+  New profile", true).clicked() {
+                    let name = self.book.add("Profile");
+                    choose = Some(Some(name));
+                }
+            });
+            if let Some(name) = choose {
+                self.set_profile(name);
+            }
+            let Some(active) = self.book.active.clone() else {
+                ui.add_space(4.0);
+                ui.label(RichText::new(if self.book.profiles.is_empty() { "No profile yet. Paste your -More text below, or make a new profile." } else { "No profile is chosen: a run is given only the toggles of the Play page." }).color(theme::dim()).small());
+                return;
+            };
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.profile_name).desired_width(220.0).margin(egui::vec2(10.0, 7.0)));
+                let can_rename = !self.profile_name.trim().is_empty() && self.profile_name.trim() != active && self.book.profile(self.profile_name.trim()).is_none();
+                if theme::button(ui, "Rename", can_rename).clicked() {
+                    let to = self.profile_name.trim().to_string();
+                    if self.book.rename(&active, &to) {
+                        self.set_profile(Some(to));
+                    }
+                }
+                if theme::button(ui, "Duplicate", true).clicked()
+                    && let Some(copy) = self.book.profile(&active).cloned()
+                {
+                    let name = self.book.add(&format!("{active} copy"));
+                    if let Some(new) = self.book.profile_mut(&name) {
+                        new.switches = copy.switches;
+                    }
+                    self.set_profile(Some(name));
+                }
+                if !self.confirm_delete {
+                    if theme::danger(ui, "Delete", true).clicked() {
+                        self.confirm_delete = true;
+                    }
+                } else {
+                    ui.label(RichText::new("Delete this profile and its switches?").color(theme::WARN));
+                    if theme::danger(ui, "Yes, delete", true).clicked() {
+                        self.book.remove(&active);
+                        self.set_profile(None);
+                        self.toast(Mark::Ok, format!("Profile {active} deleted."));
+                    }
+                    if theme::button(ui, "Keep it", true).on_hover_text("Esc").clicked() {
+                        self.confirm_delete = false;
+                    }
+                }
+            });
+            if let Some(title) = self.lib.active.clone() {
+                ui.add_space(6.0);
+                let tied = self.book.for_title(&title) == Some(active.as_str());
+                if theme::pill(ui, &format!("Choose this profile whenever {} is chosen", title_name(&title)), tied).clicked() {
+                    self.book.tie(&title, if tied { None } else { Some(active.as_str()) });
+                }
+            }
+        });
+
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::eyebrow(ui, "ADD");
+            ui.label(RichText::new("Paste what you give -More: NAME=value;NAME=value").color(theme::text()));
+            ui.add(egui::TextEdit::multiline(&mut self.paste).font(theme::mono(12.5)).desired_rows(2).desired_width(f32::INFINITY).hint_text(RichText::new("VICTORY_NAME=value;VICTORY_OTHER=value").color(theme::faint())).margin(egui::vec2(10.0, 8.0)));
+            ui.horizontal_wrapped(|ui| {
+                if theme::primary(ui, "Turn into toggles", !self.paste.trim().is_empty()).clicked() {
+                    match switches::import(&self.paste) {
+                        Ok(found) => {
+                            let name = match self.book.active.clone() {
+                                Some(name) => name,
+                                None => self.book.add("Imported"),
+                            };
+                            let count = found.len();
+                            if let Some(profile) = self.book.profile_mut(&name) {
+                                for switch in found {
+                                    profile.put(switch);
+                                }
+                            }
+                            self.set_profile(Some(name.clone()));
+                            self.paste.clear();
+                            self.toast(Mark::Ok, format!("{count} switch(es) put into {name}."));
+                        }
+                        Err(why) => self.toast(Mark::Warn, format!("Not taken: {why}.")),
+                    }
+                }
+                ui.label(RichText::new("A name the profile already has gets the new value. With no profile chosen, one is made.").color(theme::dim()).small());
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("or one:").color(theme::dim()));
+                ui.add(egui::TextEdit::singleline(&mut self.new_switch.0).font(theme::mono(12.5)).desired_width(280.0).hint_text(RichText::new("VICTORY_NAME").color(theme::faint())).margin(egui::vec2(10.0, 7.0)));
+                ui.label("=");
+                ui.add(egui::TextEdit::singleline(&mut self.new_switch.1).font(theme::mono(12.5)).desired_width(160.0).hint_text(RichText::new("value").color(theme::faint())).margin(egui::vec2(10.0, 7.0)));
+                let (name, value) = (self.new_switch.0.trim().to_string(), self.new_switch.1.trim().to_string());
+                let fits = switches::valid_name(&name) && switches::valid_value(&value);
+                if theme::button(ui, "Add", fits && self.book.active.is_some()).on_hover_text("A name is capitals, digits and _. A value holds no ; and no quote.").clicked()
+                    && let Some(profile) = self.book.active.clone().and_then(|a| self.book.profile_mut(&a))
+                {
+                    profile.put(switches::Switch { name, value, on: true, note: String::new() });
+                    self.new_switch = Default::default();
+                }
+            });
+        });
+
+        let Some(at) = self.book.active.as_ref().and_then(|a| self.book.profiles.iter().position(|p| &p.name == a)) else { return };
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let profile = &mut self.book.profiles[at];
+            ui.horizontal(|ui| {
+                theme::eyebrow(ui, "SWITCHES");
+                ui.label(RichText::new(format!("{} on of {}", profile.on_count(), profile.switches.len())).color(theme::dim()).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::link(ui, "All off").clicked() {
+                        profile.switches.iter_mut().for_each(|s| s.on = false);
+                    }
+                    if theme::link(ui, "All on").clicked() {
+                        profile.switches.iter_mut().for_each(|s| s.on = true);
+                    }
+                });
+            });
+            if profile.switches.is_empty() {
+                ui.label(RichText::new("This profile is empty.").color(theme::dim()));
+            }
+            let mut remove = None;
+            egui::Grid::new("switches").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
+                for (i, switch) in profile.switches.iter_mut().enumerate() {
+                    if theme::pill(ui, &switch.name, switch.on).clicked() {
+                        switch.on = !switch.on;
+                    }
+                    let value = ui.add_sized([200.0, 30.0], egui::TextEdit::singleline(&mut switch.value).font(theme::mono(12.5)).margin(egui::vec2(8.0, 6.0)));
+                    if !switches::valid_value(&switch.value) {
+                        ui.painter().rect_stroke(value.rect, egui::Rounding::same(8.0), egui::Stroke::new(1.5_f32, theme::WARN));
+                        value.on_hover_text("A value holds no ; and no quote: this switch is not given to a run as it is.");
+                    }
+                    ui.add_sized([260.0, 30.0], egui::TextEdit::singleline(&mut switch.note).hint_text(RichText::new("a note of your own").color(theme::faint())).margin(egui::vec2(8.0, 6.0)));
+                    if theme::link(ui, "Remove").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = remove {
+                profile.switches.remove(i);
+            }
+        });
+
+        ui.add_space(18.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let given = switches::more_for_run(self.book.active_profile(), &self.lib.more);
+            ui.horizontal(|ui| {
+                theme::eyebrow(ui, "WHAT A RUN IS GIVEN AS -MORE");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::link(ui, "Copy").clicked() {
+                        ctx.copy_text(given.clone());
+                        self.toast(Mark::Ok, "The -More text is copied.");
+                    }
+                });
+            });
+            ui.add(egui::Label::new(RichText::new(if given.is_empty() { "(nothing)" } else { given.as_str() }).font(theme::mono(12.5)).color(theme::text())).wrap());
+            if !self.lib.more.trim().is_empty() {
+                ui.label(RichText::new("The end of it is the extra text of Settings, Launch defaults.").color(theme::dim()).small());
+            }
+        });
+    }
+
     /// A folder setting: its name, what it is now (or what stands in), Browse and a way back to the default.
     fn folder_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, name: &str, value: &str, default: &str, what: Pick) -> bool {
         let mut cleared = false;
@@ -1413,7 +1650,7 @@ impl App {
             ui.add_space(12.0);
             theme::eyebrow(ui, "EXTRA SWITCHES");
             ui.add(egui::TextEdit::singleline(&mut self.lib.more).font(theme::mono(12.5)).hint_text(RichText::new("VICTORY_NAME=value;VICTORY_OTHER=value").color(theme::faint())).desired_width(f32::INFINITY).margin(egui::vec2(10.0, 8.0)));
-            ui.label(RichText::new("Passed to every run as play.cmd -More. docs/switches.md lists them.").color(theme::dim()).small());
+            ui.label(RichText::new("Given to every run after the saved switches of the Switches page (play.cmd -More), so a pair here stands over the same name there.").color(theme::dim()).small());
         });
 
         theme::section(ui, "Updates");
