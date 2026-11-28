@@ -463,6 +463,18 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// The frame line's second: what `VICTORY_LEAVE_OUT` left out.
+#[cfg(windows)]
+pub(crate) fn leave_out_line(frames: f64) {
+    make::leave_out_line(frames);
+}
+
+/// At the run's end: the hashes `VICTORY_LEAVE_OUT` named that no pipeline had.
+#[cfg(windows)]
+pub(crate) fn leave_out_end() {
+    make::leave_out_end();
+}
+
 /// Host pipelines compiled during the run, and loaded from the library
 /// instead, since the start (for the run report).
 #[cfg(windows)]

@@ -50,8 +50,10 @@ use std::time::{Duration, Instant};
 /// by whole seconds, or left without figures when there is none. 4 added
 /// `[memory.map]` and `[memory.map.peak]`: the process's memory by our own
 /// categories. 5 added `[gpu_time]` and `[gpu_time.steady]`: the card's time
-/// by kind of work, its volumes, and the memory the budget governor saw.
-pub const FORMAT: u32 = 5;
+/// by kind of work, its volumes, and the memory the budget governor saw. 6
+/// added to `[gpu_time]` the figures of the title's compute pipelines that
+/// name none of them, and `asked_to_leave_out` to `[gpu_work.left_out]`.
+pub const FORMAT: u32 = 6;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -429,11 +431,13 @@ pub enum LeftOut {
     BuilderOff,
     /// No pipeline was set.
     NoPipeline,
+    /// A shader of its pipeline is named in `VICTORY_LEAVE_OUT`.
+    AskedToLeaveOut,
     Other,
 }
 
 impl LeftOut {
-    pub const ALL: [LeftOut; 9] = [
+    pub const ALL: [LeftOut; 10] = [
         LeftOut::PipelineNotReady,
         LeftOut::ShaderNotTranslated,
         LeftOut::PipelineRefused,
@@ -442,6 +446,7 @@ impl LeftOut {
         LeftOut::IndirectNotBounded,
         LeftOut::BuilderOff,
         LeftOut::NoPipeline,
+        LeftOut::AskedToLeaveOut,
         LeftOut::Other,
     ];
 
@@ -456,6 +461,7 @@ impl LeftOut {
             LeftOut::IndirectNotBounded => "indirect_not_bounded",
             LeftOut::BuilderOff => "ray_tracing_builder_off",
             LeftOut::NoPipeline => "no_pipeline_set",
+            LeftOut::AskedToLeaveOut => "asked_to_leave_out",
             LeftOut::Other => "other",
         }
     }
@@ -1070,9 +1076,18 @@ pub enum GpuFigure {
     /// under [`LOW_RAM`].
     CardOverLooks,
     RamLowLooks,
+    /// The title's compute pipelines (`VICTORY_GPU_SPLIT`, `pipelines`),
+    /// named nowhere: the frame-line seconds that had any, the sum over them
+    /// of how many ran in each, and the card's time of the costliest 1, 5
+    /// and 20 of each second, summed.
+    PipelineSeconds,
+    ComputePipelinesSum,
+    TopPipelineNs,
+    Top5PipelinesNs,
+    Top20PipelinesNs,
 }
 
-const GPU_FIGS: usize = GpuFigure::RamLowLooks as usize + 1;
+const GPU_FIGS: usize = GpuFigure::Top20PipelinesNs as usize + 1;
 
 /// The kinds of the card's time, in order, under their keys.
 pub const GPU_KINDS: [GpuFigure; 12] = [
@@ -1339,6 +1354,15 @@ fn gpu_time_figures(d: &mut Doc, f: &[u64; GPU_FIGS]) {
     }
     d.int("looks_card_over_budget", get(GpuFigure::CardOverLooks));
     d.int("looks_free_ram_under_512_mib", get(GpuFigure::RamLowLooks));
+    d.comment("the title's compute pipelines (VICTORY_GPU_SPLIT pipelines), named nowhere: how many ran in a");
+    d.comment("second of the frame line (seconds with any), and per frame the card's time of the costliest");
+    d.comment("1, 5 and 20 of each second, ms");
+    let seconds = get(GpuFigure::PipelineSeconds);
+    d.int("pipeline_seconds", seconds);
+    d.float("compute_pipelines_a_second_avg", get(GpuFigure::ComputePipelinesSum) as f64 / seconds.max(1) as f64);
+    d.float("costliest_pipeline_ms", per(get(GpuFigure::TopPipelineNs), 1e6));
+    d.float("costliest_5_pipelines_ms", per(get(GpuFigure::Top5PipelinesNs), 1e6));
+    d.float("costliest_20_pipelines_ms", per(get(GpuFigure::Top20PipelinesNs), 1e6));
 }
 
 // ---------------------------------------------------------------------------
@@ -3643,6 +3667,13 @@ mod tests {
             f[G::FreeRamSum as usize] = looks * mib(900);
             f[G::FreeRamLowestNot as usize] = !mib(612);
             f[G::CardOverLooks as usize] = 3;
+            // 2 ms, 5 ms and 8 ms a frame of the costliest 1, 5 and 20, in
+            // seconds of 120 pipelines each.
+            f[G::PipelineSeconds as usize] = looks;
+            f[G::ComputePipelinesSum as usize] = looks * 120;
+            for (g, ms) in [(G::TopPipelineNs, 2.0), (G::Top5PipelinesNs, 5.0), (G::Top20PipelinesNs, 8.0)] {
+                f[g as usize] = (ms * 1e6 * frames as f64).round() as u64;
+            }
             f
         };
         let volumes = [2_800.0, 0.9e6, 80.0, 10.5e6, 7.0, 488e6, 3.2e6, 580.0, 52e6, 1.5e6];
@@ -3687,6 +3718,11 @@ mod tests {
                 "free_ram_mib_lowest",
                 "looks_card_over_budget",
                 "looks_free_ram_under_512_mib",
+                "pipeline_seconds",
+                "compute_pipelines_a_second_avg",
+                "costliest_pipeline_ms",
+                "costliest_5_pipelines_ms",
+                "costliest_20_pipelines_ms",
             ]) {
                 assert!(section.get(*key).is_some(), "no {key} in\n{text}");
             }
@@ -3704,6 +3740,9 @@ mod tests {
         assert_eq!(gpu["free_ram_mib_lowest"].as_float(), Some(612.0));
         assert_eq!(gpu["card_used_mib_avg"].as_float(), Some(7_100.0));
         assert_eq!(gpu["looks_card_over_budget"].as_integer(), Some(3));
+        assert_eq!(gpu["compute_pipelines_a_second_avg"].as_float(), Some(120.0));
+        assert_eq!(gpu["costliest_pipeline_ms"].as_float(), Some(2.0));
+        assert_eq!(gpu["costliest_20_pipelines_ms"].as_float(), Some(8.0));
         assert_eq!(gpu["steady"]["from_s"].as_float(), Some(40.0));
         assert_eq!(gpu["steady"]["frames"].as_integer(), Some(370));
     }

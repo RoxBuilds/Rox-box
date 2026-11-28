@@ -54,6 +54,8 @@ do something only in a diagnostics build.
 | `VICTORY_PANEL=1` | the run's numbers drawn on the picture; F3 shows and hides it |
 | `VICTORY_PIPELINE_WAIT_MS=24` | the per-frame wait for background pipeline creation (default 500 ms). A draw is left out until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | leaves out draws and dispatches whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_LEAVE_OUT=<hash>,...` | the same in every build: those pipelines are never made; what was left out is counted in the log a second and in the run report's `[gpu_work.left_out]` (`asked_to_leave_out`). Malformed entries, and at the end hashes no pipeline had, are logged |
+| `VICTORY_GPU_SPLIT` (default `pipelines`) | besides the time by kind, the title's dispatches are timed by pipeline: once a second the log names the costliest 20 compute pipelines per frame (time, share of the time measured, dispatches, groups and threads of direct ones, indirect ones, 64-lane or not, whether the program has a loop or one shaped as a poll of memory), and at the run's end the same over its last two thirds; `kinds` times by kind alone |
 | `VICTORY_GPU_TIMING=1` | each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane (own shader cache entries) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |

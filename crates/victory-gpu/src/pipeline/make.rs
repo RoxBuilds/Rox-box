@@ -42,6 +42,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// A shader of it is named in `VICTORY_LEAVE_OUT` ([`leave_out`]): never
+    /// made, its draws and dispatches not run.
+    asked_out: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -60,6 +63,7 @@ impl Pending {
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            asked_out: asked_out(&shaders),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -120,6 +124,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// reason).
 pub(crate) fn left_out_reason(p: &Pending) -> victory_pipeline::report::LeftOut {
     use victory_pipeline::report::LeftOut;
+    if p.asked_out {
+        return LeftOut::AskedToLeaveOut;
+    }
     match p.made.get() {
         None => LeftOut::PipelineNotReady,
         Some(Some(_)) => LeftOut::Other,
@@ -134,6 +141,99 @@ pub(crate) fn left_out_reason(p: &Pending) -> victory_pipeline::report::LeftOut 
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines left out as asked.
+
+/// The shader hashes `VICTORY_LEAVE_OUT=<hash>[,<hash>...]` names: the 16 hex
+/// digits the log names a shader by (`[compute 0123456789abcdef]`, "shader
+/// translated ... hash"). The draws and dispatches of every pipeline with one
+/// of them are not run: counted in the log a second and in the run report's
+/// `[gpu_work.left_out]` as `asked_to_leave_out`. From the environment only,
+/// read once; an entry that is not 16 hex digits is logged once and left out
+/// of the list, and at the run's end the hashes no pipeline had are logged.
+/// Unset: nothing is left out. (The mechanism of a sibling project's switch
+/// of the same name, GPL-3.0-or-later, without its built-in hashes.)
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let asked = parse_leave_out(&std::env::var("VICTORY_LEAVE_OUT").unwrap_or_default());
+        if !asked.1.is_empty() {
+            tracing::warn!(entries = ?asked.1, "VICTORY_LEAVE_OUT: entries that are not 16 hex digits, ignored");
+        }
+        if !asked.0.is_empty() {
+            tracing::info!(hashes = ?asked.0, "VICTORY_LEAVE_OUT: the draws and dispatches of pipelines with these shaders are not run");
+        }
+        asked.0
+    })
+}
+
+/// `value`'s hashes (lower case, each once) and the entries that are not one.
+fn parse_leave_out(value: &str) -> (Vec<String>, Vec<String>) {
+    let (mut hashes, mut bad) = (Vec::new(), Vec::new());
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let hash = entry.to_ascii_lowercase();
+        if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        } else {
+            bad.push(entry.to_owned());
+        }
+    }
+    (hashes, bad)
+}
+
+/// The hashes of [`leave_out`] a pipeline had.
+static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether a shader of `shaders` is named in [`leave_out`] (noted as had).
+fn asked_out(shaders: &[Arc<Shader>]) -> bool {
+    let asked = leave_out();
+    if asked.is_empty() {
+        return false;
+    }
+    let mut out = false;
+    for s in shaders.iter().filter(|s| asked.contains(&s.hash)) {
+        out = true;
+        let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        if !matched.contains(&s.hash) {
+            matched.push(s.hash.clone());
+        }
+    }
+    out
+}
+
+/// Draws and dispatches asked of a pipeline left out as asked, since the
+/// last line.
+static ASKED_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// The frame line's second of `frames` frames: what was left out as asked.
+pub(crate) fn leave_out_line(frames: f64) {
+    let n = ASKED_OUT.swap(0, Ordering::Relaxed);
+    if leave_out().is_empty() || frames <= 0.0 {
+        return;
+    }
+    let had = MATCHED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    tracing::info!(
+        "left out as VICTORY_LEAVE_OUT asks: {:.1} draws and dispatches a frame ({had} of the {} hashes named had a pipeline so far)",
+        n as f64 / frames,
+        leave_out().len()
+    );
+}
+
+/// At the run's end: the hashes named that no pipeline had.
+pub(crate) fn leave_out_end() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if leave_out().is_empty() || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    let never: Vec<&String> = leave_out().iter().filter(|h| !matched.contains(h)).collect();
+    if !never.is_empty() {
+        tracing::warn!(hashes = ?never, "VICTORY_LEAVE_OUT: no pipeline of the run had these shaders");
+    }
 }
 
 /// Signalled whenever a worker has made a pipeline.
@@ -178,6 +278,10 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.asked_out {
+        ASKED_OUT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -193,6 +297,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.asked_out {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -200,7 +307,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && !p.asked_out && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -499,6 +606,29 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hashes of 16 hex digits, in any case and with spaces, each once;
+    /// anything else is told apart to be logged; nothing named, nothing.
+    #[test]
+    fn the_leave_out_list_takes_hashes_alone() {
+        let (hashes, bad) = parse_leave_out(" 0123456789ABCDEF, fedcba9876543210,0123456789abcdef,xyz,0123,,");
+        assert_eq!(hashes, ["0123456789abcdef", "fedcba9876543210"]);
+        assert_eq!(bad, ["xyz", "0123"]);
+        assert_eq!(parse_leave_out(""), (Vec::new(), Vec::new()));
+    }
+
+    /// A pipeline left out as asked is never queued or made, and says why.
+    #[test]
+    fn a_pipeline_left_out_as_asked_is_not_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.asked_out = true;
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+        assert_eq!(left_out_reason(&p), victory_pipeline::report::LeftOut::AskedToLeaveOut);
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

@@ -3227,7 +3227,7 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        list.gpu_kind(dispatch_kind(p));
+        list.gpu_dispatch(dispatch_kind(p), p, Some(u64::from(x) * u64::from(y) * u64::from(z)));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -4586,7 +4586,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        list.gpu_kind(if kind == DISPATCH { dispatch_kind(p) } else { crate::host::gpu_split::Kind::Draws });
+        if kind == DISPATCH {
+            list.gpu_dispatch(dispatch_kind(p), p, None);
+        } else {
+            list.gpu_kind(crate::host::gpu_split::Kind::Draws);
+        }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {

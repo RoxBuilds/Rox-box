@@ -178,7 +178,7 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (5; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (6; 5 had no figures of compute pipelines in `[gpu_time]` and no `asked_to_leave_out`; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
 | `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
@@ -206,7 +206,7 @@ what it holds and what it never does. Sections and keys, in order:
 | **`[frames.histogram]`** | Frames by present-to-present time, buckets at 120, 90, 60, 45, 30, 20, 10, 4 and 1 frames a second |
 | **`[timeline]`** | Per window since the start (10 s; merged into longer windows to show at most 180): `presents`, `fps` (the last window's over the time the run spent in it, at least 1 s), `worst_frame_ms`. Loading and warm-up come first, then the steady state |
 | **`[gpu_work]`** | Per frame (between two presents; the first present's loading is left out), average and most: `submissions`, `draws` (with mesh dispatches) and `dispatches` run on the host, and those `left_out`; `left_out_avg_steady`, the same over the steady state (below); `submissions_total` |
-| **`[gpu_work.left_out]`** | Draws and dispatches the title recorded and the host did not run, the whole run, by reason: `pipeline_not_ready` (not made within the frame's wait budget), `shader_not_translated`, `pipeline_refused` (by the host), `out_of_memory` (constants, scratch, vertices refused), `no_descriptor_slots`, `indirect_not_bounded`, `ray_tracing_builder_off`, `no_pipeline_set`, `other` |
+| **`[gpu_work.left_out]`** | Draws and dispatches the title recorded and the host did not run, the whole run, by reason: `pipeline_not_ready` (not made within the frame's wait budget), `shader_not_translated`, `pipeline_refused` (by the host), `out_of_memory` (constants, scratch, vertices refused), `no_descriptor_slots`, `indirect_not_bounded`, `ray_tracing_builder_off`, `no_pipeline_set`, `asked_to_leave_out` (a shader of its pipeline is named in `VICTORY_LEAVE_OUT`), `other` |
 | **`[frame_time]`** | What a frame cost, per frame over the whole run, from the meters of the log's once-a-second frame line (["Reading the frame figures"](#reading-the-frame-figures)) |
 | **`[frame_time.steady]`** | The same over the steady state, which begins at `from_s`; a comment and no figures when the run was too short for one ([below](#reading-the-frame-figures)) |
 | **`[frame_time.waits]`**, **`.steady`** | Per frame, ms the submitting thread waited for the card in settles of submissions sent ahead, by what settled them |
@@ -311,7 +311,7 @@ then.
 | Key | What |
 |---|---|
 | `split` | `on`; `off` (`VICTORY_GPU_SPLIT=0`: nothing recorded, no query heap); `refused_by_driver` (the queue gave no timestamp frequency or the heap could not be made: logged once, then off); `not_started` (no list has marked a run yet) |
-| `frames`, `partly_measured_pct` | The frame meter's frames; the share of them in which some run could not be given one kind: the frame's budget of boundaries ran out (4,096 by default, `VICTORY_GPU_SPLIT=<n>` sets another, 16 to 16,384) or the heap had no slot left. Such a run is `unattributed_ms` |
+| `frames`, `partly_measured_pct` | The frame meter's frames; the share of them in which some run could not be given one kind: the frame's budget of boundaries ran out (8,192 by default, 4,096 with `VICTORY_GPU_SPLIT=kinds`; `VICTORY_GPU_SPLIT=<n>` sets another, 16 to 16,384) or the heap had no slot left. Such a run is `unattributed_ms` |
 | `draws_ms` | The title's draws, mesh dispatches and indirect draws (with what the list does unmarked behind them: barriers, state) |
 | `dispatches_wave64_ms` | The title's dispatches of compute programs written for 64-lane waves (the console program says so). On a card whose `wave_lanes_max` is 32 these are the programs the translator gives one of its forms for 64-lane waves (meetings at group barriers, halves meeting by themselves, lane-serial, or the approximate form its guard falls back to); the host pipeline does not keep which form, so this is all of them |
 | `dispatches_other_ms` | The title's other dispatches |
@@ -333,6 +333,8 @@ then.
 | `texture_uploads_mb` | Bytes of staging buffers copied into textures per frame |
 | `governor_looks` and the `*_mib_*` keys | What the budget governor saw at its looks (about one a second, from the asks it makes anyway; none with `VICTORY_BUDGET=0`) while those frames ran: the card's own memory in use (average, peak) and its budget (average), the same of the shared memory (the PC's memory the card uses), free physical memory (average, lowest) |
 | `looks_card_over_budget`, `looks_free_ram_under_512_mib` | Looks that found the card's memory in use past its budget, and free physical memory under 512 MiB |
+| `pipeline_seconds`, `compute_pipelines_a_second_avg` | With the title's dispatches timed by pipeline (`VICTORY_GPU_SPLIT`'s default `pipelines`): the frame line's seconds that had any, and how many compute pipelines ran in such a second on average. No pipeline is named: the log's table names them |
+| `costliest_pipeline_ms`, `costliest_5_pipelines_ms`, `costliest_20_pipelines_ms` | Per frame, the card's time of the costliest 1, 5 and 20 compute pipelines of each second, summed over the seconds: how much of `dispatches_wave64_ms` plus `dispatches_other_ms` a few programs take |
 
 **Telling the suspects apart.** Read the steady state, and two runs with
 `victory report --diff` where one thing changed:
@@ -478,7 +480,7 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 5
+format = 6
 kind = "run"
 
 [rox_box]
@@ -575,6 +577,7 @@ no_descriptor_slots = 0
 indirect_not_bounded = 6
 ray_tracing_builder_off = 0
 no_pipeline_set = 0
+asked_to_leave_out = 0
 other = 0
 
 [frame_time]
@@ -706,6 +709,14 @@ free_ram_mib_avg = 900.00
 free_ram_mib_lowest = 612.00
 looks_card_over_budget = 3
 looks_free_ram_under_512_mib = 0
+# the title's compute pipelines (VICTORY_GPU_SPLIT pipelines), named nowhere: how many ran in a
+# second of the frame line (seconds with any), and per frame the card's time of the costliest
+# 1, 5 and 20 of each second, ms
+pipeline_seconds = 60
+compute_pipelines_a_second_avg = 120.00
+costliest_pipeline_ms = 2.00
+costliest_5_pipelines_ms = 5.00
+costliest_20_pipelines_ms = 8.00
 
 [gpu_time.steady]
 from_s = 40.00
@@ -753,6 +764,14 @@ free_ram_mib_avg = 900.00
 free_ram_mib_lowest = 612.00
 looks_card_over_budget = 3
 looks_free_ram_under_512_mib = 0
+# the title's compute pipelines (VICTORY_GPU_SPLIT pipelines), named nowhere: how many ran in a
+# second of the frame line (seconds with any), and per frame the card's time of the costliest
+# 1, 5 and 20 of each second, ms
+pipeline_seconds = 20
+compute_pipelines_a_second_avg = 120.00
+costliest_pipeline_ms = 2.00
+costliest_5_pipelines_ms = 5.00
+costliest_20_pipelines_ms = 8.00
 
 [pipelines]
 created_by_title = 4212

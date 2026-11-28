@@ -56,6 +56,8 @@ impl Worker {
                         None,
                     )?;
                     list.Close()?;
+                    // (The name breadcrumbs give a list that did not finish.)
+                    list.SetName(windows::core::w!("replay: own work"))?;
                     self.lists.push((allocator, list, 0));
                     self.lists.len() - 1
                 }

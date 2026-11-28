@@ -30,17 +30,27 @@
 //! (the frame is then counted as partly measured). A list with no mark at all
 //! (barriers alone, our state changes) is inside the run before it.
 //!
+//! The title's dispatches are cut by pipeline too (`pipelines`, the default;
+//! [`pipes`]): their time and counts by compute pipeline, for the log's table
+//! of the costliest and for figures in the report that name none.
+//!
 //! What it costs: a mark is a relaxed load of the list's current kind, and at
-//! a change of kind a lock, an `EndQuery` and a push; a submission one list
-//! of ours more (one `EndQuery` and a `ResolveQueryData` per run of
-//! consecutive slots); a second, the fold of what landed. No command of the
-//! title's or ours moves: the queries are added between them. With
-//! `VICTORY_GPU_SPLIT=0` nothing is recorded and no query heap is made.
+//! a change of kind a lock, an `EndQuery` and a push; a dispatch of the
+//! title's, with pipelines on, a compare of its pipeline and a lock to count
+//! it, and at a change of pipeline a look-up in the table of pipelines and an
+//! `EndQuery` (on the card, a timestamp between two dispatches, which may keep
+//! them from overlapping); a submission one list of ours more (one `EndQuery`
+//! and a `ResolveQueryData` per run of consecutive slots); a second, the fold
+//! of what landed. No command of the title's or ours moves: the queries are
+//! added between them. With `VICTORY_GPU_SPLIT=0` nothing is recorded and no
+//! query heap is made.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
 use super::*;
+
+mod pipes;
 
 /// What a run of commands on the host queue is, in the order the report
 /// gives them.
@@ -93,7 +103,7 @@ pub(crate) const KINDS: usize = Kind::Unattributed as usize + 1;
 const NONE: u8 = u8::MAX;
 
 /// Timestamps in the query heap, taken by lists in chunks of [`CHUNK`]:
-/// 32 frames of the default budget.
+/// 16 frames of the default budget.
 const SLOTS: u32 = 1 << 17;
 const CHUNK: u32 = 32;
 /// Resolved timestamps the read-back ring holds for submissions not landed
@@ -102,29 +112,66 @@ const RING: u32 = 1 << 16;
 /// The most boundaries a frame the switch may ask for.
 const MOST_BUDGET: u32 = 16_384;
 
-/// Boundaries a frame by default: a few thousand, as many as the runs of
-/// one kind a heavy frame has.
+/// Boundaries a frame by default when runs are cut by kind alone: a few
+/// thousand, as many as the runs of one kind a heavy frame has.
 pub(crate) const BUDGET: u32 = 4096;
+/// The same when the title's dispatches are cut by pipeline too: one more
+/// boundary for nearly every dispatch.
+pub(crate) const PIPELINES_BUDGET: u32 = 8192;
 
-/// The budget of boundaries a frame a value of the switch asks for ([`budget`]).
-fn budget_of(value: Option<&str>) -> u32 {
-    match value.map(str::trim) {
-        None | Some("" | "1") => BUDGET,
-        Some("0") => 0,
-        Some(v) => v.parse::<u32>().map_or(BUDGET, |n| n.clamp(16, MOST_BUDGET)),
-    }
+/// What the switch asks for: the frame's budget of boundaries (0: off), and
+/// whether the title's dispatches are cut by pipeline ([`pipes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Settings {
+    budget: u32,
+    pipelines: bool,
 }
 
-/// `VICTORY_GPU_SPLIT`, unset or `1`: the card's time by kind, with the
-/// default budget of boundaries a frame ([`BUDGET`]); a number of 16 or more:
-/// that budget (at most 16,384); `0`: nothing recorded and no query heap made,
-/// as before. Past the budget a frame's lists stop marking and the frame
-/// counts as partly measured. On by default: what it adds is a timestamp at
-/// each change of kind of work in a list and one small list a submission,
-/// and it moves no command.
+/// The settings a value of the switch asks for ([`budget`]): words and a
+/// number, comma-separated, in any order: `0` off; `kinds` runs by kind alone
+/// (as before); `pipelines` (the default) the title's dispatches by pipeline
+/// too; a number of 16 or more the budget (at most 16,384); `1` or nothing the
+/// default budget of the mode. A word not known is left out.
+fn settings_of(value: Option<&str>) -> Settings {
+    let (mut budget, mut pipelines, mut off) = (None, true, false);
+    for word in value.unwrap_or_default().split(',').map(str::trim) {
+        match word {
+            "" | "1" => {}
+            "0" => off = true,
+            "kinds" => pipelines = false,
+            "pipelines" => pipelines = true,
+            n => budget = n.parse::<u32>().ok().map(|n| n.clamp(16, MOST_BUDGET)).or(budget),
+        }
+    }
+    let default = if pipelines { PIPELINES_BUDGET } else { BUDGET };
+    Settings { budget: if off { 0 } else { budget.unwrap_or(default) }, pipelines: pipelines && !off }
+}
+
+/// `VICTORY_GPU_SPLIT`, unset or `1`: the card's time by kind, and of the
+/// title's dispatches by pipeline (`pipelines`, the log's table of the
+/// costliest a second), with the default budget of boundaries a frame
+/// ([`PIPELINES_BUDGET`]); `kinds`: by kind alone, as before ([`BUDGET`]); a
+/// number of 16 or more: that budget (at most 16,384), with either word
+/// (`kinds,4096`); `0`: nothing recorded and no query heap made. Past the
+/// budget a frame's lists stop marking and the frame counts as partly
+/// measured; the last eighth of it is kept for changes of kind, so that past
+/// that a change of pipeline alone is not cut (its run counts as of
+/// pipelines not told apart). On by default: what it adds is a timestamp at
+/// each change of kind of work in a list and at each change of a dispatch's
+/// pipeline, and one small list a submission, and it moves no command.
+fn settings() -> Settings {
+    static NOW: OnceLock<Settings> = OnceLock::new();
+    *NOW.get_or_init(|| settings_of(std::env::var("VICTORY_GPU_SPLIT").ok().as_deref()))
+}
+
+/// The frame's budget of boundaries ([`settings`]; 0: off).
 pub(crate) fn budget() -> u32 {
-    static BUDGET_NOW: OnceLock<u32> = OnceLock::new();
-    *BUDGET_NOW.get_or_init(|| budget_of(std::env::var("VICTORY_GPU_SPLIT").ok().as_deref()))
+    settings().budget
+}
+
+/// Whether the title's dispatches are cut by pipeline ([`budget`]).
+pub(crate) fn pipelines() -> bool {
+    settings().pipelines && on()
 }
 
 /// The driver refused the queries (logged once): off from then on.
@@ -263,14 +310,40 @@ fn granted(used: u32, budget: u32) -> bool {
     used < budget
 }
 
+/// Whether a boundary that changes only a dispatch's pipeline fits: not in
+/// the last eighth of the budget, kept for changes of kind.
+fn pipeline_cut_granted(used: u32, budget: u32) -> bool {
+    used < budget - budget / 8
+}
+
 // ---------------------------------------------------------------------------
 // A list's marks.
+
+/// The beginning of a run: the slot its timestamp went to, its kind, and for
+/// the title's dispatches with pipelines on, the pipeline ([`pipes::Pipe`])
+/// and what the run's dispatches asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mark {
+    slot: u32,
+    kind: Kind,
+    pipe: pipes::Pipe,
+    dispatches: pipes::Asked,
+}
+
+impl Mark {
+    fn of(slot: u32, kind: Kind) -> Mark {
+        Mark { slot, kind, pipe: pipes::NO_PIPE, dispatches: pipes::Asked::default() }
+    }
+}
 
 /// Where a list's runs begin: the slots it wrote a timestamp to, in recorded
 /// order, and the kind of the run each begins.
 pub(crate) struct Marks {
     /// The kind of the run being recorded ([`NONE`]: none yet).
     now: AtomicU8,
+    /// Of a run of the title's dispatches, its pipeline (the host pipeline
+    /// object's address; 0: none).
+    now_pipe: AtomicUsize,
     inner: Mutex<Inner>,
 }
 
@@ -279,7 +352,7 @@ struct Inner {
     chunks: Vec<u32>,
     /// Slots taken of the last chunk.
     used: u32,
-    slots: Vec<(u32, Kind)>,
+    slots: Vec<Mark>,
     /// A boundary was refused (the budget, no slot left): what follows the
     /// last one is of no one kind.
     short: bool,
@@ -312,7 +385,7 @@ impl Drop for Marks {
 
 impl Marks {
     pub(crate) fn new() -> Marks {
-        Marks { now: AtomicU8::new(NONE), inner: Mutex::new(Inner::default()) }
+        Marks { now: AtomicU8::new(NONE), now_pipe: AtomicUsize::new(0), inner: Mutex::new(Inner::default()) }
     }
 
     /// A run of `kind` begins at this point of `list` (an open list these
@@ -323,6 +396,72 @@ impl Marks {
             return;
         }
         self.record(list, kind, true);
+    }
+
+    /// A dispatch of the title's (`kind` [`Kind::Wave64`] or
+    /// [`Kind::Dispatches`]) of host pipeline `p` comes at this point of
+    /// `list`, of `groups` groups (`None`: indirect). With pipelines on
+    /// ([`pipelines`]) a run begins where the kind or the pipeline changes,
+    /// and the run counts what its dispatches asked for; else as
+    /// [`Marks::mark`].
+    pub(crate) fn mark_dispatch(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        kind: Kind,
+        p: &crate::pipeline::host::HostPipeline,
+        groups: Option<u64>,
+    ) {
+        if !pipelines() {
+            self.mark(list, kind);
+            return;
+        }
+        let key = p.pso.as_raw() as usize;
+        let same_kind = self.now.load(Ordering::Relaxed) == kind as u8;
+        if same_kind && self.now_pipe.load(Ordering::Relaxed) == key {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if !inner.short
+                && let Some(last) = inner.slots.last_mut()
+            {
+                last.dispatches.add(groups);
+            }
+            return;
+        }
+        let Some(objects) = objects() else {
+            return;
+        };
+        let pipe = pipes::pipe(key, p);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.short {
+            return;
+        }
+        self.now.store(kind as u8, Ordering::Relaxed);
+        self.now_pipe.store(key, Ordering::Relaxed);
+        // Late in the frame's budget a change of pipeline alone is not cut:
+        // the run goes on, as of pipelines not told apart.
+        if same_kind
+            && !pipeline_cut_granted(USED.load(Ordering::Relaxed), budget())
+            && let Some(last) = inner.slots.last_mut()
+            && last.kind == kind
+        {
+            last.pipe = pipes::MIXED;
+            last.dispatches.add(groups);
+            return;
+        }
+        if !granted(USED.fetch_add(1, Ordering::Relaxed), budget()) {
+            inner.short = true;
+            SHORT.store(true, Ordering::Relaxed);
+            return;
+        }
+        let Some(slot) = inner.slot() else {
+            inner.short = true;
+            SHORT.store(true, Ordering::Relaxed);
+            return;
+        };
+        // SAFETY: as in `record`.
+        unsafe { list.EndQuery(&objects.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        let mut mark = Mark { pipe, ..Mark::of(slot, kind) };
+        mark.dispatches.add(groups);
+        inner.slots.push(mark);
     }
 
     /// [`Marks::mark`] outside the budget: the end of a submission, the end
@@ -347,6 +486,7 @@ impl Marks {
             return;
         }
         self.now.store(kind as u8, Ordering::Relaxed);
+        self.now_pipe.store(0, Ordering::Relaxed);
         if budgeted && !granted(USED.fetch_add(1, Ordering::Relaxed), budget()) {
             inner.short = true;
             SHORT.store(true, Ordering::Relaxed);
@@ -360,13 +500,14 @@ impl Marks {
         // SAFETY: an open list (the caller's), our heap, a slot of it that
         // these marks alone hold.
         unsafe { list.EndQuery(&objects.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
-        inner.slots.push((slot, kind));
+        inner.slots.push(Mark::of(slot, kind));
     }
 
     /// The list is reset: its slots go back (every submission of it has
     /// landed, and its timestamps were resolved by then).
     pub(crate) fn clear(&self) {
         // (No kind since the last reset: nothing was taken.)
+        self.now_pipe.store(0, Ordering::Relaxed);
         if self.now.swap(NONE, Ordering::Relaxed) == NONE {
             return;
         }
@@ -385,7 +526,7 @@ impl Marks {
 /// marks of lists of ours that it holds until it has landed.
 #[derive(Default)]
 pub(crate) struct Sequence {
-    slots: Vec<(u32, Kind)>,
+    slots: Vec<Mark>,
     held: Vec<Marks>,
     /// Something of it was not given its kind.
     partly: bool,
@@ -404,14 +545,15 @@ impl Sequence {
         self.push(&inner.slots, inner.short);
     }
 
-    fn push(&mut self, slots: &[(u32, Kind)], short: bool) {
+    fn push(&mut self, slots: &[Mark], short: bool) {
         self.slots.extend_from_slice(slots);
         if short {
             self.partly = true;
             // The run from its last mark (or the one before the list) holds
             // what the list did not mark.
             if let Some(last) = self.slots.last_mut() {
-                last.1 = Kind::Unattributed;
+                last.kind = Kind::Unattributed;
+                last.pipe = pipes::NO_PIPE;
             }
         }
     }
@@ -466,7 +608,7 @@ impl Sequence {
         let mut pending = Pending {
             number,
             at,
-            kinds: self.slots.iter().map(|s| s.1).collect(),
+            marks: self.slots.clone(),
             _held: std::mem::take(&mut self.held),
             resolver: Some(resolver),
             partly: self.partly,
@@ -503,7 +645,7 @@ impl Sequence {
         Some(Pending {
             number: 0,
             at,
-            kinds: self.slots.iter().map(|s| s.1).collect(),
+            marks: self.slots.clone(),
             _held: std::mem::take(&mut self.held),
             resolver: None,
             partly: self.partly,
@@ -531,9 +673,9 @@ pub(crate) fn alone_end(list: &ID3D12GraphicsCommandList, marks: Option<Marks>) 
 
 /// The runs of consecutive slots of `slots`, as (first slot, count), in
 /// order: one resolve each, into consecutive places of the ring.
-fn slot_runs(slots: &[(u32, Kind)]) -> Vec<(u32, u32)> {
+fn slot_runs(slots: &[Mark]) -> Vec<(u32, u32)> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
-    for &(slot, _) in slots {
+    for &Mark { slot, .. } in slots {
         match runs.last_mut() {
             Some((first, n)) if *first + *n == slot => *n += 1,
             _ => runs.push((slot, 1)),
@@ -546,7 +688,7 @@ fn slot_runs(slots: &[(u32, Kind)]) -> Vec<(u32, u32)> {
 ///
 /// # Safety
 /// An open list; `at` and the slots' count lie in the ring.
-unsafe fn resolve(list: &ID3D12GraphicsCommandList, objects: &Objects, slots: &[(u32, Kind)], at: u32) {
+unsafe fn resolve(list: &ID3D12GraphicsCommandList, objects: &Objects, slots: &[Mark], at: u32) {
     let mut to = at;
     for (first, n) in slot_runs(slots) {
         // SAFETY: the caller's; the runs are of slots these marks wrote.
@@ -640,7 +782,7 @@ fn ring_take(n: u32) -> Option<u32> {
 pub(crate) struct Pending {
     number: u64,
     at: u32,
-    kinds: Vec<Kind>,
+    marks: Vec<Mark>,
     _held: Vec<Marks>,
     resolver: Option<Prelude>,
     partly: bool,
@@ -697,14 +839,16 @@ impl Pending {
         let Some(objects) = OBJECTS.get().and_then(Option::as_ref) else {
             return;
         };
-        let n = self.kinds.len();
+        let n = self.marks.len();
         // SAFETY: the ring's mapping; the card wrote these places when the
         // submission ran, and nothing writes them again before they are
         // given back (when this is dropped).
         let ticks = unsafe { std::slice::from_raw_parts((objects.mapped as *const u64).add(self.at as usize), n) };
         let mut by_kind = [0u64; KINDS];
         let mut runs = [0u64; KINDS];
-        let ignored = fold_runs(ticks, &self.kinds, objects.frequency, &mut by_kind, &mut runs);
+        let kinds: Vec<Kind> = self.marks.iter().map(|m| m.kind).collect();
+        let ignored = fold_runs(ticks, &kinds, objects.frequency, &mut by_kind, &mut runs);
+        pipes::fold(ticks, &self.marks, objects.frequency);
         for k in 0..KINDS {
             if by_kind[k] > 0 {
                 TICKS[k].fetch_add(by_kind[k], Ordering::Relaxed);
@@ -838,7 +982,8 @@ fn take() -> ([u64; KINDS], [u64; VOLUMES_N], u64, u64) {
 /// landed, and the log says it.
 pub(crate) fn line(frames: f64) {
     let (ns, volumes, partly, ignored) = take();
-    crate::runreport::gpu_split(frames.round() as u64, ns, volumes, partly);
+    let pipelines = pipes::second(frames, ns.iter().sum(), on());
+    crate::runreport::gpu_split(frames.round() as u64, ns, volumes, partly, pipelines);
     if !on() || ns.iter().all(|&n| n == 0) {
         return;
     }
@@ -879,18 +1024,25 @@ pub(crate) fn line(frames: f64) {
 
 /// When the report that names the run's end is written: the frames since
 /// the line's last second, as the line would give them, without a line.
+/// And the log's table of pipelines over the steady state, once.
 pub(crate) fn last(frames: u64) {
-    if frames == 0 {
-        return;
+    if frames > 0 {
+        let (ns, volumes, partly, _) = take();
+        let pipelines = pipes::second(frames as f64, ns.iter().sum(), false);
+        crate::runreport::gpu_split(frames, ns, volumes, partly, pipelines);
     }
-    let (ns, volumes, partly, _) = take();
-    crate::runreport::gpu_split(frames, ns, volumes, partly);
+    pipes::steady_line();
 }
 
 impl HostList {
     /// A run of `kind` begins at this point of the list ([`Marks::mark`]).
     pub(crate) fn gpu_kind(&self, kind: Kind) {
         self.gpu_marks.mark(&self.list, kind);
+    }
+
+    /// A dispatch of the title's of `p` comes ([`Marks::mark_dispatch`]).
+    pub(crate) fn gpu_dispatch(&self, kind: Kind, p: &crate::pipeline::host::HostPipeline, groups: Option<u64>) {
+        self.gpu_marks.mark_dispatch(&self.list, kind, p, groups);
     }
 }
 
@@ -900,13 +1052,35 @@ mod tests {
 
     #[test]
     fn the_switch_is_on_by_default_and_takes_a_budget() {
-        assert_eq!(budget_of(None), BUDGET);
-        assert_eq!(budget_of(Some("1")), BUDGET);
+        let budget_of = |v| settings_of(v).budget;
+        assert_eq!(budget_of(None), PIPELINES_BUDGET);
+        assert_eq!(budget_of(Some("1")), PIPELINES_BUDGET);
         assert_eq!(budget_of(Some("0")), 0);
         assert_eq!(budget_of(Some(" 8192 ")), 8192);
         assert_eq!(budget_of(Some("3")), 16);
         assert_eq!(budget_of(Some("1000000")), MOST_BUDGET);
-        assert_eq!(budget_of(Some("lots")), BUDGET);
+        assert_eq!(budget_of(Some("lots")), PIPELINES_BUDGET);
+    }
+
+    /// Pipelines are on by default; `kinds` cuts by kind alone with its own
+    /// default budget, as before; words and a number go together.
+    #[test]
+    fn the_switch_says_whether_pipelines_are_cut() {
+        assert_eq!(settings_of(None), Settings { budget: PIPELINES_BUDGET, pipelines: true });
+        assert_eq!(settings_of(Some("pipelines")), Settings { budget: PIPELINES_BUDGET, pipelines: true });
+        assert_eq!(settings_of(Some("kinds")), Settings { budget: BUDGET, pipelines: false });
+        assert_eq!(settings_of(Some("kinds, 2048")), Settings { budget: 2048, pipelines: false });
+        assert_eq!(settings_of(Some("12000,pipelines")), Settings { budget: 12000, pipelines: true });
+        assert_eq!(settings_of(Some("0,pipelines")), Settings { budget: 0, pipelines: false });
+    }
+
+    /// A change of pipeline alone is cut up to the last eighth of the budget.
+    #[test]
+    fn the_last_eighth_of_the_budget_is_kept_for_kinds() {
+        assert!(pipeline_cut_granted(0, 8192));
+        assert!(pipeline_cut_granted(7167, 8192));
+        assert!(!pipeline_cut_granted(7168, 8192));
+        assert!(granted(7168, 8192));
     }
 
     #[test]
@@ -954,7 +1128,7 @@ mod tests {
     #[test]
     fn consecutive_slots_resolve_together() {
         let k = Kind::Draws;
-        let slots = [(64, k), (65, k), (66, k), (3, k), (4, k), (100, k), (67, k)];
+        let slots = [64, 65, 66, 3, 4, 100, 67].map(|s| Mark::of(s, k));
         assert_eq!(slot_runs(&slots), vec![(64, 3), (3, 2), (100, 1), (67, 1)]);
         assert_eq!(slot_runs(&[]), vec![]);
     }
@@ -965,19 +1139,21 @@ mod tests {
     #[test]
     fn a_short_list_leaves_its_run_unattributed() {
         let mut seq = Sequence::default();
-        seq.push(&[(0, Kind::Draws), (1, Kind::Dispatches)], false);
+        seq.push(&[Mark::of(0, Kind::Draws), Mark::of(1, Kind::Dispatches)], false);
         seq.push(&[], false);
         assert!(!seq.partly);
-        seq.push(&[(32, Kind::Wave64)], true);
+        let of_pipe = Mark { pipe: 3, ..Mark::of(32, Kind::Wave64) };
+        seq.push(&[of_pipe], true);
         assert!(seq.partly);
-        assert_eq!(seq.slots.last().map(|s| s.1), Some(Kind::Unattributed));
+        // (Of no pipeline either: what it holds is not of one.)
+        assert_eq!(seq.slots.last().map(|s| (s.kind, s.pipe)), Some((Kind::Unattributed, pipes::NO_PIPE)));
         // A short list with no mark: the run before it is unattributed.
         let mut seq = Sequence::default();
-        seq.push(&[(0, Kind::Fills)], false);
+        seq.push(&[Mark::of(0, Kind::Fills)], false);
         seq.push(&[], true);
-        assert_eq!(seq.slots, vec![(0, Kind::Unattributed)]);
+        assert_eq!(seq.slots, vec![Mark::of(0, Kind::Unattributed)]);
         let mut first = Sequence::default();
-        first.push(&[(5, Kind::Uploads), (6, Kind::Hashes), (7, Kind::Gap)], false);
+        first.push(&[Mark::of(5, Kind::Uploads), Mark::of(6, Kind::Hashes), Mark::of(7, Kind::Gap)], false);
         first.append(seq);
         assert_eq!(first.slots.len(), 4);
         assert!(first.partly);

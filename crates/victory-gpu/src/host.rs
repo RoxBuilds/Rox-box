@@ -11608,6 +11608,7 @@ impl Meter {
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         gpu_split::line(frames);
+        crate::pipeline::leave_out_line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

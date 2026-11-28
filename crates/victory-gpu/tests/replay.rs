@@ -1,9 +1,11 @@
 //! The frame recorder and replayer on the PC's own adapter (skipped without
 //! one): a small program with clears, indirect draws of textures picked from
 //! a heap, compute, buffers the CPU changes between submissions, descriptors
-//! replaced between them, and textures that share memory. It runs without
-//! the recorder, then with it, then one frame of it is replayed; every
-//! picture and buffer must be the same.
+//! replaced between them, textures that share memory in a heap made not
+//! resident, and a buffer in the program's own memory opened as a heap (one
+//! that may cross adapters, as the host layer shows title memory). It runs
+//! without the recorder, then with it, then one frame of it is replayed;
+//! every picture and buffer must be the same.
 //!
 //! `VICTORY_TEST_D3D_DEBUG=1` runs it under the debug layer.
 #![cfg(all(windows, feature = "diagnostics"))]
@@ -529,6 +531,10 @@ struct Scene {
     scratch: ID3D12Resource,
     budget: ID3D12Resource,
     shared: (ID3D12Resource, *mut u8),
+    /// A buffer in memory of the program's opened as a heap, and that
+    /// memory.
+    opened: (ID3D12Resource, *mut u8),
+    _opened_heap: ID3D12Heap,
     constants: (ID3D12Resource, *mut u8),
     texels: (ID3D12Resource, *mut u8),
     back: (ID3D12Resource, *mut u8),
@@ -718,10 +724,42 @@ impl Scene {
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                // Made resident by the program, as the host layer's are: a
+                // replay must not take the flag over (it never makes them
+                // resident, and the card hangs on them).
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                    | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
             };
             device.CreateHeap(&desc, &mut memory).unwrap();
             let memory = memory.unwrap();
+            device
+                .MakeResident(&[Some(memory.cast::<ID3D12Pageable>().unwrap())])
+                .unwrap();
+            // The program's own memory, opened as a heap: shared across
+            // adapters, so a buffer in it must be made so; the replay's heap
+            // like it is shared with no one, and its buffer must not be.
+            let bytes = 65536;
+            let base = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                windows_sys::Win32::System::Memory::MEM_COMMIT
+                    | windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!base.is_null());
+            let opened_heap: ID3D12Heap = device
+                .cast::<ID3D12Device3>()
+                .unwrap()
+                .OpenExistingHeapFromAddress(base)
+                .unwrap();
+            let opened = {
+                let mut made: Option<ID3D12Resource> = None;
+                let d = buffer_desc(bytes as u64, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+                device
+                    .CreatePlacedResource(&opened_heap, 0, &d, COMMON, None, &mut made)
+                    .unwrap();
+                (made.unwrap(), base.cast::<u8>())
+            };
             let placed = || {
                 let mut made: Option<ID3D12Resource> = None;
                 let d = texture_desc(16, rgba, D3D12_RESOURCE_FLAG_NONE);
@@ -819,6 +857,7 @@ impl Scene {
                 (&shared.0, "shared"),
                 (&one, "one"),
                 (&other, "other"),
+                (&opened.0, "opened"),
             ] {
                 record::name(r, n);
             }
@@ -862,6 +901,8 @@ impl Scene {
                 scratch,
                 budget,
                 shared,
+                opened,
+                _opened_heap: opened_heap,
                 constants,
                 texels,
                 back,
@@ -1397,6 +1438,11 @@ impl Scene {
             // The card writes memory the CPU sees.
             l.ResourceBarrier(&[moved(&self.sum, UAV, FROM)]);
             l.CopyBufferRegion(&self.shared.0, 30_000, &self.sum, 0, 1024);
+            // What the CPU wrote to its own memory, read in place.
+            for i in 0..256u32 {
+                self.opened.1.add(4 * i as usize).cast::<u32>().write(i * 977 + n);
+            }
+            l.CopyBufferRegion(&self.shared.0, 50_000, &self.opened.0, 0, 1024);
             l.ResourceBarrier(&[moved(&self.target, TARGET, FROM)]);
             l.Close().unwrap();
             self.send(&[&second, &l]);
@@ -1580,6 +1626,7 @@ fn check(player: &mut Player, options: &Options, expected: &Outcome, what: &str)
         "submissions,",
         "waits of the drawing queue",
         "lists sent to a queue other than",
+        "a heap opened from existing memory",
     ];
     assert!(
         !report
@@ -1590,6 +1637,12 @@ fn check(player: &mut Player, options: &Options, expected: &Outcome, what: &str)
         report.notes
     );
     assert!(report.notes.iter().any(|n| n.contains(known[2])));
+    // Every resource was made again (the one in the opened heap too).
+    assert!(
+        !report.notes.iter().any(|n| n.contains("could not be made again")),
+        "{what}: {:?}",
+        report.notes
+    );
     report
 }
 

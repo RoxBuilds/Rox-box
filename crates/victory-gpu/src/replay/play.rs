@@ -457,7 +457,14 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
     let mut out = Vec::new();
     if options.compare && (options.edited() || options.shaders_b.is_some()) {
         // Turn by turn: what else the machine does falls on both.
-        let image = Some(player.folder.join("replay-unchanged.png"));
+        // Beside the picture asked for (`--image`), else in the capture.
+        let image = Some(match &options.image {
+            Some(p) => p.with_file_name(format!(
+                "{}-unchanged.png",
+                p.file_stem().unwrap_or_default().to_string_lossy()
+            )),
+            None => player.folder.join("replay-unchanged.png"),
+        });
         let plain = Options {
             image,
             ..options.plain()
@@ -631,15 +638,20 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        let r = player.make_resources(options.buffers, &options.only_buffers);
+        player.failed(r, "making the frame's resources")?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        let r = player.make_pipelines(options.shaders.as_deref());
+        player.failed(r, "making the frame's pipelines")?;
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        let r = player.make_descriptors();
+        player.failed(r, "making the frame's descriptors")?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        let r = player.load_contents();
+        player.failed(r, "putting the frame's contents back")?;
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        let r = player.make_masters(options.buffers, options.restore);
+        player.failed(r, "making the copies to restore from")?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -666,6 +678,22 @@ impl Player {
     fn note(&mut self, n: String) {
         tracing::warn!("{n}");
         self.notes.push(n);
+    }
+
+    /// A step's error with its name, and, when the device was lost, what
+    /// the debug layer (`--debug-layer`) and the system's breadcrumbs
+    /// (`--breadcrumbs`) kept of it: the only trace of the command that
+    /// lost it.
+    fn failed<T>(&self, r: Result<T>, what: &str) -> Result<T> {
+        r.map_err(|e| {
+            let mut said: Vec<String> = self.info.as_ref().map(debug_messages).unwrap_or_default();
+            said.extend(removal(&self.device));
+            if said.is_empty() {
+                e.context(what.to_owned())
+            } else {
+                e.context(format!("{what} ({})", said.join("; ")))
+            }
+        })
     }
 
     /// Says what of the frame is not there.
@@ -747,8 +775,15 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and
+        // made not resident: the host layer made such heaps resident when it
+        // wanted them, the replay never does, and the card's first copy into
+        // one lost the device (hung on memory that is not there).
+        const DROP: i32 = D3D12_HEAP_FLAG_SHARED.0
+            | D3D12_HEAP_FLAG_ALLOW_DISPLAY.0
+            | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0
+            | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0
+            | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -765,6 +800,23 @@ impl Player {
                 .filter(|id| !textures.contains(id))
                 .collect()
         };
+        // What the heaps come to, by how they were made: a frame whose heaps
+        // do not fit the PC's memory or the card's is not one to time.
+        let mut by: BTreeMap<String, (u32, u64, u64)> = BTreeMap::new();
+        for h in &self.frame.heaps {
+            let (kind, cpu, pool, flags) = (h.props.kind, h.props.cpu, h.props.pool, h.flags);
+            let e = by
+                .entry(format!("type {kind} cpu {cpu} pool {pool} flags {flags:#x}"))
+                .or_default();
+            *e = (e.0 + 1, e.1 + h.size, e.2.max(h.size));
+        }
+        for (what, (n, bytes, most)) in by {
+            self.notes.push(format!(
+                "heaps of {what}: {n}, {} MB in all, the largest {} MB",
+                bytes >> 20,
+                most >> 20
+            ));
+        }
         for h in &self.frame.heaps {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
@@ -788,7 +840,13 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // A resource in a heap opened from existing memory is one that may
+            // cross adapters, and D3D12 takes that flag only in a heap shared
+            // so. The replay's heaps are shared with no one (`DROP`), so its
+            // resources are not either: with the flag left on, every such
+            // resource was refused and the frame ran on nothing.
+            desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
@@ -1394,7 +1452,9 @@ impl Player {
         }
         for (n, batch) in batches.iter().enumerate() {
             let k = n % stagings.len();
-            self.worker.wait(stagings[k].2)?;
+            self.worker
+                .wait(stagings[k].2)
+                .with_context(|| format!("before batch {n} of {} of copies", batches.len()))?;
             let map = stagings[k].1;
             let next = AtomicUsize::new(0);
             let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
@@ -1437,7 +1497,7 @@ impl Player {
             self.worker = worker;
             stagings[k].2 = sent?;
         }
-        self.worker.idle()?;
+        self.worker.idle().context("after the last batch of copies")?;
         Ok(())
     }
 
@@ -2277,8 +2337,12 @@ impl Player {
                 _ => None,
             };
             let mut built = Vec::new();
-            for cmds in lists {
+            for (k, cmds) in lists.iter().enumerate() {
                 let open = self.open(&heap, &mut next)?;
+                // (What breadcrumbs name a list by.)
+                let name = windows::core::HSTRING::from(format!("replay: submission {i} list {k}"));
+                // SAFETY: a plain call.
+                unsafe { open.1.SetName(&name)? };
                 let stamps = self.translate(
                     &open.1,
                     cmds,
@@ -3059,6 +3123,11 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
+        let r = self.run_loops(o);
+        self.failed(r, "running the frame")
+    }
+
+    fn run_loops(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
@@ -3463,6 +3532,96 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         let info = device.cast::<ID3D12InfoQueue>().ok();
         Ok((device, info))
     }
+}
+
+/// What the system's breadcrumbs (`--breadcrumbs`) kept of a lost device:
+/// how many lists finished, the ones that did not with the command each
+/// stopped at, and a page fault's address with the allocations it lies in.
+/// Nothing while the device lives or without breadcrumbs.
+fn removal(device: &ID3D12Device) -> Vec<String> {
+    // SAFETY: a plain query.
+    if unsafe { device.GetDeviceRemovedReason() }.is_ok() {
+        return Vec::new();
+    }
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    // SAFETY: the outputs are the runtime's, valid while the device lives;
+    // nodes are walked as linked, histories have their counts.
+    unsafe {
+        if let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() {
+            let (mut finished, mut stopped) = (0, Vec::new());
+            let mut node = crumbs.pHeadAutoBreadcrumbNode;
+            while let Some(p) = node.as_ref() {
+                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                if done >= p.BreadcrumbCount {
+                    finished += 1;
+                } else {
+                    let name = if p.pCommandListDebugNameW.is_null() {
+                        "unnamed".to_owned()
+                    } else {
+                        p.pCommandListDebugNameW.to_string().unwrap_or_default()
+                    };
+                    let op = (!p.pCommandHistory.is_null())
+                        .then(|| op_name((*p.pCommandHistory.add(done as usize)).0));
+                    stopped.push(format!(
+                        "{name} at command {done} of {} ({})",
+                        p.BreadcrumbCount,
+                        op.unwrap_or("?".into())
+                    ));
+                }
+                node = p.pNext;
+            }
+            let more = stopped.len().saturating_sub(8);
+            stopped.truncate(8);
+            out.push(format!(
+                "breadcrumbs: {finished} lists finished, these did not: {}{}",
+                stopped.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
+            ));
+        }
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput()
+            && fault.PageFaultVA != 0
+        {
+            let mut names = Vec::new();
+            let mut node = fault.pHeadExistingAllocationNode;
+            while let Some(n) = node.as_ref()
+                && names.len() < 8
+            {
+                names.push(format!("type {}", n.AllocationType.0));
+                node = n.pNext;
+            }
+            out.push(format!(
+                "page fault at {:#x}, inside allocations {names:?}",
+                fault.PageFaultVA
+            ));
+        }
+    }
+    out
+}
+
+/// A breadcrumb's command.
+fn op_name(op: i32) -> String {
+    let name = match op {
+        0 => "marker",
+        1 | 2 => "event",
+        3 => "draw",
+        4 => "indexed draw",
+        5 => "indirect",
+        6 => "dispatch",
+        7 => "buffer copy",
+        8 => "texture copy",
+        9 => "resource copy",
+        11 => "resolve",
+        12 => "target clear",
+        13 => "unordered-access clear",
+        14 => "depth clear",
+        15 => "barrier",
+        18 => "query resolve",
+        _ => return format!("op {op}"),
+    };
+    name.to_owned()
 }
 
 /// The debug layer's errors: how many of each kind, and its first text.

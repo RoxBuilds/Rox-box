@@ -57,7 +57,7 @@ with the presented one.
 
 | switch | does |
 |---|---|
-| `--compare` | runs the frame unchanged and with the experiments turn by turn, and prints the difference |
+| `--compare` | runs the frame unchanged and with the experiments turn by turn, and prints the difference (the unchanged picture goes beside `--image`'s, as `<name>-unchanged.png`) |
 | `--skip-clamps` | no argument clamps and no barriers of their scratch buffers; draws read arguments kept from a first run |
 | `--batch-clamps` / `--batch-clamps 2` | argument clamps in batches, as `VICTORY_INDIRECT_BATCH=2` / `=1` does |
 | `--skip-hash-passes` | no compare/rehash passes over card buffers |
@@ -75,8 +75,8 @@ with the presented one.
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |
-| `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`) |
-| `--debug-layer` | D3D12's debug layer; its errors in the report |
+| `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`): when the device is lost, the error names the lists that did not finish, the command each stopped at, and a page fault's address |
+| `--debug-layer` | D3D12's debug layer; its errors in the report, and in the error of a step that fails |
 
 Use the median of several loops; the first is slower. An experiment that
 leaves out waits or work can draw another picture and, with wild data, lose
@@ -149,6 +149,10 @@ The `--diverge` family runs the recorded copies without the merge.
   and root arguments are.
 - Views replaced during the frame get a heap of their own per submission in
   the replay (64 MB for two million views).
+- Heaps are made without their sharing flags and resident (the host layer
+  makes its heaps resident itself; the replay never does), and resources
+  without the flag to cross adapters (those in heaps opened from existing
+  memory).
 - Upload heaps become custom write-combined ones in the replay, as the card
   writes what the CPU wrote.
 - What the CPU changes in memory both see is taken before each submission, by

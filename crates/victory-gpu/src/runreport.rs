@@ -96,9 +96,10 @@ pub(crate) fn gpu_split(
     ns: [u64; crate::host::gpu_split::KINDS],
     volumes: [u64; crate::host::gpu_split::VOLUMES_N],
     partly: u64,
+    pipelines: [u64; 4],
 ) {
     use report::GpuFigure as G;
-    let mut values = [(G::Frames, frames); 2 + crate::host::gpu_split::KINDS + crate::host::gpu_split::VOLUMES_N];
+    let mut values = [(G::Frames, frames); 2 + crate::host::gpu_split::KINDS + crate::host::gpu_split::VOLUMES_N + 5];
     values[1] = (G::PartlyFrames, partly);
     for (i, (&kind, n)) in report::GPU_KINDS.iter().zip(ns).enumerate() {
         values[2 + i] = (kind, n);
@@ -118,6 +119,17 @@ pub(crate) fn gpu_split(
     for (i, (&figure, n)) in volume.iter().zip(volumes).enumerate() {
         values[2 + crate::host::gpu_split::KINDS + i] = (figure, n);
     }
+    // The compute pipelines of the second, named nowhere: a second that had
+    // any, how many ran, the card's time of the costliest 1, 5 and 20.
+    let [ran, top1, top5, top20] = pipelines;
+    let at = 2 + crate::host::gpu_split::KINDS + crate::host::gpu_split::VOLUMES_N;
+    values[at..].copy_from_slice(&[
+        (G::PipelineSeconds, u64::from(ran > 0)),
+        (G::ComputePipelinesSum, ran),
+        (G::TopPipelineNs, top1),
+        (G::Top5PipelinesNs, top5),
+        (G::Top20PipelinesNs, top20),
+    ]);
     report::gpu_time(crate::host::gpu_split::state(), &values);
 }
 
@@ -234,6 +246,7 @@ fn last_meters() {
         (Figure::RefreshAllUs, take(&crate::texture::REFRESH_WAITS[3])),
     ]);
     crate::host::gpu_split::last(u64::from(frames));
+    crate::pipeline::leave_out_end();
 }
 
 /// The card's clock per frame (`host::card_clock_line`): ms with nothing of
@@ -639,6 +652,6 @@ mod tests {
         system_memory(u64::MAX, u64::MAX);
         let s = crate::host::budget::Sample::UNKNOWN;
         governor_look(&s, crate::host::budget::Level::Green);
-        gpu_split(30, [1_000; crate::host::gpu_split::KINDS], [7; crate::host::gpu_split::VOLUMES_N], 1);
+        gpu_split(30, [1_000; crate::host::gpu_split::KINDS], [7; crate::host::gpu_split::VOLUMES_N], 1, [40, 9_000, 20_000, 30_000]);
     }
 }
