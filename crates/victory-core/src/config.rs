@@ -32,6 +32,9 @@ pub struct Config {
     pub shader_profile: Option<PathBuf>,
     /// Optional user-supplied path to an external `bcpack-tables.bin` file.
     pub bcpack_tables: Option<PathBuf>,
+    /// Optional user-supplied PC upscaler DLL (or the folder it is in) for the
+    /// host upscaler (docs/upscaling.md).
+    pub upscaler_dll: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -54,6 +57,7 @@ struct FilePaths {
     patches_file: Option<PathBuf>,
     shader_profile: Option<PathBuf>,
     bcpack_tables: Option<PathBuf>,
+    upscaler_dll: Option<PathBuf>,
 }
 
 impl Config {
@@ -113,6 +117,7 @@ impl Config {
             patches_file: file.patches_file.map(in_file),
             shader_profile: file.shader_profile.map(in_file),
             bcpack_tables: file.bcpack_tables.map(in_file),
+            upscaler_dll: file.upscaler_dll.map(in_file),
         };
         let test_titles = match env("VICTORY_TEST_TITLES") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
@@ -134,6 +139,9 @@ impl Config {
             patches_file: env_path("VICTORY_PATCHES_FILE").or(file.patches_file),
             shader_profile: env_path("VICTORY_SHADER_PROFILE").or(file.shader_profile),
             bcpack_tables: env_path("VICTORY_BCPACK_TABLES").or(file.bcpack_tables),
+            // The user's PC upscaler DLL for the host upscaler (docs/upscaling.md),
+            // or the folder it is in; wins over `[paths] upscaler_dll`.
+            upscaler_dll: env_path("VICTORY_UPSCALER_DLL").or(file.upscaler_dll),
             source,
         })
     }
@@ -411,6 +419,23 @@ mod tests {
         assert_eq!(cfg.patches_file, Some(PathBuf::from("env-patches.toml")));
         assert_eq!(cfg.shader_profile, Some(PathBuf::from("file-shaders.toml")));
         assert_eq!(cfg.bcpack_tables, Some(PathBuf::from("file-bcpack.bin")));
+    }
+
+    /// The upscaler DLL's path: relative to the file, and the environment's
+    /// wins.
+    #[test]
+    fn the_upscaler_dll_is_a_path_like_the_others() {
+        let dir = std::env::temp_dir().join("victory-config-upscaler");
+        let file = FilePaths { upscaler_dll: Some("vendor".into()), ..Default::default() };
+        let none = |_: &str| None;
+        let cfg = Config::resolve(file, Some(dir.join(CONFIG_NAME)), none).unwrap();
+        assert_eq!(cfg.upscaler_dll, Some(dir.join("vendor")));
+        let file = FilePaths { upscaler_dll: Some("vendor".into()), ..Default::default() };
+        let env = |k: &str| (k == "VICTORY_UPSCALER_DLL").then(|| OsString::from("elsewhere.dll"));
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.upscaler_dll, Some(PathBuf::from("elsewhere.dll")));
+        let parsed: FileConfig = toml::from_str("[paths]\nupscaler_dll = 'a.dll'\n").unwrap();
+        assert_eq!(parsed.paths.upscaler_dll, Some(PathBuf::from("a.dll")));
     }
 
     #[test]

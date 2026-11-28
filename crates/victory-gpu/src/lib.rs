@@ -95,6 +95,7 @@ pub mod timeline;
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+pub mod upscale;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

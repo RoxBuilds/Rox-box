@@ -423,6 +423,7 @@ fn show_config() -> Result<()> {
     println!("patches     : {}", status(&cfg.patches_file));
     println!("shaders     : {}", status(&cfg.shader_profile));
     println!("tables      : {}", status(&cfg.bcpack_tables));
+    println!("upscaler    : {}", status(&cfg.upscaler_dll));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

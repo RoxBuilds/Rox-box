@@ -214,6 +214,10 @@ logs its table offset, so a run says what to write next.
   present.
 - `host.rs` and `host/`: the one host device, queue and window; sending work
   to the card and waiting for it.
+- `upscale.rs`, `upscale/`: the host upscaler, which runs a title's FidelityFX
+  upscale on AMD FSR 3.1 from a DLL the user supplies, with the title's own
+  upscaler to fall back on (its title side is
+  `victory-hle/src/modules/fidelityfx.rs`; [docs/upscaling.md](docs/upscaling.md)).
 - `ambient.rs`: an optional screen-space ambient estimate, used when a title's
   ray-tracing passes are not run
   ([docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)).
@@ -294,6 +298,7 @@ one `VICTORY_CONFIG` names, else `victory.toml` in the current directory, else
 | `patches_file` | `VICTORY_PATCHES_FILE` | Optional byte-checked patches for the user's title |
 | `shader_profile` | `VICTORY_SHADER_PROFILE` | Optional names and bindings of shaders that need special handling |
 | `bcpack_tables` | `VICTORY_BCPACK_TABLES` | Optional BCPack tables, supplied by the user |
+| `upscaler_dll` | `VICTORY_UPSCALER_DLL` | Optional PC upscaler DLL for the host upscaler, supplied by the user ([docs/upscaling.md](docs/upscaling.md)) |
 | `test_titles` | `VICTORY_TEST_TITLES` (`;`-separated) | Other folders for `census` and `translate` |
 
 An environment variable wins over the file. A relative path in the file is
@@ -360,4 +365,5 @@ marked `shortcut:` in the code.
 - [docs/run-report.md](docs/run-report.md)
 - [docs/low-memory-gpus.md](docs/low-memory-gpus.md)
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)
+- [docs/upscaling.md](docs/upscaling.md)
 - [docs/README-fxceless.md](docs/README-fxceless.md)

@@ -94,6 +94,14 @@ game_dir = 'C:\Games\MyTitle'
 # requests.                                         env: VICTORY_BCPACK_TABLES
 # bcpack_tables = 'bcpack-tables.bin'
 
+# The PC upscaler DLL for the host upscaler: amd_fidelityfx_dx12.dll from
+# AMD's FidelityFX SDK v1.1.x release, which you download yourself (nothing of
+# it ships with Rox-box; docs/upscaling.md). The DLL itself or the folder it
+# is in. Left out, it is looked for in `vendor\` next to victory.exe, then in
+# `vendor\` in data_dir; not found, a title's own upscaler runs as before.
+#                                                   env: VICTORY_UPSCALER_DLL
+# upscaler_dll = 'D:\rox-data\vendor\amd_fidelityfx_dx12.dll'
+
 # For developers: folders of other titles, used by `victory census` and
 # `victory translate` to exercise platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')

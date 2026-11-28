@@ -110,7 +110,7 @@ impl HostList {
     /// commands go on: what it set (descriptor heaps, a root signature, the
     /// pipeline, a depth target without colour targets, one viewport and
     /// scissor, the topology) is no longer what the title set.
-    pub(super) fn state_lost(&self) {
+    pub(crate) fn state_lost(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         if !std::mem::replace(&mut twins.state_lost, true) {
             LOST.fetch_add(1, Ordering::Relaxed);

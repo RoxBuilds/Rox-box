@@ -118,10 +118,18 @@ pub fn run(
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,
     };
-    let with_dlls = WithTitleDlls {
+    // Where the user's PC upscaler DLL is looked for (docs/upscaling.md),
+    // before the title's FidelityFX imports are bound to the host upscaler.
+    victory_gpu::upscale::use_places(victory_gpu::upscale::Places {
+        configured: cfg.upscaler_dll.clone(),
+        exe_dir: std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)),
+        data_dir: Some(cfg.data_dir.clone()),
+    });
+    let titles = WithTitleDlls {
         inner: &resolver,
         dlls: &dlls,
     };
+    let with_dlls = victory_hle::modules::fidelityfx::Interposing { inner: &titles };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -363,10 +371,12 @@ impl LateDlls {
                     inner: &hle,
                     dlls: &mapped,
                 };
-                let resolver = victory_loader::WithTitleDlls {
+                let titles = victory_loader::WithTitleDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                // The FidelityFX entry points of the host upscaler, as at the start.
+                let resolver = victory_hle::modules::fidelityfx::Interposing { inner: &titles };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

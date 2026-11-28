@@ -375,6 +375,37 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// A step of ours that records into a title list's host list at its place
+/// among the title's commands ([`write_down`], [`run_now`]): the host
+/// upscaler's dispatch (`crate::upscale`).
+#[cfg(windows)]
+pub(crate) type Step = Box<dyn FnOnce(&crate::host::HostList, &mut crate::draw::State) + Send>;
+
+/// Runs `f` on the host list and draw state of title list `this` now, if it
+/// records onto one as its methods are called (not [`written_down`]):
+/// in order with the title's commands so far.
+#[cfg(windows)]
+pub(crate) fn run_now<R>(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State) -> R) -> Option<R> {
+    let mut out = None;
+    with_state(this, |list, state| out = Some(f(list, state)));
+    out
+}
+
+/// Whether title list `this` only writes its calls down (`VICTORY_THIN=1`):
+/// a step goes in with [`write_down`], and runs when the list is translated.
+#[cfg(windows)]
+pub(crate) fn written_down(this: This) -> bool {
+    !this.is_null() && host_list(this).is_none() && thin::on() && thin::recording(this)
+}
+
+/// Writes `step` down in title list `this` ([`written_down`]): it runs, in
+/// order, on the list of ours the stream is translated onto; one never
+/// translated (the title let go of its recording) is dropped unrun.
+#[cfg(windows)]
+pub(crate) fn write_down(this: This, step: Step) -> bool {
+    thin::step(this, step)
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

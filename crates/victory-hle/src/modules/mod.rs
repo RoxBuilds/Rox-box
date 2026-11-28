@@ -12,6 +12,7 @@ pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
+pub mod fidelityfx;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]

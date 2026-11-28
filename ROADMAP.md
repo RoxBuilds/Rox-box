@@ -131,7 +131,9 @@ simpler one, the patterns it was meant to blend (thin geometry, soft shadows)
 show.
 
 - take the title's upscale call at that interface and hand it to an upscaler
-  of the host's: first one that speaks the same interface, then others;
+  of the host's: first one that speaks the same interface (built: FSR 3.1
+  from the user's FidelityFX SDK DLL, [docs/upscaling.md](docs/upscaling.md);
+  not yet measured on a title), then others;
 - the vendors' files are never part of this repository or of a release. They
   are looked for at run time in a folder the user fills, under the terms the
   user accepted for them; with none there, or on any failure, the title's own

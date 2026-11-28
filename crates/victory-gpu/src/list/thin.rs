@@ -84,6 +84,8 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        // Never handed over, so never translated: steps of ours in them go.
+        drop_steps(&self.words);
         self.words.clear();
     }
 
@@ -266,6 +268,8 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        // Streams never translated: steps of ours in them are dropped unrun.
+        inner.chunks.iter().for_each(|c| drop_steps(c));
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
@@ -513,6 +517,37 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const CLEAR_UAV: u64 = after(17);
+/// A step of ours (`super::Step`), boxed: the word is the box's address.
+const STEP: u64 = after(18);
+
+/// Drops the steps of ours in a stream that is not translated.
+fn drop_steps(stream: &[u64]) {
+    let mut i = 0;
+    while i < stream.len() {
+        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if op == STEP && i + 1 < stream.len() {
+            // SAFETY: made by `step`, named once; the stream is not run.
+            drop(unsafe { Box::from_raw(stream[i + 1] as *mut super::Step) });
+        }
+        i += 1 + len;
+    }
+}
+
+/// Whether title list `this` has a recording open to write into.
+pub(crate) fn recording(this: This) -> bool {
+    let front = front(this);
+    !front.closed && front.recording.is_some()
+}
+
+/// Writes a step of ours down ([`super::write_down`]); false (and the step
+/// dropped unrun) if the list has no recording open.
+pub(crate) fn step(this: This, step: super::Step) -> bool {
+    if !recording(this) {
+        return false;
+    }
+    front(this).put(STEP, &[Box::into_raw(Box::new(step)) as u64]);
+    true
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -796,6 +831,15 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             held(uploads).push(block);
             continue;
         }
+        if op == STEP {
+            // SAFETY: made by `step`, named once.
+            let step = *unsafe { Box::from_raw(w[0] as *mut super::Step) };
+            // A recording let go of: the step is dropped unrun.
+            if !skip {
+                super::with_state(list, step);
+            }
+            continue;
+        }
         if skip && op != CLOSE && op != RESET {
             continue;
         }
@@ -1043,6 +1087,23 @@ mod tests {
         assert_eq!((op, next.len(), len2), (CLEAR_UAV, 1 + len2, 6));
         assert_eq!((Kind::of(next[1]), next[1] >> 8), (Kind::Uint, 0));
         assert!(at::<Rect>(next, 7, 0).is_null());
+    }
+
+    /// A step of ours written down and never translated (the title let go of
+    /// its recording) is dropped unrun, with what it holds.
+    #[test]
+    fn a_step_never_translated_is_dropped() {
+        let held = Arc::new(());
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(Plain::DRAW as u64, &[3, 1, 0, 0]);
+        let kept = held.clone();
+        let step: super::super::Step = Box::new(move |_, _| drop(kept));
+        f.put(STEP, &[Box::into_raw(Box::new(step)) as u64]);
+        assert_eq!(Arc::strong_count(&held), 2);
+        f.leave();
+        assert_eq!(Arc::strong_count(&held), 1);
+        assert!(f.words.is_empty());
     }
 
     /// The translating threads run at normal priority, as they did, unless

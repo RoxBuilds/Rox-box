@@ -158,7 +158,16 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        if let Some(ours) = host_override(module, name) {
+            return ours;
+        }
+        let found = host::get_proc_address(module, name);
+        // The FidelityFX API's entry points, from whichever DLL: the host
+        // upscaler's shims (`fidelityfx`), when it is on.
+        if !found.is_null() && (name as usize) >= 0x1_0000 {
+            return super::fidelityfx::interpose(&narrow(name), found as usize) as *mut c_void;
+        }
+        return found;
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {

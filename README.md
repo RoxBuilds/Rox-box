@@ -279,6 +279,13 @@ Two things to know about switches:
   PowerShell, `play.ps1` also takes a hashtable (`.\play.ps1 -More @{ NAME = 'value' }`);
   `play.cmd` cannot pass one.
 
+Upscaling: a title that upscales through AMD FidelityFX can have its upscale
+run by AMD FSR 3.1 on the PC instead of its console upscaler, if you download
+`amd_fidelityfx_dx12.dll` from AMD's FidelityFX SDK v1.1.x release yourself and
+put it in a `vendor` folder next to `victory.exe` (nothing of it ships with
+Rox-box; without it the title's own upscaler runs as before).
+[docs/upscaling.md](docs/upscaling.md) has the steps.
+
 Window and input:
 
 - Alt+Enter toggles a borderless 16:9 window.
@@ -511,6 +518,8 @@ package as a GitHub Release.
 - [docs/findings.md](docs/findings.md): where a frame's time goes.
 - [docs/selftest.md](docs/selftest.md): the title-free self-test and its
   benchmark.
+- [docs/upscaling.md](docs/upscaling.md): the host upscaler and the DLL you
+  supply for it.
 - [docs/run-report.md](docs/run-report.md): the shareable run report, field by
   field, and how to add a counter.
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): ray-tracing passes and the

@@ -4,7 +4,7 @@ Every `VICTORY_*` environment variable the source reads. This file is generated 
 
 To add a switch, write it in the code (`switch::on`, `toggled!` or a value read), describe it in a comment directly above the read, and run `cargo xtask switches`. `cargo xtask switches --check` (and `cargo test`) fail when this file is stale. `scripts\play.ps1` clears every other `VICTORY_*` variable; see [ARCHITECTURE.md](../ARCHITECTURE.md#configuration-and-switches).
 
-504 switches: 8 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 385 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
+506 switches: 9 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 386 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
 
 How to read the tables:
 
@@ -28,6 +28,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_PATCHES_FILE` | Gives the code that reads the user's optional files (patches, shader profile, format tables) the paths the config file names, for every command: they are read from the environment, which takes precedence. | `apps/victory/src/main.rs`<br>`crates/victory-core/src/config.rs`<br>`crates/victory-loader/src/resolution.rs` |
 | `VICTORY_SHADER_PROFILE` | Gives the code that reads the user's optional files (patches, shader profile, format tables) the paths the config file names, for every command: they are read from the environment, which takes precedence. | `apps/victory/src/main.rs`<br>`crates/victory-core/src/config.rs`<br>`crates/victory-core/src/report.rs`<br>`crates/victory-gpu/src/shader_profile.rs` |
 | `VICTORY_TEST_TITLES` | Switches whose value is, or may be, a path, a list of hashes or of title offsets: never written, whatever it looks like. | `crates/victory-core/src/config.rs`<br>`crates/victory-core/src/report.rs` |
+| `VICTORY_UPSCALER_DLL` | The user's PC upscaler DLL for the host upscaler (docs/upscaling.md), or the folder it is in; wins over `[paths] upscaler_dll`. | `crates/victory-core/src/config.rs` |
 
 ## victory
 
@@ -190,6 +191,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_HEAP_SYNC_FIRST` | off unless set | `1` built in, not with -Safe | Whether a submission sent ahead begins the round of the heaps' records (`crate::descriptor::begin_sync_heaps`) as soon as it holds the submission lock, before the steps done on the card are planned and flights are looked at (`VICTORY_HEAP_SYNC_FIRST=1`; off by default: after them, as before). Ported from trustno1-coder/VIctory-NVIDIA 66f7e54. The submitting thread waits for that round at the... | `crates/victory-gpu/src/host.rs` |
 | `VICTORY_HEAP_TEXTURES` | value |  |  | `crates/victory-gpu/src/draw.rs` |
 | `VICTORY_HELD_LEVELS` | value |  | Whether a texture the title places in memory is read, kept and uploaded from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole, as before). Such a title describes every level of a texture and views it from the first one it holds; the memory of the larger ones is the next texture's, or nothing. Of recorded frames the levels some slot shows are a fifth of such host copies' bytes... | `crates/victory-gpu/src/resource.rs` |
+| `VICTORY_HOST_UPSCALER` | value |  | `VICTORY_HOST_UPSCALER=0` turns the host upscaler off: no shims are bound and the title's own upscaler runs. Unset (or any other value): on, when the user's upscaler DLL is found. | `crates/victory-gpu/src/upscale.rs` |
 | `VICTORY_IDLE_BIG` | value |  | A host list whose recording bound more draws and dispatches than this is not kept idle but let go (`VICTORY_IDLE_BIG`; 0: every one is kept): its allocators keep what that recording took, and the next title list to take it may record a dozen draws. 2048, as before (\[`idle_big_for`\]); `VICTORY_IDLE_BIG=512` to measure on a PC with little memory. | `crates/victory-gpu/src/list.rs` |
 | `VICTORY_IDLE_BY_FRAME` | on unless `0` |  | Whether the idle host lists are as many as a frame asks for lately instead of \[`idle_most`\]'s number, on a PC of 24 GiB or less (`VICTORY_IDLE_BY_FRAME`, on unless `0`: that number always, as before). Every host list costs about 0.8 MiB of the process's private commit in the driver, whatever it records (measured: its allocators and lists), so the 384 small and 96 big idle lists such a PC keeps... | `crates/victory-gpu/src/list.rs` |
 | `VICTORY_IDLE_LISTS` | value |  | The most host lists kept idle (128 were too few: flights land several at a time, so lists were thrown away and others made in the same frame, with their preludes and buffers, an eighth of the submitting thread's time), and the most upload memory they may keep between them (a list keeps scratch chunks over a reset only while lists do not share them, `VICTORY_SCRATCH_POOL=0`, \[`give_back`\]): 512... | `crates/victory-gpu/src/list.rs` |

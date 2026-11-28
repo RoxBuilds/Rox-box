@@ -50,7 +50,13 @@ shader lowering concepts from upstream contributors:
   marks, the console's early depth test, a stand-in for reflections without
   rays and the ambient stand-in's colour filter, and console threads given
   from a group counter (from Vice-Tay); credited per commit where they were
-  ported
+  ported; and the design of the host upscaler (its `docs/dlss.md`): binding a
+  title's imports of the FidelityFX API to shims that keep the title's own
+  DLL for everything else, taking only the upscale dispatch, and recording
+  it as a step in the title's command list (in the list's written-down
+  stream with `VICTORY_THIN=1`); written anew here for an FSR backend
+  (`crates/victory-gpu/src/upscale.rs`,
+  `crates/victory-hle/src/modules/fidelityfx.rs`)
 
 Individual upstream changes are credited where they were adapted, in code
 comments of the form "after upstream ..." with the upstream commit or pull
@@ -92,6 +98,44 @@ request.
   as LGPL-2.1 Section 3 allows. Both files carry FFmpeg's notice and a
   statement of the changes (a Rust rewrite restricted to XMA2) in their
   headers.
+
+### 4. AMD FidelityFX SDK API layouts (MIT)
+
+- **File:** [crates/victory-gpu/src/upscale/ffx.rs](crates/victory-gpu/src/upscale/ffx.rs)
+- **Upstream:** FidelityFX SDK v1.1.4 (`ffx-api/include/ffx_api/ffx_api.h`,
+  `ffx_api_types.h`, `ffx_upscale.h`, `dx12/ffx_api_dx12.h`), by AMD
+  (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+- **Copyright:** `Copyright (C) 2024 Advanced Micro Devices, Inc.`
+- **License:** MIT (the SDK's `LICENSE.txt`). The structures, constants and
+  the DXGI-to-surface-format table are written in Rust from the headers'
+  public layouts and values, which an implementation of the API must agree
+  on; no header text is copied. The permission notice, in the standard MIT
+  wording (the SDK's own `LICENSE.txt` is the text that governs; its wording
+  differs from this only in spacing and punctuation):
+
+  > Permission is hereby granted, free of charge, to any person obtaining a
+  > copy of this software and associated documentation files (the
+  > "Software"), to deal in the Software without restriction, including
+  > without limitation the rights to use, copy, modify, merge, publish,
+  > distribute, sublicense, and/or sell copies of the Software, and to permit
+  > persons to whom the Software is furnished to do so, subject to the
+  > following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included
+  > in all copies or substantial portions of the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  > OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  > MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+  > NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  > DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  > OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+  > USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+- **Not included:** the FidelityFX DLLs themselves. The host upscaler loads
+  `amd_fidelityfx_dx12.dll` at run time from where the user put it
+  ([docs/upscaling.md](docs/upscaling.md)); it is never in this repository or
+  a release, and its own licence is the user's to accept.
 
 ## Clean-Room Re-implementations
 

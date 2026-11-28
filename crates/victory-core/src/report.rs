@@ -2608,6 +2608,70 @@ fn view_copies(d: &mut Doc, v: Option<[u64; 4]>) {
 }
 
 // ---------------------------------------------------------------------------
+// The host upscaler (`[upscaler]`): whether a title's FidelityFX upscales ran
+// on an upscaler of the PC's, how many, and the card's time of them. Given by
+// the GPU side as it samples its counters (`upscaler_set`); left out of the
+// report until given.
+
+/// The host upscaler's figures since the start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Upscaler {
+    /// 0 not looked at yet, 1 off (`VICTORY_HOST_UPSCALER=0`), 2 no DLL
+    /// found, 3 the DLL refused, 4 ready.
+    pub state: u64,
+    /// Host contexts made.
+    pub contexts: u64,
+    /// Upscale dispatches recorded on the host, and those the title's own
+    /// upscaler did instead.
+    pub host_dispatches: u64,
+    pub title_dispatches: u64,
+    /// Host contexts or dispatches that failed (the title's own upscaler
+    /// then takes over).
+    pub failures: u64,
+    /// Host dispatches timed on the card, their nanoseconds, the longest.
+    pub timed: u64,
+    pub card_ns: u64,
+    pub card_ns_most: u64,
+}
+
+static UPSCALER: Mutex<Option<Upscaler>> = Mutex::new(None);
+
+/// The host upscaler's figures as counted now.
+pub fn upscaler_set(u: Upscaler) {
+    *UPSCALER.lock().unwrap_or_else(|e| e.into_inner()) = Some(u);
+}
+
+fn upscaler_take() -> Option<Upscaler> {
+    *UPSCALER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `[upscaler]`, if given.
+fn upscaler(d: &mut Doc, u: Option<Upscaler>) {
+    let Some(u) = u else { return };
+    d.table("upscaler");
+    d.comment("the host upscaler: a title's FidelityFX upscales on an upscaler of the PC's (docs/upscaling.md)");
+    d.word(
+        "state",
+        Ours(match u.state {
+            0 => "not_asked",
+            1 => "off",
+            2 => "no_dll",
+            3 => "dll_refused",
+            _ => "ready",
+        }),
+    );
+    d.boolean("host_ran", u.host_dispatches > 0);
+    d.int("contexts", u.contexts);
+    d.int("host_dispatches", u.host_dispatches);
+    d.int("title_dispatches", u.title_dispatches);
+    d.int("failures", u.failures);
+    d.comment("the card's time of a host dispatch, ms (timed: how many were)");
+    d.int("timed", u.timed);
+    d.float("card_ms_mean", if u.timed == 0 { 0.0 } else { u.card_ns as f64 / u.timed as f64 / 1e6 });
+    d.float("card_ms_most", u.card_ns_most as f64 / 1e6);
+}
+
+// ---------------------------------------------------------------------------
 // Rendering.
 
 /// Everything a report says, taken at once.
@@ -3311,6 +3375,8 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
         d.float("refresh_ms_steady", refresh(&steady.figures));
     }
 
+    upscaler(d, upscaler_take());
+
     d.table("unimplemented");
     d.int("methods_called", s.methods.len() as u64);
     d.int("methods_lost", s.methods_lost);
@@ -3515,6 +3581,39 @@ mod tests {
         assert_eq!(v["blocks"].as_integer(), Some(14));
         assert_eq!(v["blocks_mib"].as_integer(), Some(14));
         assert_eq!(v.len(), 4);
+    }
+
+    /// `[upscaler]` gives its numbers once they are given, and is left out
+    /// before.
+    #[test]
+    fn the_upscaler_says_its_numbers_once_given() {
+        let mut d = Doc { out: String::new(), host: false };
+        upscaler(&mut d, None);
+        assert!(d.out.is_empty());
+        let u = Upscaler {
+            state: 4,
+            contexts: 1,
+            host_dispatches: 600,
+            title_dispatches: 2,
+            failures: 0,
+            timed: 500,
+            card_ns: 500 * 2_500_000,
+            card_ns_most: 4_000_000,
+        };
+        upscaler(&mut d, Some(u));
+        let table: toml::Table = toml::from_str(&d.out).unwrap_or_else(|e| panic!("{e}\n{}", d.out));
+        let v = table["upscaler"].as_table().expect("a table");
+        assert_eq!(v["state"].as_str(), Some("ready"));
+        assert_eq!(v["host_ran"].as_bool(), Some(true));
+        assert_eq!(v["host_dispatches"].as_integer(), Some(600));
+        assert_eq!(v["title_dispatches"].as_integer(), Some(2));
+        assert_eq!(v["card_ms_mean"].as_float(), Some(2.5));
+        assert_eq!(v["card_ms_most"].as_float(), Some(4.0));
+        let mut d = Doc { out: String::new(), host: false };
+        upscaler(&mut d, Some(Upscaler { state: 2, ..Upscaler::default() }));
+        let table: toml::Table = toml::from_str(&d.out).unwrap_or_else(|e| panic!("{e}\n{}", d.out));
+        assert_eq!(table["upscaler"]["state"].as_str(), Some("no_dll"));
+        assert_eq!(table["upscaler"]["host_ran"].as_bool(), Some(false));
     }
 
     #[test]

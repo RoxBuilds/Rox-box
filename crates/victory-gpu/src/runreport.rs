@@ -441,6 +441,8 @@ pub fn sample() {
     if report::ending() {
         last_meters();
     }
+    // `[upscaler]`: the host upscaler's figures.
+    crate::upscale::report();
     let (made, loaded) = crate::pipeline::host_counts();
     report::set(Stat::PipelinesMadeNow, made);
     report::set(Stat::PipelinesFromLibrary, loaded);
