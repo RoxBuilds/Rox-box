@@ -191,17 +191,30 @@ struct Ripe {
     started: u64,
     finished: u64,
     ahead: usize,
+    /// No new block is made ([`growth_held`]): a piece that finds no room in
+    /// the blocks there is not pooled.
+    hold: bool,
 }
 
 impl Ripe {
-    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0 };
+    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0, hold: false };
 
-    fn now() -> Ripe {
+    /// The submissions now (asked with the pool's lock held: a block made
+    /// after this is made after them); `hold` as [`hold_now`] said.
+    fn now(hold: bool) -> Ripe {
         let (started, finished) = crate::host::submissions();
         // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)), hold }
     }
+}
 
+/// [`Ripe::hold`] now: [`growth_held`] by the governor's last sample, asked
+/// only while the card is compacted (before the pool's lock is taken).
+fn hold_now() -> bool {
+    compacting() && growth_held(true, crate::host::budget::sample().card)
+}
+
+impl Ripe {
     fn is<B>(self, block: &Block<B>) -> bool {
         self.ahead == 0 || block.made <= self.finished
     }
@@ -274,7 +287,36 @@ struct Block<B> {
     /// Since when (ms) nothing is in it: since it was made, or since its
     /// last piece came back; `None` while something is.
     empty_since: Option<u64>,
+    /// Bytes of the pieces taken from it and not given back yet (resting
+    /// ones are not counted: nothing holds them).
+    live: u64,
+    /// Being emptied by the card's compaction ([`Pool::choose_drain`]): no
+    /// new piece is cut from it, and it goes once nothing is in it.
+    drain: Option<Drain>,
+    /// Not chosen for compaction again before this (ms): its last drain did
+    /// not empty it in [`DRAIN_MS`].
+    drain_again_at: u64,
 }
+
+/// A block being emptied ([`Block::drain`]): since when (ms), and the mark
+/// of the submissions that may still read it, taken at the first look that
+/// found it empty (`crate::host::retire_mark`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Drain {
+    since: u64,
+    mark: Option<u64>,
+}
+
+/// How long a block may be draining before it is given up (ms): what is left
+/// in it is held by work, by slots whose copies cannot be moved, or is used
+/// again.
+const DRAIN_MS: u64 = 5_000;
+/// How long a block given up so is not chosen again (ms).
+const DRAIN_AGAIN_MS: u64 = 30_000;
+/// The most a block may hold to be chosen for compaction, in hundredths of
+/// its bytes: what is in it is uploaded again elsewhere, and its whole size
+/// goes back to the card.
+const DRAIN_UNDER_PCT: u64 = 50;
 
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
@@ -336,9 +378,13 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
+        // The first fit over every block there, the ripe ones first (never
+        // one being emptied, [`Pool::choose_drain`]): a new block only when
+        // none has room.
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
+                && block.drain.is_none()
                 && ripe.is(block)
                 && let Some(start) = block.free.take(len, align)
             {
@@ -348,13 +394,20 @@ impl<B: Clone> Pool<B> {
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.as_ref().filter(|b| b.drain.is_none()).map(|b| (b.made, i)))
+                .collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
         let (i, start) = match found {
             Some(found) => found,
+            // The card past its budget while it is relieved: no block more
+            // for want of room in those there ([`growth_held`]).
+            None if ripe.hold => return None,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started, now);
@@ -368,8 +421,9 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(size)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.drain.is_none() && b.free.whole(size)).count();
             if empty < ripe.ahead
+                && !ripe.hold
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started, now);
@@ -377,6 +431,7 @@ impl<B: Clone> Pool<B> {
         }
         let block = self.blocks[i].as_mut()?;
         block.empty_since = None;
+        block.live += len;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -419,11 +474,17 @@ impl<B: Clone> Pool<B> {
             made,
             since: crate::host::now_ms(),
             empty_since: Some(now),
+            live: 0,
+            drain: None,
+            drain_again_at: 0,
         });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(Some(block)) = self.blocks.get_mut(piece.block) {
+            block.live = block.live.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
     }
 
@@ -493,7 +554,9 @@ impl<B: Clone> Pool<B> {
     /// The bytes free in the blocks now (not those resting) and the largest
     /// free range of one ([`texture_free`]).
     fn free(&self) -> (u64, u64) {
-        let ranges = self.blocks.iter().flatten().flat_map(|b| b.free.0.values().copied());
+        // (Not those of blocks being emptied: nothing new is cut from them.)
+        let ranges =
+            self.blocks.iter().flatten().filter(|b| b.drain.is_none()).flat_map(|b| b.free.0.values().copied());
         ranges.fold((0, 0), |(all, most), len| (all + len, most.max(len)))
     }
 
@@ -501,7 +564,11 @@ impl<B: Clone> Pool<B> {
     /// blocks go, spare ones too, the last made first, until `need` bytes have
     /// gone: with `trims` those empty for [`TRIM_MS`] (a slot that still shows
     /// a texture of one may be read, as for the trim's), else any. Their bytes.
-    fn relieve(&mut self, now: u64, need: u64) -> u64 {
+    /// The `keep` made first stay: the blocks made ahead ([`ahead`]), which
+    /// were made again at the next texture (a relief of the card that let
+    /// them go at each look counted 10 GB freed in a run of 1,053 s whose
+    /// card never came down).
+    fn relieve(&mut self, now: u64, need: u64, keep: usize) -> u64 {
         self.rested(now);
         let size = self.block;
         let trims = self.trims;
@@ -513,7 +580,9 @@ impl<B: Clone> Pool<B> {
             .filter(|(b, _)| !trims || b.empty_since.is_some_and(|since| now >= since + TRIM_MS))
             .map(|(b, i)| (b.made, i))
             .collect();
-        empty.sort_unstable_by(|a, b| b.cmp(a));
+        empty.sort_unstable();
+        empty.drain(..keep.min(empty.len()));
+        empty.reverse();
         let mut freed = 0;
         for (_, i) in empty {
             if freed >= need {
@@ -524,7 +593,139 @@ impl<B: Clone> Pool<B> {
         }
         freed
     }
+
+    /// Chooses blocks to empty for the card's compaction ([`compact_on`]):
+    /// of those with something in it, under [`DRAIN_UNDER_PCT`] of their
+    /// bytes, not given up lately ([`DRAIN_AGAIN_MS`]), the emptiest first,
+    /// until the blocks being emptied come to `need` bytes, and with at most
+    /// `most_live` bytes in the ones chosen now (each is uploaded again; one
+    /// at least). How many it chose.
+    fn choose_drain(&mut self, now: u64, need: u64, most_live: u64) -> usize {
+        let size = self.block;
+        let mut have: u64 = self.blocks.iter().flatten().filter(|b| b.drain.is_some()).map(|_| size).sum();
+        let mut candidates: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                (b.drain.is_none()
+                    && b.live > 0
+                    && u128::from(b.live) * 100 < u128::from(size) * u128::from(DRAIN_UNDER_PCT)
+                    && now >= b.drain_again_at)
+                    .then_some((b.live, i))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let (mut chosen, mut live) = (0, 0u64);
+        for (bytes, i) in candidates {
+            if have >= need || (chosen > 0 && live + bytes > most_live) {
+                break;
+            }
+            if let Some(b) = self.blocks[i].as_mut() {
+                b.drain = Some(Drain { since: now, mark: None });
+                have += size;
+                live += bytes;
+                chosen += 1;
+            }
+        }
+        chosen
+    }
+
+    /// The blocks being emptied: one with nothing in it any more is marked
+    /// with `mark` (the submissions that may still read it) at the first
+    /// look that finds it so, and goes at a later one once `landed` says that
+    /// mark is past, its resting pieces with it (not the normal trim's wait:
+    /// nothing is cut from it again); one still not empty after [`DRAIN_MS`]
+    /// is given up. The blocks that went and their bytes.
+    fn release_drained(&mut self, now: u64, mark: u64, landed: impl Fn(u64) -> bool) -> (u64, u64) {
+        let size = self.block;
+        let mut gone = Vec::new();
+        for (i, slot) in self.blocks.iter_mut().enumerate() {
+            let Some(b) = slot.as_mut() else {
+                continue;
+            };
+            let Some(drain) = b.drain.as_mut() else {
+                continue;
+            };
+            if b.live > 0 {
+                if now >= drain.since + DRAIN_MS {
+                    b.drain = None;
+                    b.drain_again_at = now + DRAIN_AGAIN_MS;
+                }
+                continue;
+            }
+            match drain.mark {
+                None => drain.mark = Some(mark),
+                Some(at) if landed(at) => {
+                    *slot = None;
+                    gone.push(i);
+                }
+                Some(_) => {}
+            }
+        }
+        if !gone.is_empty() {
+            // (Its index is used again by the next block made: a piece of it
+            // given back later must not land in that one.)
+            self.resting.retain(|(_, p)| !gone.contains(&p.block));
+        }
+        (gone.len() as u64, gone.len() as u64 * size)
+    }
+
+    /// The card is relieved no longer: the blocks being emptied are blocks
+    /// like the others again.
+    fn end_drain(&mut self) {
+        for b in self.blocks.iter_mut().flatten() {
+            b.drain = None;
+        }
+    }
+
+    /// Whether block `i` is being emptied.
+    fn draining(&self, i: usize) -> bool {
+        self.blocks.get(i).and_then(Option::as_ref).is_some_and(|b| b.drain.is_some())
+    }
 }
+
+/// Whether the card's own memory is compacted while the budget governor
+/// relieves it (`VICTORY_CARD_COMPACT`, on unless `0`: as before, idle
+/// copies go wherever they lie). With it:
+/// - the blocks of textures least full (under half of a block) are emptied:
+///   every idle copy in them goes, a slot's copy is made again in another
+///   block (its slot shows the old one until the new one is uploaded), and
+///   a block with nothing left in it goes as soon as the submissions that
+///   may read it are done, without the trim's wait;
+/// - copies in other blocks are not let go for the card (that frees none of
+///   it: a block goes only once all of it is empty), copies of their own
+///   memory are;
+/// - nothing new is cut from those blocks, and while the card's use is past
+///   its budget no block more is made for want of room in the others: such
+///   a copy is an allocation of its own (which goes back whole when it goes).
+///
+/// A relief that let copies go wherever they lay counted 10 GB freed in a
+/// run of 1,053 s on a card of 8 GB, whose use went to 10.1 GB with 2.8 GB
+/// free inside blocks that still held a copy.
+fn compact_on() -> bool {
+    crate::toggled!("VICTORY_CARD_COMPACT")
+}
+
+/// Whether the card's compaction ([`compact_on`]) acts: on, and the budget
+/// governor relieves the card.
+pub(crate) fn compacting() -> bool {
+    compact_on() && crate::host::budget::card_relieving()
+}
+
+/// Whether no block of textures more is made for want of room in those
+/// there: while the card is relieved with compaction on (`relieved`) and
+/// its use `card` (budget and use, the system's count) is past the budget
+/// ([`GROWTH_HELD_PCT`] of it). Never with the budget not known.
+fn growth_held(relieved: bool, card: [u64; 2]) -> bool {
+    let [budget, used] = card;
+    relieved && budget > 0 && u128::from(used) * 100 >= u128::from(budget) * u128::from(GROWTH_HELD_PCT)
+}
+
+/// The card's use, in hundredths of its budget, from which no block more is
+/// made while it is relieved ([`growth_held`]).
+const GROWTH_HELD_PCT: u64 = 100;
 
 /// `pool`, if nobody holds it now (memory ran out where its owner may be
 /// making a block: `crate::host::Host::upload_buffer` is called with the lock
@@ -540,14 +741,81 @@ fn try_lock<T>(pool: &'static Mutex<T>) -> Option<std::sync::MutexGuard<'static,
 /// Memory ran out (`crate::host::budget::relieve`): empty blocks of staging
 /// buffers go, until `need` bytes have ([`Pool::relieve`]); their bytes.
 pub(crate) fn relieve_staging(need: u64) -> u64 {
-    try_lock(&STAGING).map_or(0, |mut pool| pool.relieve(now(), need))
+    try_lock(&STAGING).map_or(0, |mut pool| pool.relieve(now(), need, 0))
 }
 
 /// The same of blocks of textures (the card's memory), as the trim of
 /// [`room`] goes but past the spare ones too.
 pub(crate) fn relieve_textures(need: u64) -> u64 {
-    try_lock(&TEXTURES).map_or(0, |mut pool| pool.relieve(now(), need))
+    try_lock(&TEXTURES).map_or(0, |mut pool| pool.relieve(now(), need, 0))
 }
+
+/// The same for a relief of the card (`crate::host::budget`), keeping the
+/// blocks made ahead ([`ahead`]), which would be made again at once.
+pub(crate) fn relieve_textures_for_card(need: u64) -> u64 {
+    let keep = ahead().min(SPARES.load(Ordering::Relaxed));
+    try_lock(&TEXTURES).map_or(0, |mut pool| pool.relieve(now(), need, keep))
+}
+
+/// The card's compaction ([`compact_on`]), once a second while the card is
+/// relieved by `need` bytes: blocks are chosen to be emptied
+/// ([`Pool::choose_drain`]), at most `most_live` bytes of copies in those
+/// chosen now; and those emptied go ([`Pool::release_drained`]). The blocks
+/// that went and their bytes; `None` while the pool's lock is held.
+pub(crate) fn compact(need: u64, most_live: u64) -> Option<(u64, u64)> {
+    let mut pool = try_lock(&TEXTURES)?;
+    let now = now();
+    let gone = pool.release_drained(now, crate::host::retire_mark(), crate::host::landed);
+    pool.choose_drain(now, need, most_live);
+    DRAINING.store(pool.blocks.iter().flatten().any(|b| b.drain.is_some()), Ordering::Relaxed);
+    Some(gone)
+}
+
+/// The card is relieved no longer: no block is being emptied
+/// ([`Pool::end_drain`]).
+pub(crate) fn compact_end() {
+    if DRAINING.swap(false, Ordering::Relaxed) {
+        lock(&TEXTURES).end_drain();
+    }
+}
+
+/// Some block of textures is being emptied ([`compact`]).
+static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where a host texture lies, for the card's compaction ([`compact_on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lies {
+    /// An allocation of its own: it goes back to the card when it goes.
+    Own,
+    /// In a block of textures that stays.
+    Block,
+    /// In a block being emptied.
+    Draining,
+}
+
+/// The blocks being emptied now, by index (empty while none is, or the
+/// pool's lock is held), for [`lies_in`].
+pub(crate) fn draining_now() -> Vec<bool> {
+    if !DRAINING.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    try_lock(&TEXTURES).map_or_else(Vec::new, |pool| (0..pool.blocks.len()).map(|i| pool.draining(i)).collect())
+}
+
+/// Where `texture` lies ([`Lies`]), with `draining` from [`draining_now`].
+pub(crate) fn lies_in(texture: &ID3D12Resource, draining: &[bool]) -> Lies {
+    let block = PLACED.lock().unwrap_or_else(|e| e.into_inner()).get(&(texture.as_raw() as usize)).copied();
+    match block {
+        None => Lies::Own,
+        Some(i) if draining.get(i as usize).copied().unwrap_or(false) => Lies::Draining,
+        Some(_) => Lies::Block,
+    }
+}
+
+/// The block each texture cut from one lies in, by its raw pointer: set when
+/// it is made, gone when its piece comes back ([`release`]).
+static PLACED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u32>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// For the run report: the bytes of the blocks of staging buffers (made
 /// whole, so what they hold whether or not pieces of them are in use); `None`
@@ -668,6 +936,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's raw pointer ([`PLACED`]).
+    raw: usize,
 }
 
 struct Methods([*const (); 3]);
@@ -705,6 +975,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&gone.raw);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -815,14 +1086,18 @@ pub(crate) fn mark_in_block(texture: &ID3D12Resource) {
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    PLACED.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, piece.block as u32);
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, raw }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
         if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
-            // under a texture that may be alive.
+            // under a texture that may be alive (and its block is never
+            // emptied: not known as one of it).
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&raw);
             std::mem::forget(object);
         }
     }
@@ -857,10 +1132,11 @@ pub(crate) unsafe fn texture(
     }
     // (Asked before the pool is locked: it asks the card's budget.)
     let block = texture_block();
+    let hold = hold_now();
     let mut pool = lock(&TEXTURES);
     pool.sized(|| block, trim);
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(hold), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: block,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -1019,7 +1295,7 @@ mod tests {
     fn a_block_made_ahead_is_refused_during_the_window_too() {
         let mut pool: Pool<u32> = Pool::new(2);
         let now = 100;
-        let ripe = Ripe { started: 0, finished: 0, ahead: 2 };
+        let ripe = Ripe { started: 0, finished: 0, ahead: 2, hold: false };
         let calls = std::cell::Cell::new(0);
         let make = || {
             calls.set(calls.get() + 1);
@@ -1099,7 +1375,7 @@ mod tests {
             made.set(made.get() + 1);
             Some(made.get())
         };
-        let at = |started, finished| Ripe { started, finished, ahead: 2 };
+        let at = |started, finished| Ripe { started, finished, ahead: 2, hold: false };
         let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
@@ -1290,12 +1566,12 @@ mod tests {
                 pool.give(*p, 10);
             }
             // Resting: nothing to let go of.
-            assert_eq!(pool.relieve(10 + REST - 1, u64::MAX), 0, "{trims}");
+            assert_eq!(pool.relieve(10 + REST - 1, u64::MAX, 0), 0, "{trims}");
             assert_eq!(pool.blocks(), 4, "{trims}");
             // Rested, but with the trim not empty for its time yet: nothing.
             let mut t = 10 + REST;
             if trims {
-                assert_eq!(pool.relieve(t, u64::MAX), 0);
+                assert_eq!(pool.relieve(t, u64::MAX, 0), 0);
                 assert_eq!(pool.blocks(), 4);
                 t += TRIM_MS;
             }
@@ -1304,12 +1580,12 @@ mod tests {
             pool.rested(t);
             let before = pool.blocks();
             assert!(before >= 3, "{trims}: the pool keeps two empty ones at least");
-            assert_eq!(pool.relieve(t, 4 * MIB), 4 * MIB, "{trims}");
+            assert_eq!(pool.relieve(t, 4 * MIB, 0), 4 * MIB, "{trims}");
             assert_eq!(pool.blocks(), before - 1, "{trims}");
-            assert!(pool.relieve(t, u64::MAX) >= 4 * MIB, "{trims}");
+            assert!(pool.relieve(t, u64::MAX, 0) >= 4 * MIB, "{trims}");
             assert_eq!(pool.blocks(), 1, "{trims}: the block with pieces out stays");
             assert!(pool.blocks[3].is_some(), "{trims}");
-            assert_eq!(pool.relieve(u64::MAX / 2, u64::MAX), 0, "{trims}");
+            assert_eq!(pool.relieve(u64::MAX / 2, u64::MAX, 0), 0, "{trims}");
         }
     }
 
@@ -1359,5 +1635,162 @@ mod tests {
         let (_b, _, _) = pool.take(MIB, 512, 1_000_000, make).unwrap();
         pool.rested(1_000_000 + 100 * TRIM_MS);
         assert_eq!(pool.blocks(), 1);
+    }
+
+    /// A pool of blocks of 4 MiB with the trim (none kept spare).
+    fn small_pool() -> Pool<u32> {
+        let mut pool: Pool<u32> = Pool::undecided(0);
+        pool.sized(|| 4 << 20, || true);
+        pool
+    }
+
+    /// The compaction chooses blocks under half full, the emptiest first,
+    /// until those being emptied come to what is needed and with at most so
+    /// many bytes in those chosen at one look (one at least); nothing new is
+    /// cut from a block being emptied, and its free room is not counted.
+    #[test]
+    fn the_emptiest_blocks_are_chosen_to_be_emptied_and_nothing_is_cut_from_them() {
+        const MIB: u64 = 1 << 20;
+        let mut pool = small_pool();
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        // Blocks 0-2 of four pieces of 1 MiB, block 3 of eight of 512 KiB.
+        let mut taken: Vec<Piece> = (0..12).map(|_| pool.take(MIB, 65536, 0, make).unwrap().0).collect();
+        taken.extend((0..8).map(|_| pool.take(MIB / 2, 65536, 0, make).unwrap().0));
+        assert_eq!(pool.blocks(), 4);
+        assert!(taken[..4].iter().all(|p| p.block == 0) && taken[12..].iter().all(|p| p.block == 3));
+        // Left in them: 1 MiB (a quarter), 3 MiB, 2 MiB (half: not chosen),
+        // 512 KiB (an eighth).
+        for i in [1, 2, 3, 4, 8, 9, 13, 14, 15, 16, 17, 18, 19] {
+            pool.give(taken[i], 10);
+        }
+        let live: Vec<u64> = pool.blocks.iter().flatten().map(|b| b.live).collect();
+        assert_eq!(live, [MIB, 3 * MIB, 2 * MIB, MIB / 2]);
+        // As much as one block is needed: the emptiest.
+        assert_eq!(pool.choose_drain(20, 4 * MIB, u64::MAX), 1);
+        assert!(pool.draining(3) && !pool.draining(0));
+        // Two: the next emptiest too, never the ones half full or more.
+        assert_eq!(pool.choose_drain(20, 8 * MIB, u64::MAX), 1);
+        assert!(pool.draining(0));
+        assert_eq!(pool.choose_drain(20, u64::MAX, u64::MAX), 0);
+        assert!(!pool.draining(1) && !pool.draining(2));
+        // At most 1 MiB of copies at one look: the first, and no more.
+        pool.end_drain();
+        assert_eq!(pool.choose_drain(20, u64::MAX, MIB), 1);
+        assert!(pool.draining(3) && !pool.draining(0));
+        pool.end_drain();
+        assert_eq!(pool.choose_drain(20, u64::MAX, 0), 1, "one at least");
+        assert!(pool.draining(3));
+        // Rested: block 3 has 3.5 MiB free, but it is being emptied: its
+        // room is not counted, and a new piece goes to block 0.
+        pool.rested(10 + REST);
+        let (all, _) = pool.free();
+        assert_eq!(all, 3 * MIB + MIB + 2 * MIB);
+        let (p, _, _) = pool.take(MIB / 2, 65536, 10 + REST, make).unwrap();
+        assert_eq!(p.block, 0);
+        // No longer being emptied: a block like the others.
+        pool.end_drain();
+        let (all, _) = pool.free();
+        assert_eq!(all, 5 * MIB / 2 + MIB + 2 * MIB + 7 * MIB / 2);
+    }
+
+    /// A block being emptied goes once nothing is in it and the submissions
+    /// that may read it are done (the mark of the first look that found it
+    /// empty), its resting pieces with it; one still not empty after its
+    /// time is given up and not chosen again for a while.
+    #[test]
+    fn an_emptied_block_goes_once_the_card_is_done_with_it() {
+        const MIB: u64 = 1 << 20;
+        let mut pool = small_pool();
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let p: Vec<Piece> = (0..5).map(|_| pool.take(MIB, 65536, 0, make).unwrap().0).collect();
+        assert_eq!((p[0].block, p[4].block), (0, 1));
+        for piece in &p[1..4] {
+            pool.give(*piece, 0);
+        }
+        assert_eq!(pool.choose_drain(0, u64::MAX, u64::MAX), 2);
+        // Something in both: nothing goes.
+        assert_eq!(pool.release_drained(100, 7, |m| m <= 5), (0, 0));
+        // Block 0 empty (its last piece resting): marked at the first look,
+        // gone at the first one after its mark has landed.
+        pool.give(p[0], 200);
+        assert_eq!(pool.release_drained(300, 7, |m| m <= 5), (0, 0));
+        assert_eq!(pool.release_drained(400, 9, |m| m <= 6), (0, 0));
+        assert!(pool.blocks[0].is_some());
+        assert_eq!(pool.release_drained(500, 9, |m| m <= 7), (1, 4 * MIB));
+        assert!(pool.blocks[0].is_none());
+        assert!(pool.resting.iter().all(|(_, piece)| piece.block != 0), "its resting pieces went with it");
+        // Block 1 still holds its piece after the time: given up, and not
+        // chosen again until a while later.
+        assert_eq!(pool.release_drained(DRAIN_MS, 9, |_| true), (0, 0));
+        assert!(!pool.draining(1) && pool.blocks[1].is_some());
+        assert_eq!(pool.choose_drain(DRAIN_MS, u64::MAX, u64::MAX), 0);
+        assert_eq!(pool.choose_drain(DRAIN_MS + DRAIN_AGAIN_MS, u64::MAX, u64::MAX), 1);
+    }
+
+    /// While growth is held, a piece that finds no room in the blocks there
+    /// is not pooled (no block is made, ahead neither), and one that finds
+    /// room is; growth is held while the card is relieved and its use is at
+    /// or past its budget, on cards of 8 to 24 GB alike, never with the
+    /// budget not known.
+    #[test]
+    fn no_block_is_made_while_the_relieved_card_is_past_its_budget() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let mut pool = small_pool();
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let held = Ripe { started: 0, finished: 0, ahead: 2, hold: true };
+        assert!(pool.take_ripe(MIB, 65536, 0, held, make).is_none());
+        assert_eq!(made.get(), 0);
+        let free = Ripe { hold: false, ..held };
+        let (a, _, _) = pool.take_ripe(MIB, 65536, 0, free, make).unwrap();
+        // (And one made ahead.)
+        assert_eq!(made.get(), 2);
+        let (b, _, _) = pool.take_ripe(MIB, 65536, 0, held, make).unwrap();
+        assert_eq!((a.block, b.block, made.get()), (0, 0, 2));
+        let (c, _, _) = pool.take_ripe(3 * MIB, 65536, 0, held, make).unwrap();
+        assert_eq!(c.block, 1, "into the block made ahead before");
+        assert_eq!(made.get(), 2, "none more");
+        for budget in [6935 * MIB, 7 * GIB, 11 * GIB, 15 * GIB, 23 * GIB] {
+            assert!(growth_held(true, [budget, budget]));
+            assert!(growth_held(true, [budget, budget / 100 * 118]));
+            assert!(!growth_held(true, [budget, budget - MIB]));
+            assert!(!growth_held(false, [budget, 2 * budget]));
+        }
+        assert!(!growth_held(true, [0, 8 * GIB]));
+    }
+
+    /// A relief of the card keeps the blocks made ahead (the ones made
+    /// first): let go, they would be made again at the next texture.
+    #[test]
+    fn a_relief_of_the_card_keeps_the_blocks_made_ahead() {
+        const MIB: u64 = 1 << 20;
+        let mut pool: Pool<u32> = Pool::undecided(SPARE_KEPT);
+        pool.sized(|| 4 * MIB, || true);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let p: Vec<Piece> = (0..12).map(|_| pool.take(MIB, 65536, 0, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 3);
+        for piece in &p {
+            pool.give(*piece, 0);
+        }
+        // (The trim of `rested` keeps what `room` says, which other tests
+        // may set: only what is left after the relief is checked.)
+        pool.relieve(REST + TRIM_MS, u64::MAX, 2);
+        assert!(pool.blocks[0].is_some() && pool.blocks[1].is_some() && pool.blocks[2].is_none());
     }
 }

@@ -366,22 +366,45 @@ fn takes_in(s: &Sample, bytes: u64, lines: &Lines) -> bool {
     place_in(s, bytes, Kind::Either, lines) == Place::Card
 }
 
-/// Looks that relieved the card, and the bytes they let go of at once.
-static RELIEVED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// While the card is relieved: looks that relieved it; the bytes given back
+/// to the system (blocks of textures that went, host copies of textures of
+/// their own memory let go or cut down); the bytes of host copies let go or
+/// made again elsewhere inside blocks of textures (which give nothing back
+/// by themselves); blocks the compaction emptied that went
+/// (`crate::pool::compact`); and what the system counted of the card less
+/// after those went than before, summed.
+static RELIEVED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// For the run report: [`RELIEVED`].
-pub(crate) fn relief_counts() -> [u64; 2] {
+pub(crate) fn relief_counts() -> [u64; 5] {
     RELIEVED.each_ref().map(|n| n.load(Ordering::Relaxed))
 }
 
-/// The card is past its relief's line by `need` bytes: what it holds idle
-/// goes. Empty blocks of textures at once (past the spare ones too); cells
-/// of sparse windows idle for half a second at the next submission, with the
-/// heaps their tiles leave empty; idle host copies of textures in the sweeps
-/// that follow (`crate::resource::let_go_idle`, which goes by
-/// [`card_relieving`]). Those let go at once, in bytes.
-fn card_tend(need: u64) -> u64 {
-    let mut blocks = crate::pool::relieve_textures;
+/// The texture sweep let a host copy of `bytes` go, or made it again (cut
+/// down or elsewhere), while the card is relieved: given back to the system
+/// unless it lay in a block of textures (`pooled`). Nothing otherwise.
+pub(crate) fn relief_let_go(pooled: bool, bytes: u64) {
+    if card_relieving() {
+        RELIEVED[if pooled { 2 } else { 1 }].fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// The most bytes of host copies in the blocks of textures the compaction
+/// chooses to empty at one look, in hundredths of the card's budget: each
+/// is uploaded again.
+const COMPACT_LIVE_PCT: u64 = 2;
+
+/// The card is past its relief's line by `need` bytes (its budget `budget`):
+/// what it holds idle goes. Empty blocks of textures at once (past the spare
+/// ones too, not those made ahead); cells of sparse windows idle for half a
+/// second at the next submission, with the heaps their tiles leave empty;
+/// idle host copies of textures in the sweeps that follow
+/// (`crate::resource::let_go_idle`, which goes by [`card_relieving`]); with
+/// the compaction (`crate::pool::compacting`), the blocks of textures least
+/// full are chosen to be emptied, and those emptied go. What went back to
+/// the system at once, in bytes.
+fn card_tend(need: u64, budget: u64) -> u64 {
+    let mut blocks = crate::pool::relieve_textures_for_card;
     let mut cells = |_: u64| {
         crate::shadow::hurry_sparse();
         0
@@ -390,14 +413,41 @@ fn card_tend(need: u64) -> u64 {
         need,
         &mut [("empty blocks of textures", &mut blocks), ("cells of sparse windows idle for half a second", &mut cells)],
     );
-    tell(&done, &CARD_TENDED, || {
+    let mut freed = tell(&done, &CARD_TENDED, || {
         format!(
             "the card's memory is past {RELIEF_ON_PCT} % of its budget ({} MB over {RELIEF_OFF_PCT} %; idle textures go in the \
              sweeps, new ones are made of fewer levels; VICTORY_CARD_RELIEF=0: only after a refusal)",
             need / MIB
         )
-    })
+    });
+    if crate::pool::compacting() {
+        let card = || super::host().and_then(|h| h.video_memory()).map_or(0, |m| m[1]);
+        let before = card();
+        let most_live = budget / 100 * COMPACT_LIVE_PCT;
+        if let Some((blocks, bytes)) = crate::pool::compact(need, most_live)
+            && blocks > 0
+        {
+            let returned = before.saturating_sub(card());
+            freed += bytes;
+            RELIEVED[3].fetch_add(blocks, Ordering::Relaxed);
+            RELIEVED[4].fetch_add(returned, Ordering::Relaxed);
+            let n = COMPACTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::info!(
+                    times = n,
+                    blocks,
+                    block_mb = bytes / MIB,
+                    card_less_mb = returned / MIB,
+                    "blocks of textures emptied by the card's compaction went (VICTORY_CARD_COMPACT)"
+                );
+            }
+        }
+    }
+    freed
 }
+
+/// Looks at which blocks the compaction emptied went (for the log).
+static COMPACTED: AtomicU64 = AtomicU64::new(0);
 
 /// Reliefs of the card that let go of something at once (for the log).
 static CARD_TENDED: AtomicU64 = AtomicU64::new(0);
@@ -423,6 +473,9 @@ pub(crate) fn look() {
         let was = CARD_RELIEF.load(Ordering::Relaxed);
         let (now, need) = relief_next(was, s.card);
         CARD_RELIEF.store(now, Ordering::Relaxed);
+        if !now {
+            crate::pool::compact_end();
+        }
         if now != was {
             tracing::info!(
                 card_mb = s.card[1] / MIB,
@@ -432,7 +485,7 @@ pub(crate) fn look() {
             );
         }
         if need > 0 {
-            let freed = card_tend(need);
+            let freed = card_tend(need, s.card[0]);
             RELIEVED[0].fetch_add(1, Ordering::Relaxed);
             RELIEVED[1].fetch_add(freed, Ordering::Relaxed);
         }

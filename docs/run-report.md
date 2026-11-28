@@ -178,7 +178,7 @@ what it holds and what it never does. Sections and keys, in order:
 
 | Key | Meaning |
 |---|---|
-| `format` | The report format's version (7; 6 left the card's memory in use and the host lists' driver objects out of `[memory.map]`'s `accounted_total_mib`, so its `unaccounted_mib` held them, and had no `card_in_use_mib`, `host_lists_driver_estimate_mib`, `card_texture_blocks_free_mib`, `host_lists_idle`, `card_relief_looks` or `card_relief_freed_mib`; 5 had no figures of compute pipelines in `[gpu_time]` and no `asked_to_leave_out`; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
+| `format` | The report format's version (8; 7 counted in `card_relief_freed_mib` the blocks of textures made ahead that relief let go and that were made again at once, and had no `card_relief_in_blocks_mib`, `card_compact_blocks_released` or `card_compact_returned_mib`; 6 left the card's memory in use and the host lists' driver objects out of `[memory.map]`'s `accounted_total_mib`, so its `unaccounted_mib` held them, and had no `card_in_use_mib`, `host_lists_driver_estimate_mib`, `card_texture_blocks_free_mib`, `host_lists_idle`, `card_relief_looks` or `card_relief_freed_mib`; 5 had no figures of compute pipelines in `[gpu_time]` and no `asked_to_leave_out`; 4 had no `[gpu_time]`; 3 had no `[memory.map]`; 2 had no `kind`, and its `[frame_time]` left out the frames of the last part of a second, and a short run's `[frame_time.steady]` was all zeros; 1 had no `[frame_time]`, `[memory.pressure]`, `[textures]`, `first_draw_s`, `left_out_avg_steady` or `pipelines_gone_without`) |
 | `kind` | `run` (`selftest` for [the self-test's report](#the-self-tests-report)) |
 | **`[rox_box]`** | |
 | `version`, `diagnostics` | Rox-box's version; whether it is a build with the `diagnostics` feature |
@@ -447,7 +447,9 @@ the frame line's own lines. Every key is 0 while its switch is off.
 | `lowest_free_ram_mib`, `lowest_commit_headroom_mib` | The budget governor's asks of the system (at most every 32 ms; absent with `VICTORY_BUDGET=0`) | Low is the warning here: under about 1,500 the PC pages and the governor and commit guard hold work back |
 | `governor_green_s`, `_yellow_s`, `_red_s` | The governor's looks (about once a second): the time from each look to the next is the level it found | Time at red is time memory ran out: uploads held back, idle memory let go, textures shown late |
 | `vram_over_budget`, `vram_over_budget_looks` | Looks that found the card's own memory in use past its budget | The driver moves memory out of the card: stutter, and textures and buffers read from the PC's memory |
-| `card_relief_looks`, `card_relief_freed_mib` | Looks of the governor that relieved the card (`VICTORY_CARD_RELIEF`): from 95 % of its budget in use until it is back under 90 %, empty blocks of textures go at once, idle cells of sparse windows at the next submission, idle host copies of textures in the sweeps (the largest first, by the system's own count of the card), and new copies are made of at most 256 texels a side. `_freed_mib` is what went at once (the blocks); the sweeps' share shows as `card_in_use_mib` falling | Many looks with `vram_over_budget_looks` close to them: the relief does not bring the card back under its line, and something it does not let go of grows (see the `card_*` keys of `[memory.map]`) |
+| `card_relief_looks`, `card_relief_freed_mib` | Looks of the governor that relieved the card (`VICTORY_CARD_RELIEF`): from 95 % of its budget in use until it is back under 90 %, empty blocks of textures go at once (not the ones made ahead), idle cells of sparse windows at the next submission, idle host copies of textures in the sweeps (the largest first, by the system's own count of the card), and new copies are made of at most 256 texels a side. `_freed_mib` (format 8) is only memory given back to the system: blocks of textures that went (emptied ones and those the compaction emptied) and host copies of their own memory let go or cut down (those go once the submissions that may use them are done). A 7 also counted blocks made ahead that were made again at once | Many looks with `vram_over_budget_looks` close to them: the relief does not bring the card back under its line, and something it does not let go of grows (see the `card_*` keys of `[memory.map]`) |
+| `card_relief_in_blocks_mib` | While the card is relieved: host copies of textures let go, cut down or made again elsewhere that lay inside blocks of textures. They give the card nothing by themselves: a block goes only once all of it is empty | Large beside a small `card_relief_freed_mib`: the copies let go were scattered over blocks that stayed (with `VICTORY_CARD_COMPACT=0`, or blocks the compaction could not empty) |
+| `card_compact_blocks_released`, `card_compact_returned_mib` | The card's compaction (`VICTORY_CARD_COMPACT`, on): while the card is relieved, the blocks of textures least full (under half of a block) are emptied (their idle copies go, the copies slots hold are made again in another block and shown as before until uploaded), and a block emptied goes once the submissions that may read it are done. The blocks that went, and what the system's count of the card was less just after they went than just before, summed (other allocations made in between count too: an estimate) | `_returned_mib` close to the blocks' bytes (16 MiB each on a card of 8 GiB): the compaction gives the card back what it empties. Few blocks with `card_texture_blocks_free_mib` large: what is left in those blocks is held (by slots whose copies cannot be moved, or used again) |
 | `commit_critical_times` | The commit guard ("commit is critical, holding back uploads"): times commit headroom fell under 1,536 MiB | Commit ran short again and again |
 | `commit_uploads_held_back` | Stagings for uploads the guard held back ("a staging buffer was held back") | Textures were uploaded later than asked for |
 | `commit_allocations_refused` | Allocations refused with `E_OUTOFMEMORY` the guard saw | Memory ran out outright |
@@ -502,7 +504,7 @@ Rendered from synthetic numbers by the unit test
 # pipeline names, memory addresses or offsets into the title, text from the
 # title, or command-line arguments. docs/run-report.md explains every field.
 
-format = 7
+format = 8
 kind = "run"
 
 [rox_box]
@@ -850,6 +852,11 @@ vram_over_budget_looks = 3
 # and what they let go of at once (empty blocks of textures; the rest goes in the sweeps after them)
 card_relief_looks = 0
 card_relief_freed_mib = 0
+# copies let go or made again elsewhere inside blocks of textures while relieved (which give back nothing by
+# themselves); blocks the compaction emptied that went, and the system's count of the card less after than before
+card_relief_in_blocks_mib = 0
+card_compact_blocks_released = 0
+card_compact_returned_mib = 0
 # the commit guard: times commit went critical, stagings it held back, refusals it saw
 commit_critical_times = 1
 commit_uploads_held_back = 14

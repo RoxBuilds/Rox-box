@@ -2421,6 +2421,14 @@ pub(crate) fn want_level(this: This, first: u32) {
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
+    // A texture the host copied into: what the copy holds is the card's
+    // alone (title memory never had it), and a new copy, cut from a block,
+    // would count as written ([`holds_of`]) and show what the block held
+    // before, another texture's bytes. The copy stays, its slot shows its
+    // levels.
+    if crate::texture::host_wrote(this as usize) {
+        return;
+    }
     // A slot made where no upload follows ([`NoUploadFollows`]) would show
     // the new copy before anything is in it: the copy stays, and the slot
     // shows its levels; the texture pass replaces it when it asks for more.
@@ -3476,19 +3484,29 @@ fn idle_order(idle: &mut [(u64, u64, usize)], largest_first: bool) {
 /// shortcut: a slot's texture that shaders read by index is "used" when the
 /// pass or a draw asks for it, not when a shader reads it: one on screen
 /// may be cut too. Those idle longest go first.
+///
+/// With `relocate` (the card's compaction, `crate::pool::compacting`: the
+/// copy lies in a block being emptied) it is made again in any case, at the
+/// level cut to or at its own first level if that is lower (`side`
+/// `u64::MAX`: at its own), a single level too: its slots show the old copy
+/// until the new one, which no block being emptied takes, has been
+/// uploaded. Returns the bytes and whether the old copy lay in a block.
 #[cfg(windows)]
-fn cut_idle(r: &Resource, at: usize, side: u64, idle: &dyn Fn(u64) -> bool) -> Option<u64> {
+fn cut_idle(r: &Resource, at: usize, side: u64, idle: &dyn Fn(u64) -> bool, relocate: bool) -> Option<(u64, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
     const TEXTURE_2D: u32 = 3;
     let desc = &r.desc;
-    if side == u64::MAX
+    if (side == u64::MAX && !relocate)
         || !held_only()
         || !r.host.placed.load(Relaxed)
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
         || desc.depth_or_array_size != 1
-        || desc.mip_levels <= 1
+        || (desc.mip_levels <= 1 && !relocate)
         || desc.sample_count > 1
+        // (What the host copied into is not in title memory: made again,
+        // the copy would lose it, [`want_level`].)
+        || crate::texture::host_wrote(at)
     {
         return None;
     }
@@ -3503,11 +3521,13 @@ fn cut_idle(r: &Resource, at: usize, side: u64, idle: &dyn Fn(u64) -> bool) -> O
         return None;
     }
     let first = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(0);
-    let cut = side_base(desc, first, side);
-    if cut <= host.base {
+    let cut = if side == u64::MAX { host.base } else { side_base(desc, first, side) };
+    let cut = if relocate { cut.max(host.base) } else { cut };
+    if cut <= host.base && !relocate {
         return None;
     }
     let bytes = host.bytes;
+    let pooled = host.pooled;
     crate::texture::unstage(at as This);
     r.host.cut.store(cut, Relaxed);
     r.host.grown.store(true, Relaxed);
@@ -3519,7 +3539,43 @@ fn cut_idle(r: &Resource, at: usize, side: u64, idle: &dyn Fn(u64) -> bool) -> O
     crate::descriptor::host::remapped(r.data() as usize, span as usize);
     DETAILED[2].fetch_add(1, Relaxed);
     DETAILED[3].fetch_add(bytes, Relaxed);
-    Some(bytes)
+    Some((bytes, pooled))
+}
+
+/// How long a copy in a block being emptied (`crate::pool::compacting`) has
+/// to have been idle to go or be made again elsewhere, in milliseconds (and
+/// four frames): the least the sweep ever waits ([`crate::host::vram_idle_ms`]),
+/// for a thread that asked for the copy and has not yet recorded its use.
+#[cfg(windows)]
+const DRAIN_IDLE_MS: u64 = 1_000;
+
+/// The most copies one look of the sweep makes again elsewhere to empty
+/// blocks ([`cut_idle`] with `relocate`): each is uploaded again.
+#[cfg(windows)]
+const MOVES_A_LOOK: usize = 64;
+
+/// What the sweep does with an idle copy while the card is compacted
+/// (`crate::pool::compacting`), by where it lies ([`crate::pool::Lies`]):
+/// one of its own memory goes as before (counted against the bytes the
+/// sweep may let go); one in a block being emptied goes whatever that count
+/// is; one in another block stays (letting it go gives the card nothing:
+/// it is uploaded again later for a block that stays as it was).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Sweep {
+    Counted,
+    Drained,
+    Kept,
+}
+
+/// [`Sweep`] for a copy lying at `lies`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sweep_for(lies: crate::pool::Lies) -> Sweep {
+    match lies {
+        crate::pool::Lies::Own => Sweep::Counted,
+        crate::pool::Lies::Draining => Sweep::Drained,
+        crate::pool::Lies::Block => Sweep::Kept,
+    }
 }
 
 /// Whether [`let_go_idle`] counts the room the texture queue keeps for card
@@ -3602,6 +3658,11 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relievin
     let hints = crate::host::Host::residency_hints();
     let now = crate::host::moment();
     let largest_first = relieving && most != u64::MAX;
+    // The card's compaction: the blocks being emptied, and the idle time of
+    // the copies in them ([`DRAIN_IDLE_MS`]).
+    let compacting = relieving && crate::pool::compacting();
+    let draining = if compacting { crate::pool::draining_now() } else { Vec::new() };
+    let found_ms = if compacting { idle_ms.min(DRAIN_IDLE_MS) } else { idle_ms };
     let mut idle: Vec<(u64, u64, usize)> = Vec::new();
     // Textures whose residency class is to change, and how long they were idle.
     let mut moving: Vec<(usize, u64)> = Vec::new();
@@ -3628,7 +3689,7 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relievin
                         moving.push((at, since));
                     }
                 }
-                if crate::host::long_ago(used, idle_ms, IDLE_FRAMES) && !crate::texture::host_wrote(at) {
+                if crate::host::long_ago(used, found_ms, IDLE_FRAMES) && !crate::texture::host_wrote(at) {
                     // (Its size in title memory stands for its copy's: only
                     // the order goes by it, and only while relieved.)
                     let bytes = if largest_first { footprint(&r.desc).map_or(0, |f| f.size) } else { 0 };
@@ -3642,19 +3703,53 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relievin
             idle_order(&mut idle, largest_first);
         }
         let mut held = Vec::new();
+        // Copies in blocks being emptied that slots hold: made again elsewhere.
+        let mut to_move = Vec::new();
         for (_, _, at) in idle {
-            if bytes >= most {
+            if bytes >= most && !compacting {
                 break;
             }
             // SAFETY: as above; still in the table, whose lock is held.
             let r = unsafe { &*(at as *const Resource) };
-            if let Some(host) = take_idle(r, at, idle_ms) {
+            let sweep = if compacting { copy_lies(r, &draining).map_or(Sweep::Kept, sweep_for) } else { Sweep::Counted };
+            let counted = sweep == Sweep::Counted;
+            if counted && (bytes >= most || !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)) {
+                continue;
+            }
+            if sweep == Sweep::Kept {
+                continue;
+            }
+            if let Some(host) = take_idle(r, at, if counted { idle_ms } else { found_ms }) {
                 went += 1;
-                bytes += host.bytes;
+                if counted {
+                    bytes += host.bytes;
+                }
+                crate::host::budget::relief_let_go(host.pooled, host.bytes);
                 first.get_or_insert(at);
                 crate::host::retire(host);
-            } else {
+            } else if counted {
                 held.push(at);
+            } else {
+                to_move.push(at);
+            }
+        }
+        // Blocks being emptied: the copies slots hold there are made again
+        // in another block (shown as they were until that one is uploaded).
+        if !to_move.is_empty() {
+            let idle = |used: u64| crate::host::long_ago(used, found_ms, IDLE_FRAMES);
+            let mut moves = 0;
+            for at in to_move {
+                if moves >= MOVES_A_LOOK {
+                    break;
+                }
+                // SAFETY: as above.
+                let r = unsafe { &*(at as *const Resource) };
+                if let Some((had, pooled)) = cut_idle(r, at, cut_side, &idle, true) {
+                    moves += 1;
+                    MOVED[0].fetch_add(1, Relaxed);
+                    MOVED[1].fetch_add(had, Relaxed);
+                    crate::host::budget::relief_let_go(pooled, had);
+                }
             }
         }
         // Still short: what slots hold is cut down (`VICTORY_TEXTURE_CUT`),
@@ -3668,10 +3763,11 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relievin
                 }
                 // SAFETY: as above.
                 let r = unsafe { &*(at as *const Resource) };
-                if let Some(had) = cut_idle(r, at, cut_side, &idle) {
+                if let Some((had, pooled)) = cut_idle(r, at, cut_side, &idle, false) {
                     cuts += 1;
                     // (What is left of it is a few hundredths of that.)
                     cut_bytes += had;
+                    crate::host::budget::relief_let_go(pooled, had);
                 }
             }
         }
@@ -3711,6 +3807,20 @@ fn let_go_sliced(idle_ms: u64, most: u64, slice_ms: u64, cut_side: u64, relievin
         });
     }
 }
+
+/// Where the host copy of title texture `r` lies (`crate::pool::lies_in`,
+/// with `draining` from `crate::pool::draining_now`); `None` without one.
+#[cfg(windows)]
+fn copy_lies(r: &Resource, draining: &[bool]) -> Option<crate::pool::Lies> {
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let (host, _) = made.as_ref()?;
+    Some(crate::pool::lies_in(&host.texture, draining))
+}
+
+/// Since the start: host copies the sweep made again in another block to
+/// empty one (the card's compaction), and their bytes.
+#[cfg(windows)]
+pub(crate) static MOVED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Of title texture `r` (at `at`), takes the host copy if it may go: the
 /// title fills it, nothing used it for `idle_ms` and four frames, and only
@@ -5181,6 +5291,18 @@ mod tests {
         assert_eq!(by_size.map(|i| i.2), [5, 2, 3, 1, 4]);
     }
 
+    /// While the card is compacted, an idle copy of its own memory goes as
+    /// the sweep's count allows, one in a block being emptied goes whatever
+    /// that count is, and one in a block that stays is kept (it would give
+    /// the card nothing).
+    #[test]
+    fn a_compacted_card_lets_go_what_gives_it_memory_back() {
+        use crate::pool::Lies;
+        assert_eq!(sweep_for(Lies::Own), Sweep::Counted);
+        assert_eq!(sweep_for(Lies::Draining), Sweep::Drained);
+        assert_eq!(sweep_for(Lies::Block), Sweep::Kept);
+    }
+
     /// New copies have at most 256 texels a side while the card is relieved,
     /// whatever the band says (also on a card the band is off for), and the
     /// band's own bound when it is smaller or the card is not relieved.
@@ -5685,11 +5807,11 @@ mod tests {
         // were let go under them.)
         let (idle, used) = (|_: u64| true, |_: u64| false);
         // Used lately: left alone.
-        assert!(cut_idle(resource(held), held as usize, side, &used).is_none());
+        assert!(cut_idle(resource(held), held as usize, side, &used, false).is_none());
         // No slot holds it: the sweep lets that one go whole, not here.
-        assert!(cut_idle(resource(free), free as usize, side, &idle).is_none());
+        assert!(cut_idle(resource(free), free as usize, side, &idle, false).is_none());
         let cuts = DETAILED[2].load(Relaxed);
-        assert!(cut_idle(resource(held), held as usize, side, &idle).is_some_and(|had| had > 0));
+        assert!(cut_idle(resource(held), held as usize, side, &idle, false).is_some_and(|(had, _)| had > 0));
         assert!(DETAILED[2].load(Relaxed) > cuts);
         assert!(made_copy(held).is_none(), "the old copy is out; the slot holds its texture");
         assert!(crate::host::references(&slot) >= 1);
@@ -5699,10 +5821,17 @@ mod tests {
         let d = unsafe { cut.texture.GetDesc() };
         assert_eq!((cut.base, cut.tail, d.Width, u32::from(d.MipLevels)), (level, true, 1024 >> level, 11 - level));
         assert!(cut.serial != serial && cut.grown.load(Relaxed), "its slots are made from it after its upload");
-        // Down already: not again.
+        // Down already: not again; but lying in a block being emptied (the
+        // card's compaction), made again at its own levels, a slot holding it.
+        let slot_of_cut = cut.texture.clone();
         drop(cut);
-        assert!(cut_idle(resource(held), held as usize, side, &idle).is_none());
-        drop(slot);
+        assert!(cut_idle(resource(held), held as usize, side, &idle, false).is_none());
+        assert!(cut_idle(resource(held), held as usize, u64::MAX, &idle, true).is_some_and(|(had, _)| had > 0));
+        assert!(made_copy(held).is_none(), "the old copy is out; its slot holds it");
+        let moved = host_copy(held).unwrap();
+        assert_eq!((moved.base, moved.tail), (level, true), "the same levels");
+        assert!(moved.grown.load(Relaxed), "its slots are made from it after its upload");
+        drop((moved, slot_of_cut, slot));
     }
 
     /// `texture_at` from eight threads, four of them through what readers

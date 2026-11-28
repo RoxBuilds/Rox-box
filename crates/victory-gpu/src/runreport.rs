@@ -453,9 +453,12 @@ pub fn sample() {
     if limit > 0 {
         report::set(Stat::ViewHeapViews, u64::from(limit) + 1);
     }
-    let [looks, freed] = crate::host::budget::relief_counts();
+    let [looks, freed, in_blocks, blocks, returned] = crate::host::budget::relief_counts();
     report::set(Stat::CardReliefLooks, looks);
     report::set(Stat::CardReliefFreed, freed);
+    report::set(Stat::CardReliefInBlocks, in_blocks);
+    report::set(Stat::CardCompactBlocks, blocks);
+    report::set(Stat::CardCompactReturned, returned);
     let [critical, held, refused] = crate::host::commit::counts();
     report::set(Stat::CommitCritical, critical);
     report::set(Stat::CommitHeldBack, held);

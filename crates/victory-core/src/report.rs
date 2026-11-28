@@ -58,8 +58,12 @@ use std::time::{Duration, Instant};
 /// so `unaccounted_mib` is smaller than a 6's for the same run; it adds
 /// `card_texture_blocks_free_mib` beside, the count `host_lists_idle`, and
 /// `card_relief_looks` and
-/// `card_relief_freed_mib` to `[memory.pressure]`.
-pub const FORMAT: u32 = 7;
+/// `card_relief_freed_mib` to `[memory.pressure]`. 8 counts in
+/// `card_relief_freed_mib` only what went back to the system (a 7 counted
+/// the blocks made ahead that were made again at once), and adds
+/// `card_relief_in_blocks_mib`, `card_compact_blocks_released` and
+/// `card_compact_returned_mib`.
+pub const FORMAT: u32 = 8;
 /// Reports kept in the folder: the newest, this one included.
 pub const KEEP: usize = 20;
 /// How often the helper thread writes the report while the run goes on.
@@ -401,9 +405,17 @@ pub enum Stat {
     /// (`VICTORY_CARD_RELIEF`), and the bytes those looks let go of at once.
     CardReliefLooks,
     CardReliefFreed,
+    /// While the card is relieved: bytes of host copies of textures let go or
+    /// made again elsewhere inside blocks of textures (which give the card
+    /// nothing by themselves); blocks of textures the compaction emptied
+    /// that went (`VICTORY_CARD_COMPACT`); and the system's count of the
+    /// card less after those went than before, summed.
+    CardReliefInBlocks,
+    CardCompactBlocks,
+    CardCompactReturned,
 }
 
-const STATS: usize = Stat::CardReliefFreed as usize + 1;
+const STATS: usize = Stat::CardCompactReturned as usize + 1;
 static STAT: [AtomicU64; STATS] = [const { AtomicU64::new(0) }; STATS];
 
 /// One more of `stat`.
@@ -3217,6 +3229,11 @@ fn run_sections(d: &mut Doc, s: &Snapshot) {
     d.comment("and what they let go of at once (empty blocks of textures; the rest goes in the sweeps after them)");
     d.int("card_relief_looks", s.stat(Stat::CardReliefLooks));
     d.int("card_relief_freed_mib", mib(s.stat(Stat::CardReliefFreed)));
+    d.comment("copies let go or made again elsewhere inside blocks of textures while relieved (which give back nothing by");
+    d.comment("themselves); blocks the compaction emptied that went, and the system's count of the card less after than before");
+    d.int("card_relief_in_blocks_mib", mib(s.stat(Stat::CardReliefInBlocks)));
+    d.int("card_compact_blocks_released", s.stat(Stat::CardCompactBlocks));
+    d.int("card_compact_returned_mib", mib(s.stat(Stat::CardCompactReturned)));
     d.comment("the commit guard: times commit went critical, stagings it held back, refusals it saw");
     d.int("commit_critical_times", s.stat(Stat::CommitCritical));
     d.int("commit_uploads_held_back", s.stat(Stat::CommitHeldBack));

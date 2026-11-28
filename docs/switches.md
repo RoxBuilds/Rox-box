@@ -4,7 +4,7 @@ Every `VICTORY_*` environment variable the source reads. This file is generated 
 
 To add a switch, write it in the code (`switch::on`, `toggled!` or a value read), describe it in a comment directly above the read, and run `cargo xtask switches`. `cargo xtask switches --check` (and `cargo test`) fail when this file is stale. `scripts\play.ps1` clears every other `VICTORY_*` variable; see [ARCHITECTURE.md](../ARCHITECTURE.md#configuration-and-switches).
 
-502 switches: 8 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 383 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
+503 switches: 8 paths, 21 in `victory`, 6 in `victory-core`, 1 in `victory-formats`, 384 in `victory-gpu`, 33 in `victory-hle`, 8 in `victory-loader`, 42 in `victory-shader`.
 
 How to read the tables:
 
@@ -122,6 +122,7 @@ Folders and files, also settable under `[paths]` in `victory.toml` (the environm
 | `VICTORY_CARD_BUFFERS_MB` | value |  |  | `crates/victory-gpu/src/shadow.rs` |
 | `VICTORY_CARD_BUFFERS_MIN_KB` | value | `64` built in, not with -Safe | `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the least size in KiB, so that it can go under 1 MiB: 64 is every title buffer. Copies under 1 MiB are nearly all there are and few bytes; in the PC's memory every load, store and atomic a shader does on them crosses the bus. | `crates/victory-gpu/src/shadow.rs` |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | value |  | With plain CPU sides (`plain_sides`) a copy on the card costs the PC's shared memory nothing, so every title buffer from 1 MiB goes there while the card has room (`card_room_for`'s lines, unchanged): of the bytes the CPU compared each frame to find shader writes, most lay in copies under 16 MiB. A setting wins. | `crates/victory-gpu/src/shadow.rs` |
+| `VICTORY_CARD_COMPACT` | on unless `0` |  | Whether the card's own memory is compacted while the budget governor relieves it (`VICTORY_CARD_COMPACT`, on unless `0`: as before, idle copies go wherever they lie). With it: - the blocks of textures least full (under half of a block) are emptied: every idle copy in them goes, a slot's copy is made again in another block (its slot shows the old one until the new one is uploaded), and a block... | `crates/victory-gpu/src/pool.rs` |
 | `VICTORY_CARD_HASH_LEN` | value |  | The bytes of the copy the card's hashes cover: the title buffer's own, rounded up to the hash's 16-byte step. The card's buffer is the title buffer rounded up to 64 KiB, of which a title buffer of 288 bytes can give nothing back but those (after fxceless c36971b2). `VICTORY_CARD_HASH_LEN=0`: the whole buffer. | `crates/victory-gpu/src/shadow.rs` |
 | `VICTORY_CARD_HEADROOM_PCT` | value |  | \[`card_headroom_for`\] for this card, read once. | `crates/victory-gpu/src/resource.rs` |
 | `VICTORY_CARD_JOIN` | value |  |  | `crates/victory-gpu/src/host/card_join.rs` |
