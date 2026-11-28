@@ -229,6 +229,8 @@ function Get-RunSettings([switch]$Safe, [switch]$RayTracing, [string]$Display, [
         VICTORY_PIPELINE_BOOK = '1'
     }
     if ($Safe) {
+        # victory.exe's built-in defaults (apps\victory\src\defaults.rs): only the base set.
+        $settings.VICTORY_DEFAULTS = 'safe'
         $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
     } else {
         $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'

@@ -43,7 +43,7 @@ the name of the upstream project it descends from: `victory.exe`,
 
 ### Maturity
 
-This is research software, version 0.1. Be realistic about it:
+This is research software, version 0.2. Be realistic about it:
 
 - It runs **some** titles, with **major performance and visual limitations**.
   Frame rates are far below native, effects can be missing or wrong, and draws
@@ -133,11 +133,12 @@ The same steps, shorter, are in [QUICKSTART.txt](QUICKSTART.txt) inside the zip.
 `launcher\` holds a window over `victory.exe` and `play.cmd`: a library of
 title folders, one button to play or stop, the checks, shader and warm-up
 steps, the run report and the switches, with nothing to install. It knows no
-title: a title is a folder you name. Today it is built from the source tree
-(`cd launcher`, then `cargo build --release`; the file is
-`launcher	argeteleaseoxbox-launcher.exe`, run next to `victory.exe` or
-from the checkout) and is not yet in the release package; `play.cmd` works as
-before either way. [launcher/README.md](launcher/README.md) describes every
+title: a title is a folder you name. It is in the release package as
+`roxbox-launcher.exe`, next to `victory.exe`:
+double-click it instead of `play.cmd` if you prefer a window. From the source
+tree, `cd launcher` and `cargo build --release` builds it into
+`launcher\target\release\roxbox-launcher.exe`. `play.cmd` works as before
+either way. [launcher/README.md](launcher/README.md) describes every
 part.
 
 ### Check your PC without a title

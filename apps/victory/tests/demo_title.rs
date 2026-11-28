@@ -298,9 +298,15 @@ fn the_demo_title_runs_to_its_end_on_the_software_adapter() {
     // on the host (the first present's loading is left out of these).
     assert_eq!(ran.float("gpu_work", "submissions_avg"), 1.0, "{text}");
     assert_eq!(ran.float("gpu_work", "draws_avg"), 2.0, "{text}");
-    assert_eq!(ran.int("gpu_work", "draws_max"), 2, "{text}");
     assert_eq!(ran.float("gpu_work", "dispatches_avg"), 1.0, "{text}");
-    assert_eq!(ran.int("gpu_work", "dispatches_max"), 1, "{text}");
+    // Draws and dispatches are counted when a list is translated. With the
+    // submission threads of victory.exe's defaults on (VICTORY_THIN and its
+    // siblings), the next frame's list can be translated before this frame's
+    // present is counted, so one frame can show the next one's work as well
+    // (and that one none): the averages above stay exact, a frame's most can
+    // be twice the work of one.
+    assert!((2..=4).contains(&ran.int("gpu_work", "draws_max")), "{text}");
+    assert!((1..=2).contains(&ran.int("gpu_work", "dispatches_max")), "{text}");
     assert_eq!(ran.int("gpu_work", "left_out_max"), 0, "{text}");
     assert_eq!(ran.int("gpu_work", "submissions_total"), i64::from(FRAMES), "{text}");
     for (reason, n) in ran.report["gpu_work"]["left_out"]

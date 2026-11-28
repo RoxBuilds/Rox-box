@@ -520,6 +520,28 @@ fn assignments(text: &str) -> Vec<(String, String)> {
     found
 }
 
+/// The built-in defaults of `victory.exe`: the source of its table.
+const DEFAULTS_SOURCE: &str = "apps/victory/src/defaults.rs";
+
+/// The table of [`DEFAULTS_SOURCE`]: `base("NAME", "value")` (every run) and
+/// `newer("NAME", "value")` (not with `-Safe`), names without `VICTORY_`.
+fn builtin_defaults(rs: &str) -> LauncherSettings {
+    let mut found = LauncherSettings::new();
+    for line in rs.lines().map(str::trim) {
+        let (rest, cond) = if let Some(r) = line.strip_prefix("base(\"") {
+            (r, "built in")
+        } else if let Some(r) = line.strip_prefix("newer(\"") {
+            (r, "built in, not with -Safe")
+        } else {
+            continue;
+        };
+        let mut parts = rest.split('"');
+        let (Some(name), Some(_), Some(value)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        found.entry(format!("VICTORY_{name}")).or_default().push((vec![cond.to_owned()], value.to_owned()));
+    }
+    found
+}
+
 fn launcher_cell(entries: &[(Vec<String>, String)]) -> String {
     let mut cells: Vec<String> = Vec::new();
     for (conds, value) in entries {
@@ -696,7 +718,15 @@ fn escape_markdown(text: &str) -> String {
 
 pub fn generate(sources: &[(String, String)], launcher: Option<&str>) -> String {
     let mut switches = collect(sources);
-    let launcher = launcher.map(launcher_settings).unwrap_or_default();
+    let mut launcher = launcher.map(launcher_settings).unwrap_or_default();
+    // The built-in defaults first, then what play.ps1 adds or changes.
+    if let Some((_, rs)) = sources.iter().find(|(path, _)| path == DEFAULTS_SOURCE) {
+        for (name, mut entries) in builtin_defaults(rs) {
+            let after = launcher.remove(&name).unwrap_or_default();
+            entries.extend(after);
+            launcher.insert(name, entries);
+        }
+    }
     let mut left_out = 0usize;
     let mut described: BTreeMap<String, String> = BTreeMap::new();
     for s in &mut switches {
@@ -748,8 +778,10 @@ pub fn generate(sources: &[(String, String)], launcher: Option<&str>) -> String 
          every read sits in an item or module under `#[cfg(feature = \"diagnostics\")]`.\n",
     );
     out.push_str(
-        "- **Set by launcher**: what `Get-RunSettings` in `scripts/play.ps1` sets by default, \
-         and under which launcher options (`-Safe`, `-Fast`, `-RayTracing`).\n",
+        "- **Set by default**: what `victory.exe` sets itself when the variable is not set \
+         (`built in`: the table in `apps/victory/src/defaults.rs`; `VICTORY_DEFAULTS=0` turns \
+         it off), then what `Get-RunSettings` in `scripts/play.ps1` sets, and under which \
+         launcher options (`-Safe`, `-Fast`, `-RayTracing`).\n",
     );
     out.push_str(
         "- **Description**: the comment block directly above the first read that has one, \
@@ -768,7 +800,7 @@ pub fn generate(sources: &[(String, String)], launcher: Option<&str>) -> String 
 
     let table = |out: &mut String, rows: &[&Switch], with_kind: bool| {
         if with_kind {
-            out.push_str("| Name | Kind | Set by launcher | Description | Where |\n|---|---|---|---|---|\n");
+            out.push_str("| Name | Kind | Set by default | Description | Where |\n|---|---|---|---|---|\n");
         } else {
             out.push_str("| Name | Description | Where |\n|---|---|---|\n");
         }
@@ -1030,6 +1062,15 @@ pub(crate) mod plain;
         assert_eq!(cell("VICTORY_E"), "`1` without -Safe");
         assert_eq!(cell("VICTORY_F"), "the value of `-Display`");
         assert!(!got.contains_key("VICTORY_C") && !got.contains_key("VICTORY_Z"));
+    }
+
+    #[test]
+    fn the_built_in_defaults_are_read_from_their_table() {
+        let rs = "const TABLE: &[Default] = &[\n    base(\"A\", \"1\"),\n    newer(\"B_C\", \"64\"),\n    // base(\"X\", \"9\"),\n];\n";
+        let got = builtin_defaults(rs);
+        assert_eq!(launcher_cell(&got["VICTORY_A"]), "`1` built in");
+        assert_eq!(launcher_cell(&got["VICTORY_B_C"]), "`64` built in, not with -Safe");
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

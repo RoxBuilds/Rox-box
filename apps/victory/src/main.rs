@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod defaults;
 mod inspect;
 mod preflight;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -296,6 +297,17 @@ fn real_main() -> Result<()> {
         Command::Config | Command::Check { .. } | Command::Inspect { .. } | Command::LibExports { .. }
     ) || matches!(cli.command, Command::Selftest { .. })
         || matches!(cli.command, Command::Report { diff: Some(_), .. });
+    // The commands that start the graphics layer get the confirmed defaults
+    // (defaults.rs) before any switch is read.
+    let graphics = matches!(cli.command, Command::Run { .. } | Command::Selftest { .. });
+    #[cfg(windows)]
+    let graphics = graphics || matches!(cli.command, Command::Warm { .. });
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let graphics = graphics || matches!(cli.command, Command::Replay(_));
+    if graphics {
+        let set = defaults::apply();
+        eprintln!("Rox-box: {set} switches set from the built-in defaults (VICTORY_DEFAULTS=0 for none, =safe for the base set)");
+    }
     match victory_core::Config::load() {
         Ok(cfg) => publish_external_paths(&cfg),
         Err(_) if reads_no_config => {}
